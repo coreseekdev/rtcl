@@ -1265,6 +1265,7 @@ fn top_op_class(op: &OpCode) -> u8 {
     match op {
         // ── 名键读（FlushOnly）：flush 后全局完整 ──────────────────────
         OpCode::EvalExpr { .. }
+        | OpCode::EvalExprCond
         | OpCode::LoadVar(_)
         | OpCode::LoadArrayElem(_)
         | OpCode::VarExists(_)
@@ -1332,6 +1333,7 @@ fn top_op_class(op: &OpCode) -> u8 {
         | OpCode::Div
         | OpCode::Mod
         | OpCode::Pow
+        | OpCode::ExprFoldError(..)
         | OpCode::Neg
         | OpCode::Eq
         | OpCode::Ne
@@ -1635,9 +1637,13 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
             OpCode::Mod => op_int_mod(st),
             OpCode::Neg => {
                 let a = st.pop_val();
-                let v = crate::types::expr_ops::op_neg(&a)?;
-                st.stack.push(v);
-                Ok(())
+                // 不用 `?`：一元操作数错误（`-$a` 的 cannot use …）与其他
+                // 算术 op 一样走循环底部的错误处理器记命令帧——`?` 会从
+                // exec_inner 直接返回，帧整体丢失（9.1：`expr {-$a}` 的
+                // errorInfo 带 `while executing "expr {-$a}"` 帧，C16）。
+                crate::types::expr_ops::op_neg(&a).map(|v| {
+                    st.stack.push(v);
+                })
             }
             OpCode::Eq => {
                 let (a, b) = pop_pair(st);
@@ -1834,6 +1840,7 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
                     | OpCode::LappendVarVar(_, _)
                     | OpCode::EvalScript
                     | OpCode::EvalExpr
+                    | OpCode::EvalExprCond
             );
             if is_word_op && std::mem::take(&mut interp.err_from_subst) {
                 // 顶替纪律（e8/e9 链式载体）：在位单元边界帧先入链——
@@ -2446,6 +2453,59 @@ fn op_expr_mark_begin_push_const(
     st.bodies.push(Region::Expr(st.cur_site));
     op_begin_cmd(interp, code, st, site)?;
     op_push_const(st, code, idx);
+    Ok(())
+}
+
+/// `ExprFoldError(op, a, b)` — a compile-time constant fold the runtime
+/// refuses, planted by the peephole in place of the failing
+/// `[PushInt/PushFloat, PushInt/PushFloat, ArithOp]` window (C16).  The
+/// shared expr_ops raise the exact runtime error for the window's
+/// constants; the bare message is pre-logged (tclsh's double-log model)
+/// so the expr command frame appends with 9.1's folded-literal keyword
+/// `invoked from within`, and the INNER errorstack entry is the syntax
+/// form — byte-identical to the runtime evaluator's fold path.
+fn op_expr_fold_error(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    op: u8,
+    a: rtcl_ir::opcode::FoldConst,
+    b: rtcl_ir::opcode::FoldConst,
+) -> Result<()> {
+    use rtcl_ir::opcode::FoldConst;
+    let va = match a {
+        FoldConst::Int(i) => Value::from_int(i),
+        FoldConst::Float(f) => crate::types::expr_funcs::float_value(f),
+    };
+    let vb = match b {
+        FoldConst::Int(i) => Value::from_int(i),
+        FoldConst::Float(f) => crate::types::expr_funcs::float_value(f),
+    };
+    let r = match op {
+        b'/' => crate::types::expr_ops::numeric_binop(&va, &vb, '/'),
+        b'%' => crate::types::expr_ops::int_mod(&va, &vb),
+        b'P' => crate::types::expr_ops::op_pow(va, vb),
+        b'<' => crate::types::expr_ops::int_shift(&va, &vb, true),
+        b'>' => crate::types::expr_ops::int_shift(&va, &vb, false),
+        b'&' => crate::types::expr_ops::int_bitop(&va, &vb, '&'),
+        b'|' => crate::types::expr_ops::int_bitop(&va, &vb, '|'),
+        b'~' => crate::types::expr_ops::op_bitnot(&va),
+        _ => crate::types::expr_ops::int_bitop(&va, &vb, '^'),
+    };
+    match r {
+        // The compile-time would-error probe and the runtime disagree
+        // (defensive — should not happen): keep the computed value.
+        Ok(v) => st.stack.push(v),
+        Err(e) => {
+            if interp.err_info.is_none() {
+                interp.err_info = Some(e.message_text());
+                interp.err_fresh = false;
+                interp.err_force_inner = true;
+            }
+            interp.arm_expr_syntax_inner(&e);
+            return Err(e);
+        }
+    }
     Ok(())
 }
 
@@ -3495,6 +3555,13 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             let v = interp.eval_expr(expr.as_str())?;
             st.stack.push(v);
         }
+        OpCode::EvalExprCond => {
+            // 条件语境（if/elseif/while/for 的 jumpFalse 操作数）：不做
+            // 结果规范化——tclsh 的转换先行（C16 9.1 钉形）。
+            let expr = st.pop_val();
+            let v = interp.eval_expr_cond(expr.as_str())?;
+            st.stack.push(v);
+        }
 
         // ── Arithmetic / comparison (expr_ops = the expr parser's own
         //    semantics — overflow widening, floor division, exact error
@@ -3597,6 +3664,9 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             let a = st.pop_val();
             let v = crate::types::expr_ops::op_pow(a, b)?;
             st.stack.push(v);
+        }
+        OpCode::ExprFoldError(op, a, b) => {
+            op_expr_fold_error(interp, code, st, *op, *a, *b)?
         }
         OpCode::Neg => {
             let a = st.pop_val();

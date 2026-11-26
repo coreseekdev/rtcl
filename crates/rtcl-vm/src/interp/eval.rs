@@ -877,6 +877,16 @@ impl Interp {
                             );
                         }
                     }
+                    // 词级错误出口同样恢复命令语境（cur_source/word_srcs
+                    // 是逐命令换装的——泄漏会让下一个 dispatch 前的语境
+                    // 读取（catch 的 D-3 verbatim 检查、字面量门）切到
+                    // 本单元的源与词跨度（C16 折叠错误流实证的越界
+                    // panic：外层 catch 的词 span 切到内层脚本源）。
+                    self.cur_source = saved_source;
+                    self.cur_cmd_text = saved_text;
+                    self.cur_cmd_line = saved_line;
+                    self.cur_cmd_line_abs = saved_line_abs;
+                    self.cur_cmd_word_srcs = saved_srcs;
                     return Err(e);
                 }
             };
@@ -1671,36 +1681,20 @@ impl Interp {
             // D-3 残差：expr 错误的 INNER 条目 = syntax 特形——
             // `syntax {msg} {opts-dict}`（tclsh 实测；opts 为该错误自身
             // 的完整 options 形）。一次性预装同 cmd_error 通道。
-            // C2/C3（2026-11-16）：-errorinfo 载荷 = 抬升点已预装的
-            // err_info（解析错误带 (parsing expression …) 帧、ARITH 带
-            // 裸消息）；-errorcode = 解析错误的 TCL PARSE EXPR <CLASS>
-            // 抬升码（err_code_raised 已装全局），其余按变体派生。
-            let tec = if self.err_code_raised {
-                self.globals
-                    .get("errorCode")
-                    .map(|v| v.as_str().to_string())
-                    .unwrap_or_else(|| e.tcl_error_code())
-            } else {
-                e.tcl_error_code()
-            };
-            let msg = e.message_text();
-            let line = self.err_line;
-            let ei = self.err_info.clone().unwrap_or_else(|| msg.clone());
-            let opts = format!(
-                "-code 1 -level 0 -errorcode {} -errorinfo {} -errorline {}",
-                crate::value::tcl_quote(&tec),
-                crate::value::tcl_quote(&ei),
-                line
-            );
-            self.err_pending_inner =
-                Some(format!("syntax {} {}", crate::value::tcl_quote(&msg), crate::value::tcl_quote(&opts)));
-            if tec.starts_with("TCL PARSE EXPR") {
-                // A parse error is a new error: the next log event starts
-                // a fresh -errorstack with that entry (tclsh
-                // TclErrorStackResetIf).  Without this the event appended
-                // the frame and left the previous error's stack standing.
-                self.err_force_inner = true;
-            }
+            self.arm_expr_syntax_inner(e);
+        }
+        r
+    }
+
+    /// Condition-context expr evaluation（`if`/`elseif`/`while`/`for`）：
+    /// 不做结果规范化——tclsh 的 jumpFalse 转换先行（NaN 条件报转换错，
+    /// 见 [`crate::types::expr::eval_expr_cond`]）。INNER 预装同
+    /// [`Self::eval_expr`]。
+    pub fn eval_expr_cond(&mut self, expr: &str) -> Result<Value> {
+        crate::interp::dbgtrace::event("eval_expr_cond", "");
+        let r = crate::types::expr::eval_expr_cond(self, expr);
+        if let Err(e) = &r {
+            self.arm_expr_syntax_inner(e);
         }
         r
     }
@@ -1734,6 +1728,47 @@ impl Interp {
     /// 带替换下标的写一律走 DynCall 分派（命令自己替换实参）。
     pub fn jit_read_var_ref(&mut self, name: &str) -> Result<Value> {
         self.eval_var_ref(name)
+    }
+
+    /// expr 错误的 INNER errorstack 预装（D-3 残差收口）：条目 =
+    /// syntax 特形——`syntax {msg} {完整 options 形}`（tclsh 实测）。
+    /// 树走包装器（[`Interp::eval_expr`]）与 VM 的折叠错误 op
+    /// （`ExprFoldError`，C16）共用；opts 用该错误自身的
+    /// -errorcode/-errorinfo/-errorline。
+    pub(crate) fn arm_expr_syntax_inner(&mut self, e: &Error) {
+        // C2/C3（2026-11-16）：-errorinfo 载荷 = 抬升点已预装的
+        // err_info（解析错误带 (parsing expression …) 帧、ARITH 带
+        // 裸消息）；-errorcode = 解析错误的 TCL PARSE EXPR <CLASS>
+        // 抬升码（err_code_raised 已装全局），其余按变体派生。
+        let tec = if self.err_code_raised {
+            self.globals
+                .get("errorCode")
+                .map(|v| v.as_str().to_string())
+                .unwrap_or_else(|| e.tcl_error_code())
+        } else {
+            e.tcl_error_code()
+        };
+        let msg = e.message_text();
+        let line = self.err_line;
+        let ei = self.err_info.clone().unwrap_or_else(|| msg.clone());
+        let opts = format!(
+            "-code 1 -level 0 -errorcode {} -errorinfo {} -errorline {}",
+            crate::value::tcl_quote(&tec),
+            crate::value::tcl_quote(&ei),
+            line
+        );
+        self.err_pending_inner = Some(format!(
+            "syntax {} {}",
+            crate::value::tcl_quote(&msg),
+            crate::value::tcl_quote(&opts)
+        ));
+        if tec.starts_with("TCL PARSE EXPR") {
+            // A parse error is a new error: the next log event starts
+            // a fresh -errorstack with that entry (tclsh
+            // TclErrorStackResetIf).  Without this the event appended
+            // the frame and left the previous error's stack standing.
+            self.err_force_inner = true;
+        }
     }
 }
 

@@ -54,7 +54,8 @@ pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // A1 步数预算：每迭代计一步（回退兜底：即使此内建不被编译为
         // VM 回边，空体 while 也被覆盖）。
         interp.charge_step()?;
-        let cond = interp.eval_expr(test)?;
+        // 条件语境不做结果规范化（eval_expr_cond，C16 9.1 钉形）。
+        let cond = interp.eval_expr_cond(test)?;
         if !crate::types::expr_funcs::strict_bool(&cond)? {
             break;
         }
@@ -132,7 +133,8 @@ pub fn cmd_for(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     loop {
         interp.charge_step()?;
-        let cond = interp.eval_expr(test)?;
+        // 条件语境不做结果规范化（eval_expr_cond，C16 9.1 钉形）。
+        let cond = interp.eval_expr_cond(test)?;
         if !crate::types::expr_funcs::strict_bool(&cond)? { break; }
 
         if same_unit {

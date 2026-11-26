@@ -4,7 +4,7 @@
 //! script: a constant pool, an instruction list, local-variable names, and
 //! source-line mappings for diagnostics.
 
-use crate::opcode::OpCode;
+use crate::opcode::{FoldConst, OpCode};
 use core::fmt;
 use std::rc::Rc;
 
@@ -12,6 +12,85 @@ use std::rc::Rc;
 enum FoldResult {
     Int(i64),
     Bool(bool),
+}
+
+/// The operator byte an [`OpCode::ExprFoldError`] carries, keyed to the
+/// executor's expr_ops dispatch (`/` Div, `%` Mod, `P` Pow, `<` Shl,
+/// `>` Shr, `&`/`|`/`^` BitAnd/Or/Xor).
+fn fold_error_char(op: &OpCode, a: FoldConst, b: FoldConst) -> Option<u8> {
+    let (ai, af) = match a {
+        FoldConst::Int(i) => (Some(i), None),
+        FoldConst::Float(f) => (None, Some(f)),
+    };
+    let (bi, bf) = match b {
+        FoldConst::Int(i) => (Some(i), None),
+        FoldConst::Float(f) => (None, Some(f)),
+    };
+    let float_involved = af.is_some() || bf.is_some();
+    let errors = match op {
+        // 1/0 and friends: divide by zero.  With a float involved only
+        // 0/0.0 errors (domain, either form — `0.0/0` too); x/0.0 (x≠0)
+        // is ±Inf per IEEE.
+        OpCode::Div => {
+            let a_zero = ai == Some(0) || af == Some(0.0);
+            let b_zero = bi == Some(0) || bf == Some(0.0);
+            if float_involved {
+                a_zero && b_zero
+            } else {
+                bi == Some(0)
+            }
+        }
+        // % takes ints only: any float operand errors (left first);
+        // otherwise a zero divisor.
+        OpCode::Mod => float_involved || bi == Some(0),
+        // 0**neg errors; other int bases with a negative exponent give 0;
+        // the ≥2^28-bit magnitude cap errors except for the units
+        // short-circuits (0**n, 1**n, (-1)**n) — the runtime checks the
+        // units first.  A float base errors only for 0.0**neg.
+        OpCode::Pow => {
+            if let (Some(x), Some(y)) = (ai, bi) {
+                if x == 0 && y < 0 {
+                    true
+                } else if y < 0 {
+                    false
+                } else {
+                    x != 0 && x.unsigned_abs() != 1 && y >= (1 << 28)
+                }
+            } else {
+                let base_zero = ai == Some(0) || af == Some(0.0);
+                let exp = bi.map(|v| v as f64).or(bf).unwrap_or(0.0);
+                base_zero && exp < 0.0
+            }
+        }
+        // Shifts take ints only; a negative count errors; `<<` past
+        // rtcl's bignum cap errors ("integer value too large to
+        // represent" — the runtime int_shift raises it before shifting).
+        OpCode::Shl | OpCode::Shr => {
+            if float_involved {
+                true
+            } else {
+                match bi {
+                    Some(c) if c < 0 => true,
+                    Some(c) => *op == OpCode::Shl && c > (1 << 27),
+                    None => false,
+                }
+            }
+        }
+        // Bitwise ops take ints only.
+        OpCode::BitAnd | OpCode::BitOr | OpCode::BitXor => float_involved,
+        _ => false,
+    };
+    errors.then(|| match op {
+        OpCode::Div => b'/',
+        OpCode::Mod => b'%',
+        OpCode::Pow => b'P',
+        OpCode::Shl => b'<',
+        OpCode::Shr => b'>',
+        OpCode::BitAnd => b'&',
+        OpCode::BitOr => b'|',
+        OpCode::BitXor => b'^',
+        _ => 0,
+    })
 }
 
 /// Byte span into a compilation unit's source text (see [`ByteCode::source`]).
@@ -1321,6 +1400,92 @@ impl ByteCode {
             return false;
         }
         let mut changed = false;
+
+        // --- 2-op literal negation fold ---
+        //
+        // [PushInt k, Neg] → PushInt(-k) (checked; i64::MIN stays
+        // runtime — Neg widens to the exact bignum there).  Without it
+        // `0**-1` compiles to [0, 1, Neg, Pow] and the fold-error window
+        // below never sees [0, -1, Pow].
+        {
+            let len = self.ops.len();
+            let mut i = 0;
+            while i + 1 < len {
+                if let (OpCode::PushInt(k), OpCode::Neg) = (&self.ops[i], &self.ops[i + 1]) {
+                    let k = *k;
+                    if let Some(neg) = k.checked_neg() {
+                        self.ops[i] = OpCode::PushInt(neg);
+                        self.ops[i + 1] = OpCode::Nop;
+                        changed = true;
+                        i += 2;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+
+        // --- 3-op fold-error windows (C16) ---
+        //
+        // A [PushInt/PushFloat, PushInt/PushFloat, ArithOp] window whose
+        // constant evaluation the runtime refuses (1/0, 1%0.0, 0**-1,
+        // 3**268435456, negative shifts, float bit-operands, 0/0.0) is
+        // replaced with ExprFoldError carrying the two constants: the
+        // executor re-raises the exact runtime error at that point in
+        // the op stream, and the expr command frame appends with tclsh
+        // 9.1's folded-literal keyword `invoked from within` — tclsh
+        // plants the same deferred error when its compile-time fold of
+        // the constant subtree fails.  Successfully folding windows are
+        // left to the value fold below; everything else runs at runtime.
+        if len >= 3 {
+            let mut i = 0;
+            while i + 2 < len {
+                let av = match &self.ops[i] {
+                    OpCode::PushInt(k) => Some(FoldConst::Int(*k)),
+                    OpCode::PushFloat(f) => Some(FoldConst::Float(*f)),
+                    _ => None,
+                };
+                let bv = match &self.ops[i + 1] {
+                    OpCode::PushInt(k) => Some(FoldConst::Int(*k)),
+                    OpCode::PushFloat(f) => Some(FoldConst::Float(*f)),
+                    _ => None,
+                };
+                if let (Some(av), Some(bv)) = (av, bv) {
+                    if let Some(opc) = fold_error_char(&self.ops[i + 2], av, bv) {
+                        self.ops[i] = OpCode::ExprFoldError(opc, av, bv);
+                        self.ops[i + 1] = OpCode::Nop;
+                        self.ops[i + 2] = OpCode::Nop;
+                        changed = true;
+                        i += 3;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+
+        // Unary window: [PushFloat f, BitNot] — a float operand of `~`
+        // errors at fold (9.1: `~4.0` → cannot use floating-point value
+        // "4.0" as operand of "~").  The pending PushFloat stays: the
+        // fold error raises before any stack consumer and the unwind
+        // discards it.  (Outside the 3-op guard above: `expr {~4.0}` is
+        // exactly two ops.)
+        {
+            let len = self.ops.len();
+            let mut i = 0;
+            while i + 1 < len {
+                if let OpCode::PushFloat(f) = &self.ops[i] {
+                    if matches!(self.ops[i + 1], OpCode::BitNot) {
+                        self.ops[i + 1] =
+                            OpCode::ExprFoldError(b'~', FoldConst::Float(*f), FoldConst::Int(0));
+                        changed = true;
+                        i += 2;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
 
         // --- 3-op constant folding ---
         //

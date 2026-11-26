@@ -201,6 +201,14 @@ impl CmdId {
 // OpCode — the instruction set
 // ---------------------------------------------------------------------------
 
+/// A constant as it sat in a peephole fold window: the exact value the
+/// `PushInt`/`PushFloat` would have pushed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FoldConst {
+    Int(i64),
+    Float(f64),
+}
+
 /// A single VM instruction.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OpCode {
@@ -214,6 +222,13 @@ pub enum OpCode {
 
     /// Push the empty string.
     PushEmpty,
+
+    /// Evaluate TOS as an expression in a CONDITION context
+    /// (`if`/`elseif`/`while`/`for`): result canonicalization is skipped
+    /// (tclsh's jumpFalse conversion precedes it — `while {NaN}` reports
+    /// the conversion error, not the expr command's domain error, C16).
+    /// Evaluated through `Interp::eval_expr_cond`.
+    EvalExprCond,
 
     /// Push a small integer literal.
     PushInt(i64),
@@ -477,6 +492,16 @@ pub enum OpCode {
     Div,
     Mod,
     Pow,
+
+    /// A compile-time constant-fold attempt that the runtime would
+    /// refuse, planted by the peephole in place of the failing
+    /// `[PushInt/PushFloat, PushInt/PushFloat, ArithOp]` window (C16).
+    /// At execution the shared expr_ops raise the exact runtime error
+    /// (identical text/errorCode), and the expr command frame appends
+    /// with tclsh 9.1's folded-literal keyword `invoked from within`.
+    /// Payload: the operator char and the two constants as they would
+    /// have been pushed.
+    ExprFoldError(u8, FoldConst, FoldConst),
     Neg,
 
     // ── Comparison ──────────────────────────────────────────────────────────
@@ -785,6 +810,7 @@ impl fmt::Display for OpCode {
             OpCode::PushConst(idx) => write!(f, "PUSH_CONST {}", idx),
             OpCode::PushConstWide(idx) => write!(f, "PUSH_CONST_WIDE [{}]", idx),
             OpCode::PushEmpty => write!(f, "PUSH_EMPTY"),
+            OpCode::EvalExprCond => write!(f, "EVAL_EXPR_COND"),
             OpCode::PushInt(n) => write!(f, "PUSH_INT {}", n),
             OpCode::PushFloat(n) => write!(f, "PUSH_FLOAT {}", n),
             OpCode::PushTrue => write!(f, "PUSH_TRUE"),
@@ -887,6 +913,9 @@ impl fmt::Display for OpCode {
             OpCode::Div => write!(f, "DIV"),
             OpCode::Mod => write!(f, "MOD"),
             OpCode::Pow => write!(f, "POW"),
+            OpCode::ExprFoldError(op, a, b) => {
+                write!(f, "EXPR_FOLD_ERROR {} {:?} {:?}", *op as char, a, b)
+            }
             OpCode::Neg => write!(f, "NEG"),
 
             // Comparison

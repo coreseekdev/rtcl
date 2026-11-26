@@ -11,7 +11,12 @@ use super::nfa::Prog;
 type Caps = Vec<Option<(usize, usize)>>;
 type State = (usize, Caps);
 
-const BUDGET: u64 = 2_000_000;
+// 24M（原 2M，C47 9.1 对齐）：oracle 对长文本上的回溯扫描给出结果
+// （`regexp {(x+)y\1}` 对 1030/2000/3300 个 x → 0，无步数预算），原
+// 2M 在 n≈1000 就报 REGEXP REG_ESPACE。24M 覆盖 ~3300 字符的线性-平方
+// 扫描族（bail 墙钟 ~1.5-2s，防挂死护栏仍在——真指数级 pattern 仍
+// 截断报 too complex，tclsh 对同类 pattern 自身也挂）。
+const BUDGET: u64 = 24_000_000;
 /// States one node may hand on. Hitting it leaves the match unfinished
 /// (`super::over_budget`): at 512, `a+()\1x` over 2,000 characters lost
 /// the one endpoint that satisfies `x` and answered "no match".

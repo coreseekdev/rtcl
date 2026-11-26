@@ -45,6 +45,56 @@ pub(crate) fn frame_local_insert(f: &mut CallFrame, key: String, v: Value) {
     }
 }
 
+// ── T4 命名空间体快路径的键拼装 ─────────────────────────────────
+//
+// 体里裸名的解析键 = `<ns>::<名字>`（`canonical_global_in` 平名分支
+// `format!("{}::{}", ns, name)` 后剥 `::` 的产出）。快路径把键拼在
+// 调用方的栈缓冲里——每次读写零堆分配；两段都已是 UTF-8，拼接仍必
+// 是 UTF-8。64 字节封顶：更长的名字回落全链（正确性不变，慢一点）。
+
+/// 拼出 `<ns>::<name>`（`ns` 恒规整形 `::x`——与 ns_var_declared 的
+/// `&self.current_namespace[2..]` 同一拆法），返回入缓冲的切片。
+fn stack_ns_key<'b>(ns: &str, name: &str, buf: &'b mut [u8]) -> Option<&'b str> {
+    let base = &ns[2..];
+    let len = base.len() + 2 + name.len();
+    if len > buf.len() {
+        return None;
+    }
+    buf[..base.len()].copy_from_slice(base.as_bytes());
+    buf[base.len()..base.len() + 2].copy_from_slice(b"::");
+    buf[base.len() + 2..len].copy_from_slice(name.as_bytes());
+    Some(std::str::from_utf8(&buf[..len]).expect("utf8 by construction"))
+}
+
+/// 数组读的键对：宿主 `<ns>::<base>` 与元素 `<ns>::<base>(<idx>)`，
+/// 同一栈缓冲拼出（先写宿主段，再补 `(idx)`）。宿主切片与元素切片
+/// 同源于 buf（写完后取共享视图）。
+fn stack_ns_elem_keys<'b>(
+    ns: &str,
+    base: &str,
+    index: &str,
+    buf: &'b mut [u8],
+) -> Option<(&'b str, &'b str)> {
+    let stripped = &ns[2..];
+    let host_len = stripped.len() + 2 + base.len();
+    let elem_len = host_len + 1 + index.len() + 1;
+    if elem_len > buf.len() {
+        return None;
+    }
+    let mut n = 0;
+    buf[n..n + stripped.len()].copy_from_slice(stripped.as_bytes());
+    n += stripped.len();
+    buf[n..n + 2].copy_from_slice(b"::");
+    n += 2;
+    buf[n..n + base.len()].copy_from_slice(base.as_bytes());
+    buf[host_len] = b'(';
+    buf[host_len + 1..host_len + 1 + index.len()].copy_from_slice(index.as_bytes());
+    buf[elem_len - 1] = b')';
+    let host = std::str::from_utf8(&buf[..host_len]).expect("utf8 by construction");
+    let elem = std::str::from_utf8(&buf[..elem_len]).expect("utf8 by construction");
+    Some((host, elem))
+}
+
 /// Remove from a frame's locals (log entry goes stale, as above).
 pub(crate) fn frame_local_remove(f: &mut CallFrame, key: &str) -> Option<Value> {
     f.locals.remove(key)
@@ -1389,6 +1439,21 @@ impl Interp {
                 }
             }
         }
+        // T4 vars：根限定单叶 `::leaf`（无内层 `::`、无 `(`）——任何语
+        // 境直读 :: 表（split_global 臂，无重定向；限定名父 ns 检查对
+        // 单叶是空转）。命中即读；miss 与数组标记都留给下方全链
+        // （valueless 条目的 errorCode、is-array 文本、父 ns 检查归
+        // 它）。ts 分支在其上（槽叶优先，语义原样）。
+        if let Some(leaf) = name
+            .strip_prefix("::")
+            .filter(|rest| !rest.contains("::") && !rest.contains('('))
+        {
+            if !self.array_globals.is_empty() && self.array_globals.contains(leaf) {
+                // 数组语义（is-array 错误文本归属全链）。
+            } else if let Some(v) = self.globals.get(leaf) {
+                return Ok(v);
+            }
+        }
         // 限定名父 ns 不存在 → 变量不可见（D-2：ns delete——含体中自
         // 删——后的帧视图对限定访问不可见，sd1-B/sd3 实证；裸名
         // keep-alive 链接不受影响）。
@@ -1447,24 +1512,42 @@ impl Interp {
                             ErrorCode::NotFound,
                         )
                     });
+                } else if self.current_namespace.as_ref() != "::"
+                    && !has_ns_sep(array_name)
+                    && self.flat_aliases.is_empty()
+                    && self.ns_transient.is_empty()
+                {
+                    // T4 vars：ns 体平键数组读——宿主键与元素键栈上拼
+                    // （与 resolve_loc/element_key 逐字同）。宿主数组在
+                    // ns 表才进：miss = 元素缺（宿主已确证数组，全链同
+                    // 错文本）；宿主缺席时全链的 alt 判定（全局数组可
+                    // 见性——S8 已收敛为 ns-only）原样保留。
+                    let mut buf = [0u8; 96];
+                    if let Some((host, elem)) =
+                        stack_ns_elem_keys(self.current_namespace.as_ref(), array_name, index, &mut buf)
+                    {
+                        // 宿主不是死链别名（deaden 后的裸名读不得穿到旧
+                        // 目标——T7 守卫同款，对 canonical 键再查一遍）。
+                        if self.dead_flat.iter().all(|k| k != host)
+                            && self.array_globals.contains(host)
+                        {
+                            return self.globals.get(elem).ok_or_else(|| {
+                                Error::runtime(
+                                    format!(
+                                        "can't read \"{}\": no such element in array",
+                                        name
+                                    ),
+                                    ErrorCode::NotFound,
+                                )
+                            });
+                        }
+                    }
                 }
             }
-            let mut loc = self.resolve_loc(array_name);
-            if !self.loc_is_array(&loc)
-                && self.var_frame_idx().is_none()
-                && self.current_namespace.as_ref() != "::"
-                && !array_name.contains("::")
-            {
-                // Unqualified array read outside procs: the current
-                // namespace's array wins; otherwise the bare global array
-                // is visible (`set a(g)` in `namespace eval n` reads the
-                // global a).  A `variable a` declaration blocks the
-                // fallback, mirroring scalar resolution.
-                let alt = VarLoc::Global(array_name.to_string());
-                if !self.ns_var_declared(array_name) && self.loc_is_array(&alt) {
-                    loc = alt;
-                }
-            }
+            let loc = self.resolve_loc(array_name);
+            // Tcl 9（S8 读侧收尾）：裸名数组基只落当前 ns 的表——元素
+            // 读与元素写/info exists 同一落点（后两者已是 ns-only），
+            // 同名全局数组在体里不可见（tclVar.c：TCL_NAMESPACE_ONLY）。
             if self.loc_is_array(&loc) {
                 let key = loc.element_key(index);
                 self.loc_get(&loc, &key).ok_or_else(|| {
@@ -1524,6 +1607,29 @@ impl Interp {
                             ));
                         }
                         return Ok(v);
+                    }
+                } else if self.current_namespace.as_ref() != "::"
+                    && self.flat_aliases.is_empty()
+                    && self.ns_transient.is_empty()
+                {
+                    // T4 vars：ns 体裸名读（cmd_set/incr/append 的命令
+                    // 径）——键栈上拼（与 read_var_scalar_top 同构造），
+                    // 命中即读；miss 与数组标记命中都留给下方全链
+                    // （valueless 条目的 errorCode、is-array 文本）。
+                    let mut buf = [0u8; 64];
+                    if let Some(key) =
+                        stack_ns_key(self.current_namespace.as_ref(), name, &mut buf)
+                    {
+                        if let Some(v) = self.globals.get(key) {
+                            if !self.array_globals.is_empty() && self.array_globals.contains(key)
+                            {
+                                return Err(Error::runtime(
+                                    format!("can't read \"{}\": variable is array", name),
+                                    ErrorCode::Generic,
+                                ));
+                            }
+                            return Ok(v);
+                        }
                     }
                 }
             }
@@ -1842,6 +1948,24 @@ impl Interp {
                         *slot = value.clone();
                         wrote = true;
                     }
+                } else if self.current_namespace.as_ref() != "::"
+                    && self.flat_aliases.is_empty()
+                    && self.ns_transient.is_empty()
+                {
+                    // T4 vars：ns 体裸名覆写（命令径）——键栈上拼，键已
+                    // 存在才原地写；新建（含 variable 声明无值目标）落
+                    // 点归下方全链（store_var 的 9.1 落点）。
+                    let mut buf = [0u8; 64];
+                    if let Some(key) =
+                        stack_ns_key(self.current_namespace.as_ref(), name, &mut buf)
+                    {
+                        if !self.array_globals.is_empty() && self.array_globals.contains(key) {
+                            // 数组语义（is-array 错误文本归属全链）。
+                        } else if let Some(slot) = self.globals.get_mut(key) {
+                            *slot = value.clone();
+                            wrote = true;
+                        }
+                    }
                 }
                 if wrote {
                     if !self.var_traces.is_empty() {
@@ -1952,13 +2076,24 @@ impl Interp {
                 None => frame.locals.get_mut(name),
             }
         } else {
-            if self.current_namespace.as_ref() != "::"
-                || !self.flat_aliases.is_empty()
-                || (!self.arrays_env_only && self.array_globals.contains(name))
-            {
+            if !self.flat_aliases.is_empty() || !self.ns_transient.is_empty() {
                 return None;
             }
-            self.globals.get_mut(name)
+            if self.current_namespace.as_ref() == "::" {
+                if !self.arrays_env_only && self.array_globals.contains(name) {
+                    return None;
+                }
+                return self.globals.get_mut(name);
+            }
+            // T4 vars：ns 体裸名（incr 热径）——键栈上拼，与 scalar
+            // 直写守卫同一构造；数组语义与超长回落真 incr（其建名、
+            // 非整数与溢出错误文本归它）。
+            let mut buf = [0u8; 64];
+            let key = stack_ns_key(self.current_namespace.as_ref(), name, &mut buf)?;
+            if !self.arrays_env_only && self.array_globals.contains(key) {
+                return None;
+            }
+            self.globals.get_mut(key)
         }
     }
 
@@ -2881,6 +3016,12 @@ impl Interp {
     /// callback may create the element (trace-1.7).  No fire when the
     /// array is missing or the base is a scalar (trace-1.8).
     pub fn read_var(&mut self, name: &str) -> Result<Value> {
+        // T4 vars：两张 trace 表全空 → fire 一趟是可证空转（fire 也会
+        // 为 stamp key 白付两次 resolve_loc 分配），base/index 拆分与
+        // is-array 判定一并跳过——元素读走 get_var 的快径守卫。
+        if self.var_traces.is_empty() && self.elem_traces.is_empty() {
+            return self.get_var(name).cloned();
+        }
         // Fast path: scalar read with no variable traces registered — the
         // loop-body `$x` case.  The base-name allocation and the read
         // trace pass are both no-ops without traces, so skip them whole
@@ -2911,40 +3052,114 @@ impl Interp {
     /// 单次括号扫描 + 单次哈希探测，跳过 eval_var_ref/get_var 的重复
     /// 下标检查与 scope-chain 步进。守卫集 = 全语义路径可能分岔的全
     /// 部条件；任一命中返回 None（调用方走 eval_var_ref 全链）。
+    ///
+    /// T4：三条臂——(1) `::` 顶层裸名（原样）；(2) 命名空间体裸名
+    /// （无 proc 帧：键 = `<ns>::<名字>` 在栈上拼装、单次探测，命中即
+    /// 全部答案，miss/数组语义回落全链——T1 的 9.1 规则：体里裸名只
+    /// 查当前 ns 自己的表，`canonical_global`+`redirect_flat` 的落点
+    /// 由守卫等价替代）；(3) 根限定单叶 `::leaf`（split_global 的落
+    /// 点，ts 单元缺席时直读 :: 表）。
     pub(crate) fn read_var_scalar_top(&self, name: &str) -> Option<&Value> {
         crate::interp::dbgtrace::event("read_top", name);
+        if name.contains('(')
+            || !self.var_traces.is_empty()
+            || !self.dead_flat.is_empty()
+            || !self.frames.is_empty()
+        {
+            return None;
+        }
+        // 根限定单叶（`::leaf`，无内层 `::`）：任何语境直读 :: 表
+        // （resolve_loc 的 split_global 臂，无重定向）。ts 单元的
+        // ::leaf 读由 ts 分支权威（槽叶与全局叶同名同一变量，读槽
+        // 新鲜度）——ts 在席即让路。
+        if let Some(leaf) = name.strip_prefix("::") {
+            if leaf.contains("::") || self.top_slots.is_some() {
+                return None;
+            }
+            if !self.array_globals.is_empty() && self.array_globals.contains(leaf) {
+                return None; // 数组语义（is-array 错误文本归属全链）
+            }
+            return self.globals.get(leaf);
+        }
+        if has_ns_sep(name) {
+            return None;
+        }
+        if self.current_namespace.as_ref() == "::" {
+            // 原 `::` 顶层裸名臂（守卫原样）。
+            if !self.flat_aliases.is_empty() {
+                return None;
+            }
+            if !self.array_globals.is_empty() && self.array_globals.contains(name) {
+                return None; // 数组语义（is-array 错误文本归属全链）
+            }
+            return self.globals.get(name);
+        }
+        // T4 命名空间体裸名臂：键栈上拼（超长回落），平键重定向缺席
+        // 时 `<ns>::<名字>` 与 canonical_global+redirect_flat 的产出逐
+        // 字同（平名分支无 `::`/`(`，键构造不歧义）。命中即读；miss
+        // 与数组语义回落全链（valueless 条目 errorCode、is-array 文本
+        // 归它）。
+        if !self.flat_aliases.is_empty() || !self.ns_transient.is_empty() {
+            return None;
+        }
+        let mut buf = [0u8; 64];
+        let key = stack_ns_key(self.current_namespace.as_ref(), name, &mut buf)?;
+        if !self.array_globals.is_empty() && self.array_globals.contains(key) {
+            return None; // 数组语义（is-array 错误文本归属全链）
+        }
+        self.globals.get(key)
+    }
+
+    /// 顶层标量直写实守卫（set_var_scalar_top 前置；分离以避免 value
+    /// 在守卫失败时被移动）。守卫集 = set_var 全链可能分岔的条件。
+    ///
+    /// T4：命名空间体裸名臂（覆写语义）——键已存在才放行（新建落点
+    /// 与数组语义归慢链，与读侧同一键构造）；`contains_key` 探测后
+    /// set_var_scalar_top 的 `get_mut` 必中（两调用相邻、中间无 interp
+    /// 变异）。
+    pub(crate) fn scalar_top_write_ok(&self, name: &str) -> bool {
         if name.contains('(')
             || has_ns_sep(name)
             || !self.var_traces.is_empty()
             || !self.dead_flat.is_empty()
             || !self.frames.is_empty()
-            || self.current_namespace.as_ref() != "::"
-            || !self.flat_aliases.is_empty()
         {
-            return None;
+            return false;
         }
-        if !self.array_globals.is_empty() && self.array_globals.contains(name) {
-            return None; // 数组语义（is-array 错误文本归属全链）
+        if self.current_namespace.as_ref() == "::" {
+            return self.flat_aliases.is_empty()
+                && (self.array_globals.is_empty() || !self.array_globals.contains(name));
         }
-        self.globals.get(name)
-    }
-
-    /// 顶层标量直写实守卫（set_var_scalar_top 前置；分离以避免 value
-    /// 在守卫失败时被移动）。守卫集 = set_var 全链可能分岔的条件。
-    pub(crate) fn scalar_top_write_ok(&self, name: &str) -> bool {
-        !name.contains('(')
-            && !has_ns_sep(name)
-            && self.var_traces.is_empty()
-            && self.dead_flat.is_empty()
-            && self.frames.is_empty()
-            && self.current_namespace.as_ref() == "::"
-            && self.flat_aliases.is_empty()
-            && (self.array_globals.is_empty() || !self.array_globals.contains(name))
+        // T4 命名空间体裸名覆写臂。
+        if !self.flat_aliases.is_empty() || !self.ns_transient.is_empty() {
+            return false;
+        }
+        let mut buf = [0u8; 64];
+        let Some(key) = stack_ns_key(self.current_namespace.as_ref(), name, &mut buf) else {
+            return false;
+        };
+        (self.array_globals.is_empty() || !self.array_globals.contains(key))
+            && self.globals.contains_key(key)
     }
 
     /// 顶层标量直写（守卫由 scalar_top_write_ok 前置；写 trace 已被
     /// var_traces 空守卫排除）。set_var 返回语义 = Ok(新值)。
+    ///
+    /// T4：ns 体臂按守卫同一构造取 `get_mut` 原地写（键已存在，键串
+    /// 不动、不进堆）；防御臂 store_var 即 9.1 的落点语义。
     pub(crate) fn set_var_scalar_top(&mut self, name: &str, value: Value) {
+        if self.current_namespace.as_ref() != "::" {
+            let mut buf = [0u8; 64];
+            if let Some(key) = stack_ns_key(self.current_namespace.as_ref(), name, &mut buf) {
+                if let Some(slot) = self.globals.get_mut(key) {
+                    *slot = value;
+                    return;
+                }
+            }
+            // 守卫已确认键存在——此处不可达；store_var 即同一落点。
+            self.store_var(name, value);
+            return;
+        }
         self.global_insert(name.to_string(), value);
     }
 

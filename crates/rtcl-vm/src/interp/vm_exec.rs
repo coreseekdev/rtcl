@@ -3262,7 +3262,8 @@ fn op_begin_cmd(
     st: &mut VmState,
     site_idx: u32,
 ) -> Result<()> {
-    if interp.call_depth > interp.max_call_depth {
+    // 9.1 边界（C39）：完成层数 998 @limit 1000——== 也要拒。
+    if interp.call_depth >= interp.max_call_depth {
         return Err(Error::recursion_limit());
     }
     let site = &code.sites[site_idx as usize];

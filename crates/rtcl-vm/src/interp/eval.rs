@@ -1016,9 +1016,23 @@ impl Interp {
         if let (Some(k), Some(t)) = (&exec_key, &cmdtext) {
             self.exec_fire_enter(k, t)?;
         }
-        self.call_depth += 1;
+        // C39（9.1 口径）：内联循环命令（while/for/foreach——tclsh 把体
+        // 内联编译进调用者单元，体不是求值层）不占递归深度：体递归的
+        // 每层只有 proc 调用 +1，9.1 实测到 ~998 层；每次分派 +1 会让
+        // 字节码语境的循环体递归在 500 层翻车。
+        // 仅字节码语境豁免：纯树走查（RTCL_NO_BYTECODE/回退语境）的
+        // 每层 Rust 栈 ≈ 8KB+，998 层会爆 8MB 栈——那里保留 per-dispatch
+        // 计数当栈防线（资源上限机制不动；树走查循环体递归停在资源
+        // 界 ~499，记账到 D3 树引擎删除时随根消掉）。其他 builtin 分派
+        // 照旧 +1——同为树走查栈防线。
+        let depth_free = matches!(cmd_name, "while" | "for" | "foreach");
+        if !depth_free {
+            self.call_depth += 1;
+        }
         let result = f(self, args);
-        self.call_depth -= 1;
+        if !depth_free {
+            self.call_depth -= 1;
+        }
         let result = self.fill_wrong_args(cmd_name, result);
         if let (Some(k), Some(t)) = (&exec_key, &cmdtext) {
             let (code, res) = match &result {

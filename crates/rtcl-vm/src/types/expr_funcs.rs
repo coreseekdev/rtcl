@@ -255,9 +255,8 @@ pub(crate) fn f64_arg(v: &Value) -> Result<f64> {
         )),
         Some(f) => Ok(f),
         None => Err(Error::Msg(format!(
-            "expected floating-point number but got \"{}\"{}",
-            v.as_str(),
-            octal_hint(v)
+            "expected floating-point number but got \"{}\"",
+            v.as_str()
         ))),
     }
 }
@@ -355,9 +354,8 @@ fn fp_class(v: &Value) -> Result<FpClass> {
     match v.as_float() {
         Some(d) => Ok(classify(d)),
         None => Err(Error::Msg(format!(
-            "expected number but got \"{}\"{}",
-            v.as_str(),
-            octal_hint(v)
+            "expected number but got \"{}\"",
+            v.as_str()
         ))),
     }
 }
@@ -473,9 +471,8 @@ pub(crate) fn call_c99_math_func(name: &str, args: Vec<Value>) -> Result<Value> 
                 None => match args[0].as_float() {
                     Some(d) => Ok(Value::from_int(d.is_sign_negative() as i64)),
                     None => Err(Error::Msg(format!(
-                        "expected number but got \"{}\"{}",
-                        args[0].as_str(),
-                        octal_hint(&args[0])
+                        "expected number but got \"{}\"",
+                        args[0].as_str()
                     ))),
                 },
             }

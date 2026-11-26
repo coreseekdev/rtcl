@@ -55,7 +55,9 @@ colored = "2.1"
 tikv-jemallocator = { version = "0.6", default-features = false, features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
 regex = "1"
 regex-lite = "0.1"
-num-bigint = "0.4"
+# D5（specs/ARCH-DESIGN-20261126.md）：alloc-only（无 std/rand）——
+# 值表示层直接持 Rc<BigInt> 堆箱；no_std/wasm 兼容面由它保证。
+num-bigint = { version = "0.4", default-features = false }
 num-traits = "0.2"
 num-integer = "0.1"
 rtcl-data = { path = "crates/rtcl-data" }

@@ -459,35 +459,69 @@ pub fn op_str_ne(left: &Value, right: &Value) -> Value {
 
 /// `**` — Tcl: two integer operands use integer exponentiation (units
 /// short-circuit, negative exponent yields 0, ≥2^28-bit results error);
-/// any float computes in f64.
+/// any float computes in f64.  D5: bignum operands stay exact —
+/// `(2**64)**2` is the exact bignum, not a double shimmer.
 pub fn op_pow(base: Value, exp: Value) -> Result<Value> {
-    if let (Some(a), Some(b)) = (base.as_int(), exp.as_int()) {
-        return match a {
-            // Units short-circuit before any range check — tclsh
-            // computes 1**268435456 and (-1)**268435456 instantly.
-            0 if b < 0 => Err(Error::Msg(
-                "exponentiation of zero by negative power".to_string(),
-            )),
-            // 0**0 is 1 (expr-23.15); 0**n is 0 (expr-23.14).
-            0 if b == 0 => Ok(Value::from_int(1)),
-            0 => Ok(Value::from_int(0)),
-            1 => Ok(Value::from_int(1)),
-            -1 => Ok(Value::from_int(if b % 2 == 0 { 1 } else { -1 })),
-            // Integer base with negative exponent yields 0
-            // (tclsh: `expr {2**-1}` → 0).
-            _ if b < 0 => Ok(Value::from_int(0)),
-            // tclsh refuses to build numbers of ≥ 2**28 bits
-            // (expr-23.54.12: 3**268435456 → "exponent too large").
-            _ if b >= 1 << 28 => Err(Error::Msg("exponent too large".to_string())),
-            _ => match a.checked_pow(b as u32) {
-                Some(r) => Ok(Value::from_int(r)),
-                // Overflow widens to an exact bignum (expr-23.48:
-                // 2**81 is 2417851639229258349412352).
-                None => Ok(bignum::to_value(bignum::IntRep::Big(
-                    num_bigint::BigInt::from(a).pow(b as u32),
-                ))),
-            },
+    use num_bigint::BigInt;
+    use num_traits::{Signed, ToPrimitive};
+    if let (Some(ia), Some(ib)) = (bignum::int_rep(&base), bignum::int_rep(&exp)) {
+        // Exponent sign/parity/zero for both reps (D5: the exponent can
+        // itself be a bignum); the magnitude also feeds the 2**28-bit cap.
+        let (b_neg, b_even, bmag) = match &ib {
+            bignum::IntRep::I64(b) => (*b < 0, b % 2 == 0, BigInt::from(b.unsigned_abs())),
+            bignum::IntRep::Big(b) => {
+                let mag = b.abs();
+                let even = mag.bit(0) == false;
+                (b.is_negative(), even, mag)
+            }
         };
+        let b_zero = ib.is_zero();
+        // Units short-circuit before any range check — tclsh
+        // computes 1**268435456 and (-1)**268435456 instantly.
+        match &ia {
+            bignum::IntRep::I64(0) => {
+                return if b_neg {
+                    Err(Error::Msg(
+                        "exponentiation of zero by negative power".to_string(),
+                    ))
+                } else {
+                    // 0**0 is 1 (expr-23.15); 0**n is 0 (expr-23.14).
+                    Ok(Value::from_int(if b_zero { 1 } else { 0 }))
+                };
+            }
+            bignum::IntRep::I64(1) => return Ok(Value::from_int(1)),
+            bignum::IntRep::I64(-1) => {
+                return Ok(Value::from_int(if b_even { 1 } else { -1 }))
+            }
+            _ => {}
+        }
+        // Integer base with negative exponent yields 0
+        // (tclsh: `expr {2**-1}` → 0).
+        if b_neg {
+            return Ok(Value::from_int(0));
+        }
+        // tclsh refuses to build numbers of ≥ 2**28 bits
+        // (expr-23.54.12: 3**268435456 → "exponent too large"); the cap
+        // keys on the exponent magnitude in both reps.
+        if bmag >= BigInt::from(1u32 << 28) {
+            return Err(Error::Msg("exponent too large".to_string()));
+        }
+        let b32 = match &ib {
+            bignum::IntRep::I64(b) => *b as u32,
+            bignum::IntRep::Big(b) => b.to_u32().unwrap_or(u32::MAX),
+        };
+        // i64×i64: checked first, the common small case allocates nothing.
+        if let bignum::IntRep::I64(a) = &ia {
+            if let Some(r) = a.checked_pow(b32) {
+                return Ok(Value::from_int(r));
+            }
+        }
+        // Overflow — or a bignum base — widens to an exact bignum
+        // (expr-23.48: 2**81 is 2417851639229258349412352; D5:
+        // (2**64)**2 stays exact through the Big rep).
+        return Ok(bignum::to_value(bignum::IntRep::Big(
+            ia.to_big().pow(b32),
+        )));
     }
     match (base.as_float(), exp.as_float()) {
         (Some(a), Some(b)) => {

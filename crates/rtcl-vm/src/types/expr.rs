@@ -109,13 +109,15 @@ fn canonicalize_result(v: Value) -> Result<Value> {
     if let Some(i) = v.as_int() {
         return Ok(Value::from_int(i));
     }
-    // Bignum-range integers canonicalize to exact decimal text
-    // (tclsh Tcl_SetBignumObj replaces the string rep at parse: `expr {$x}`
-    // with x="0x10000000000000000" renders 18446744073709551616; pbr3).
+    // Bignum-range integers canonicalize to the exact value with an int
+    // rep (tclsh Tcl_SetBignumObj replaces the string rep at parse:
+    // `expr {$x}` with x="0x10000000000000000" renders
+    // 18446744073709551616; pbr3).  D5: the rep is Big(Rc<BigInt>) —
+    // 运算链免逐次十进制重解析；字符串渲染不变。
     // E4: never degrade to a rounded double — keep the exact value. The
     // grammar is types::bignum::parse_int (legacy octal included).
     if let Some(super::bignum::IntRep::Big(big)) = super::bignum::parse_int(v.as_str().trim()) {
-        return Ok(Value::from_str(&big.to_string()));
+        return Ok(Value::from_bigint(big));
     }
     if let Some(f) = v.as_float() {
         // A string that parses to NaN cannot canonicalize — tclsh raises

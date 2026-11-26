@@ -169,7 +169,8 @@ fn octal_hint(v: &Value) -> &'static str {
 /// Shared `int()`/`entier()`/`wide()` body.  NaN and infinities error
 /// ("integer value too large to represent" / "floating point value is
 /// Not a Number"); doubles truncate toward zero exactly; `wrap` takes the
-/// low 64 bits of the exact integer, otherwise bignums survive.
+/// low 64 bits of the exact integer (9.1's `wide()` alone), otherwise
+/// bignums survive (`int()`/`entier()` in 9.1).
 fn int_or_entier(v: &Value, keep_big: bool) -> Result<Value> {
     use super::bignum::{big_from_f64, to_i64_wrap, to_value, IntRep};
     if let Some(rep) = super::bignum::int_rep(v) {
@@ -250,14 +251,17 @@ pub(crate) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
             require_args(name, 1, args.len())?;
             abs_value(&args[0])
         }
-        // int() truncates toward zero and WRAPS to the low 64 bits of the
-        // exact integer (probed: int(1e22) is 1864712049423024128,
-        // int(9223372036854775808) is -9223372036854775808); out-of-range
-        // infinities error.  entier() is the same truncation but keeps
-        // bignum precision (entier(1e+22) is 10000000000000000000000).
+        // Tcl 9.1（D5 重钉）：int() truncates toward zero and keeps the
+        // exact value — no word wrap (`int(1e22)` is
+        // 10000000000000000000000, `int(9223372036854775808)` stays
+        // positive; the 8.6 low-64 wrap is retired).  entier() is the
+        // same truncation (they differ only for floats in
+        // Tcl_GetIntForIndex-era semantics — both exact here).  wide()
+        // alone wraps to the low 64 bits (wide(1e22) is
+        // 1864712049423024128); out-of-range infinities error.
         "int" => {
             require_args(name, 1, args.len())?;
-            int_or_entier(&args[0], false)
+            int_or_entier(&args[0], true)
         }
         "entier" => {
             require_args(name, 1, args.len())?;

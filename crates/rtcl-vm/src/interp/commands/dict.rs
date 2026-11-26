@@ -532,10 +532,11 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let mut entries = parse_dict(interp, &dict_val)?;
             // 现存键非整数 → 报错且不动字典（dict-deep 探针：tclsh
             // `expected integer but got "abc"`、d 保持 k abc——原
-            // unwrap_or(0) 会静默覆盖成 1）。
+            // unwrap_or(0) 会静默覆盖成 1）。9.1 口径（D5 重钉）：
+            // 非数字现值 errorCode = TCL VALUE NUMBER（smallface d2）。
             let cur = match entries.get(key) {
                 Some(v) => v.as_int().ok_or_else(|| {
-                    super::list::set_error_code(interp, "TCL VALUE INTEGER");
+                    super::list::set_error_code(interp, "TCL VALUE NUMBER");
                     Error::runtime(
                         format!("expected integer but got \"{}\"", v.as_str()),
                         crate::error::ErrorCode::Generic,

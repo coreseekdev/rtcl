@@ -6,9 +6,9 @@
 
 ## 对标迁移（Tcl 9.1，2026-11-25 起）
 
-> 实证底账（2026-11-25）：oracle 切到 9.1.0 后，judge **88/88** 全绿、
-> 探针 **312/437**（125 项 DIFF = 迁移面）、命令清单差 **17 缺 1 多**
-> （`case` 多）。以下按工作组拆解；每项标注探针证据（`judge/probes/`
+> 实证底账（2026-11-26 更新）：oracle 切到 9.1.0 后，judge **88/88**
+> 全绿、探针 **317/437**（122 项 DIFF = 迁移面；T1/T2/误差栈归一已
+> 顺带清 3 项+1 新探针入列）、命令清单差 **17 缺 1 多**（`case` 多）。以下按工作组拆解；每项标注探针证据（`judge/probes/`
 > 文件名）。权威变更清单：9.0 vs 8.6 见 `.refer/tcl910/tcl90-changes.md`
 > （内嵌 9.0.0 段），9.1 vs 9.0 见 `.refer/tcl910/tcl9.1.0/changes.md`。
 > 每完成一项：对应探针转绿 + `judge/run.sh`（9.1 oracle）保持 88/88。
@@ -549,18 +549,20 @@ judge/sweep 同跑）。下面只列**结构**动作：按类别消除，而不�
     缓冲区上）；`lappend`、`dict set`、`incr` 的快路径同样改成就地改。
     顺带修掉 C48（`unset` 后重建的全局变量在 `info globals` 里的位置）
     和 C50（变量读写出错时的 errorCode）。探针 d26（79 条断言）。
-  - [ ] 数组读写；P7 编译期；P1/P9 通道缓冲读；P5 `array size`；C47
-    回引预算；P15 剩下的三处（`string last` 命中、长模式未命中、非
-    ASCII 的字符计数）。
+  - [x] 数组读写；P7 编译期；P1/P9 通道缓冲读；P5 `array size`；P15
+    剩下的三处（2026-11-26 完成：数组元素读写 ≤2.1x、for5000 编译
+    0.28s→0.01s=0.5×、文件 1.38×/TCP 1.17×、`array size` O(1) 反超、
+    `string last` miss 反超 0.34x；hit/hit-uni 架构下界待 Value 字符
+    长度缓存，见 BASELINE 2026-11-26 节）。**余**：C47 回引预算。
   - [ ] 这一批里对出来的新差异：
     - [x] C49：proc 里执行的 `namespace eval` 体读不到、写不进命名空间
       的变量，反而覆盖 proc 的局部变量（两引擎）。顺带修掉 C52（体里
       用裸名访问全局变量时 trace 不触发、数组子命令不走链）和 C53
       （有条目没值的全局变量不接写，读/`unset` 的 errorCode）。探针
       d27（139 条断言）。
-    - [ ] proc 里 `info locals` / `info vars` 的顺序：tclsh 是编译局部
-      变量在前、运行期建的在后并按哈希序，rtcl 按建名的先后；而且
-      每次调用都把整个帧降级成名键存储（之后这一帧都走慢路径）。
+    - [x] proc 里 `info locals` / `info vars` 的顺序（2026-11-26 完成，
+      task/t3 @ af0f95d：直列不再降级整帧，四方逐字节一致；连带修正
+      链接字面参数的编译局部登记）。
     - [ ] C51：trace 与编译后的命令（`append` 每个值一次写 trace、读
       trace 报错后 `incr`/`lappend` 的行为、`unset` trace 的 errorCode）。
 - [ ] **工具化防线**：`judge/crash-gate.sh` 入门禁（已入：原生 118 次

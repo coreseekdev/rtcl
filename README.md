@@ -4,7 +4,7 @@
 原生嵌入式场景。**对标 Tcl 9.1**（oracle：tclsh 9.1.0，官方 release
 [core-9-1-0](https://github.com/tcltk/tcl/releases/tag/core-9-1-0)，
 参考源码与本地构建见 `.refer/tcl910/`）：判官 88/88 语料文件对 9.1.0
-逐字节一致；探针档案 312/437——125 项 8.6→9.1 语义差是迁移面（见
+逐字节一致；探针档案 317/437——122 项 8.6→9.1 语义差是迁移面（见
 TODO.md「对标迁移」）。历史 case 级基线 4067/4072 是对 tclsh 8.6.17
 建立的（`JUDGE_ORACLE=tclsh` 可复跑）。性能关键路径已达到或超过
 tclsh。生产就绪状态见 [docs/PRODUCTION.md](docs/PRODUCTION.md)。
@@ -14,16 +14,20 @@ tclsh。生产就绪状态见 [docs/PRODUCTION.md](docs/PRODUCTION.md)。
 - **对标 Tcl 9.1（core-9-1-0）**：judge 88/88 语料文件对 tclsh 9.1.0
   逐字节一致（语料提取自 8.6.17 官方测试套件，期望运行期求值）；
   语义全集含 namespace、TclOO、dict、expr 宽化、channel 等；
-  探针级 125 项 9.1 语义差迁移中
+  探针级 122 项 9.1 语义差迁移中
 - **双引擎**：字节码 VM（主）+ 树遍历（语义回退），`judge/sweep.sh`
   双引擎差分 0 分歧
 - **WASM 主目标**：wasm-bindgen 绑定（exec / JS 命令注册 / puts 路由 /
   实例隔离），wasm-bindgen 产物 ~2.1MB，node 测试 24/24；原生外部能力
   （iconv 宽表编码、libc 本地时区）均为**可选 feature**，wasm 构建不
   依赖任何外部 C 库
-- **性能**：算术/自增/字符串/字典微基准反超 tclsh（0.6-0.8×）；
-  过程调用开销反超（0.52×）；重型基准 1.05-2.26×（详见
-  bench/BASELINE.md）
+- **性能**：2026-11-26 起基准 oracle 为 tclsh 9.1.0——ns 体裸名读写
+  1500 万次 **0.65-0.72×（反超）**、编译 5000 循环 **0.5×**、文件读
+  **1.38×**、TCP 读 **1.17×**、`array size` O(1) 反超、`incr` 数组
+  元素 **0.51×**（详见 bench/BASELINE.md）；历史微基准数字
+  （算术/自增/字符串/字典 0.6-0.8×、过程调用 0.52×、重型
+  1.05-2.26×）是 tclsh 8.6.17 时代建立，9.1 全套重测列 TODO
+  「对标迁移 T9」
 - **36 项扩展**：`lambda`/`curry`/`function`/`loop`/`ensemble`/`defer`/
   `json`/`ref`/`flow` 等（经裁定的超出标准 Tcl 部分）
 
@@ -97,7 +101,7 @@ rtcl/
 │   ├── rtcl-cli/      # 命令行接口
 │   └── rtcl-expect/   # expect 风格进程自动化
 ├── judge/             # 判官：tclsh 官方测试提取语料 + 双引擎差分
-│   ├── run.sh         #   87 文件 4067/4072 用例逐字节判定
+│   ├── run.sh         #   88 文件逐字节判定（oracle 默认 tclsh9.1）
 │   ├── sweep.sh       #   双引擎差分（0 分歧门槛）
 │   └── extract/       #   tclsh 测试套件 -> 语料的机械提取器
 ├── bench/             # 性能台账 BASELINE.md + 基准脚本
@@ -109,8 +113,8 @@ rtcl/
 ```bash
 cargo test --workspace                      # 全 workspace 测试
 ./judge/run.sh                              # 88 文件逐字节（judge(interp): 88/88）
-./judge/sweep.sh                            # 双引擎差分 0 分歧
-./judge/crash-gate.sh                       # 脚本可触发的崩溃/挂起/静默错误（judge/crash-probes/）
+./judge/sweep.sh                            # 双引擎差分（12 处既有名单不新增）
+./judge/crash-gate.sh                       # 128 探针（崩溃/挂起/静默错误；judge/crash-probes/）
 # wasm 主目标：构建产物后跑同类缺陷（Node，每项一个全新实例）
 (cd crates/rtcl-wasm && ./build.sh) && node judge/crash-wasm.mjs
 # wasm 主目标：默认特性裁剪，零外部 C 依赖（iconv 不编入）
@@ -119,11 +123,13 @@ cargo build -p rtcl-wasm --target wasm32-unknown-unknown
 cargo test -p rtcl-vm --no-default-features --features rtcl_std --lib
 ```
 
-四门全绿才可提交；判官/差分必须用刚构建的二进制（防陈旧二进制假绿）。
+全绿才可提交；判官/差分必须用刚构建的二进制（防陈旧二进制假绿；
+worktree 门禁用 `judge/gates/`，多 agent 纪律见 Agent.md）。
 
 ## 与标准 Tcl 的差异
 
-5/4072 用例存在已知分歧（0.12%，全部记录于 docs/PRODUCTION.md）：
+5/4072 用例存在已知分歧（0.12%，8.6 时代口径，全部记录于
+docs/PRODUCTION.md）：
 rename 遮蔽过程后旧名解析、`interp alias {} name {} target` 形式、
 3 条错误信息帧计数微差。另有 36 项经裁定的扩展超出标准 Tcl。
 

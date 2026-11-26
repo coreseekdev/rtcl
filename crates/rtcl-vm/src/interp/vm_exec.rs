@@ -2138,7 +2138,9 @@ fn op_store_local(interp: &mut Interp, code: &ByteCode, st: &mut VmState, slot: 
     let slot = slot as usize;
     // `set` keeps its result: the value stays on the stack.
     let v = st.top_val();
-    if !interp.frame_slot_write(slot, &v) {
+    // const 标记的 frame 局部走 set_var（其守卫持有 can't set 错形——
+    // const-free 帧 consts==None，一次 Option 探测）。
+    if interp.frame_local_is_const(slot, code) || !interp.frame_slot_write(slot, &v) {
         let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
         let r = interp.set_var(name, v)?;
         // set_var 的返回 = trace 落地后的变量值（tclsh：write trace 改
@@ -2162,6 +2164,11 @@ fn op_store_local_pop(
 ) -> Result<()> {
     let slot = slot as usize;
     let v = st.pop_val();
+    if interp.frame_local_is_const(slot, code) {
+        let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
+        interp.set_var(name, v)?;
+        return Ok(());
+    }
     if let Err(v) = interp.frame_slot_write_move(slot, v) {
         let name = code.locals().get(slot).map(String::as_str).unwrap_or("");
         interp.set_var(name, v)?;

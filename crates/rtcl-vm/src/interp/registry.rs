@@ -98,6 +98,9 @@ static CMD_TABLE: &[CmdEntry] = &[
     CmdEntry { name: "lremove",   func: list::cmd_lremove,       cat: Standard, cmd_id: None,                            usage: "list ?index ...?",                 help: "Remove elements from a list by index" },
     CmdEntry { name: "ledit",     func: list::cmd_ledit,         cat: Standard, cmd_id: None,                            usage: "listVar first last ?element ...?", help: "Replace elements of a list stored in variable" },
     CmdEntry { name: "concat",    func: list::cmd_concat,        cat: Standard, cmd_id: Some(CmdId::Concat    as u16),   usage: "?arg ...?",                        help: "Concatenate arguments" },
+    // const varName value — tclsh 9.1 (tclVar.c Tcl_ConstObjCmd):
+    // create + VAR_CONSTANT flag; writes/unsets error.
+    CmdEntry { name: "const",     func: misc::cmd_const,         cat: Language, cmd_id: None,                            usage: "varName value",                    help: "Create a constant variable" },
     CmdEntry { name: "split",     func: list::cmd_split,         cat: Standard, cmd_id: Some(CmdId::Split     as u16),   usage: "string ?splitChars?",              help: "Split a string into a list" },
     CmdEntry { name: "join",      func: list::cmd_join,          cat: Standard, cmd_id: Some(CmdId::Join      as u16),   usage: "list ?joinString?",                help: "Join list elements into a string" },
     CmdEntry { name: "lmap",      func: list::cmd_lmap,          cat: Standard, cmd_id: Some(CmdId::Lmap      as u16),   usage: "varList list ?varList list ...? command", help: "Map over list elements" },

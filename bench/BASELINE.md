@@ -2761,3 +2761,22 @@ judge 88/88、crash-gate 128/128（d28 在内）、sweep 12 既有、probes **31
   **317**/122（t4 探针入列）、workspace cargo exit 0。
 - 施工注记：子代理两次被机器 OOM 杀（进程级），主会话接手收尾——改动本身
   一次成型，验证链（探针/基准/门禁）由主会话补齐。
+
+## D5 num-bigint 任意精度集成（task/bigint @ f7a3241，2026-11-26，子代理施工）
+
+- Value：`InternalRep::Big(Rc<BigInt>)`——i63 快路径零改动；溢出落 Big 箱；
+  Clone 是 Rc 份额复制；`as_str` 惰性渲染 canonical 十进制。杠杆点一处：
+  `bignum::to_value` 从字符串箱改 Big 箱，全部算术 widen 臂自动落新表示。
+- 语义修正三处（探针实证）：`int()` 不再截 word（9.1）；`op_pow` 补 bignum
+  底/指数臂；`incr` 接任意精度 + errorCode 9.1 分工。**勘误**：9.1 除法/
+  取模是地板除（`-7/2=-4`），非向零除——设计稿已更正，现状实现本就正确。
+- 探针：bn_int91/bn_pow91/bn_bits91/bn_incr91 四个新入仓，oracle/vm/tree
+  三方逐字节一致。
+- 门禁：judge 88/88（旧口径）/合并后新语料 case 级 **4157/4849=85.7%**
+  （基线 4152，bigint 清 5 case）、crash-gate 128/128、probes **326/117**
+  （溢出族 5 个 8.6 钉形转 9.1 一致，DIFF 122→117）、sweep 12 既有、
+  workspace exit 0、wasm32 过。
+- wasm 体积：perf 轨 −1114B；size 轨 +2567B（+0.14%）——num-bigint 本在
+  链接链，alloc-only 开关自抵。
+- 基准：arith_loop/var_incr ±5% 内（快径零改动）；bignum 链收益：阶乘
+  400×30 轮 58ms→**9ms**、2^63 加链 10 万次 47ms→**18ms**。

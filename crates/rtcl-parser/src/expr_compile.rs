@@ -200,9 +200,16 @@ fn tokenize(expr: &str) -> Option<Vec<Token>> {
                     return None;
                 }
                 tokens.push(Token::Var(name));
-            } else if chars[i].is_ascii_alphabetic() || chars[i] == '_' {
+            } else if chars[i].is_ascii_alphabetic() || chars[i] == '_' || chars[i] == ':' {
                 let start = i;
-                while i < len && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                // `:` 属名字字符（树走查 parse_var_name 的字符集同款：
+                // alnum/_/:——`$::n`、`$ns::v`、`a:b` 编进 LoadVar，条件
+                // 不再整段回落 EvalExpr 每迭代重解析）。接收面是树字符
+                // 集的子集（树收 Unicode alnum），LoadVar 的执行与树走
+                // 查同一 eval_var_ref——值与错误同源。
+                while i < len
+                    && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == ':')
+                {
                     i += 1;
                 }
                 // $name(index)：数组元素读——括号内原文（可含 $k/[..] 嵌套）

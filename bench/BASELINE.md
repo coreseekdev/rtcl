@@ -2817,3 +2817,24 @@ B3（timer/regexp/regsub/lsearch/process/混合包，部分子代理+主会话�
   dict/subst/array/const/regexp/lsearch/binary/process 十余文件转绿
 
 B2（exec 宿主路径/file/HTTP/大小守卫）：见 BASELINE 2026-11-26 B2 节。
+
+## N 数字字面量 9.1 语法批（task/digits91 5 提交，2026-11-26 合并，子代理施工）
+
+- **12 个解析点统一到 9.1 文法**：共享扫描器 scan_number（bignum.rs，
+  tclStrToD.c acceptPoint 镜像）——0o/0O、**新增 0d/0D**、0b、0x、裸
+  前导 0=十进制（017=17、09=9、018 不再报错）、`_` 分隔符、±号形；
+  **删除 is_invalid_octal**（9.1 无此错误面）。覆盖：parse_int/int_rep、
+  parse_float_str、expr 词法与预解析（radix hint 0b→binary/0o→octal，
+  oracle 钉形）、索引扫描、lsort、string is（类界重钉：integer 任意宽
+  度含 bignum、wideinteger 64 位）、format、scan（**核实不改**——自有
+  C 文法与 9.1 一致）、编译期折叠（**核实不改**——新形式正确 bail）。
+- **关键归组更正**：gen_expr 族 95 失败无一由数字文法引起——26+29+12
+  条是 expr 错误消息 9 口径簇（另一批）、12 条 mathfunc（已落地）、9 条
+  TIP582 expr 注释（另一批）。真实翻绿在散布点：gen_cmdIL 混进制排序、
+  gen_util 索引 0d 形、gen_obj 2→0。
+- 探针 digits91.tcl（90+ 形，oracle 逐字节一致）+ 8 个 scratch 矩阵。
+- rewrite 期间探针抓回三缺陷（hex 字位/前缀区间越界 panic/空尾数）。
+- 门禁（合并后）：judge 76/95、probes **363/100**（DIFF 117→100：翻绿
+  bn2-bn4/ec2/expr_lead1-2/incr_frame/ix3/s_probe/v_err 等 10 个，零新
+  增）、crash-gate 128/128、sweep 12 既有、rtcl-vm 870/0、workspace
+  1496/0、wasm32 过。

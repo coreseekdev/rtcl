@@ -106,17 +106,30 @@ fn main() {
         rtcl_core::interp::set_bytecode_disabled(true);
     }
 
-    let result = if let Some(ref file) = args.file {
-        run_file(file, args.quiet).map(|()| 0)
-    } else if let Some(ref cmd) = args.command {
-        run_command(cmd, args.quiet).map(|()| 0)
-    } else if args.interactive {
-        run_repl(args.quiet)
-    } else {
-        // Default: show help
-        print_help();
-        Ok(0)
-    };
+    // 解释器跑在 64MB 栈线程上（C39）：树走查引擎每层 Rust 栈
+    // ~8-17KB（eval_command/dispatch 链），主线程默认 8MB 只够 ~500 层
+    // 循环体递归——9.1 的递归上限语义（1000 层）需要 8MB+ 的树走查栈。
+    // 递归上限仍由 max_call_depth 把守（wasm 150 / 本机 1000，实测校准
+    // 不变）；线程栈是物理供给，不是限制机制。栈页懒分配，浅运行
+    // RSS 不变。
+    let result = std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            if let Some(ref file) = args.file {
+                run_file(file, args.quiet).map(|()| 0)
+            } else if let Some(ref cmd) = args.command {
+                run_command(cmd, args.quiet).map(|()| 0)
+            } else if args.interactive {
+                run_repl(args.quiet)
+            } else {
+                // Default: show help
+                print_help();
+                Ok(0)
+            }
+        })
+        .expect("spawn interpreter thread")
+        .join()
+        .unwrap_or_else(|_| Ok(1));
 
     match result {
         Ok(0) => {}

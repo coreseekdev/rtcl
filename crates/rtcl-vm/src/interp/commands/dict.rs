@@ -1483,7 +1483,12 @@ mod tests {
         assert_eq!(interp.eval("tcl::mathop::+").unwrap().as_str(), "0");
         assert_eq!(interp.eval("tcl::mathop::+ {*}[list 1 2]").unwrap().as_str(), "3");
         let e = interp.eval("tcl::mathop::+ abc").unwrap_err();
-        assert!(e.to_string().contains("can't use non-numeric string"));
+        // 9.1（C16 钉形）：cannot use non-numeric string "abc" as left
+        // operand of "+"。
+        assert_eq!(
+            e.to_string(),
+            "cannot use non-numeric string \"abc\" as left operand of \"+\""
+        );
     }
 
     #[test]
@@ -1540,14 +1545,12 @@ mod tests {
     #[test]
     fn test_dict_filter_script_requires_boolean() {
         // dict-17.29: a non-boolean body result is an error, not a keep.
+        // 9.1（C 阶段钉形）：多元素 list 值的布尔转换报不引值形。
         let mut interp = Interp::new();
         let e = interp
             .eval("dict filter {a 1 b 2} script {k v} {list $k $v}")
             .unwrap_err();
-        assert_eq!(
-            e.to_string(),
-            "expected boolean value but got \"a 1\""
-        );
+        assert_eq!(e.to_string(), "expected boolean value but got a list");
     }
 
     #[test]

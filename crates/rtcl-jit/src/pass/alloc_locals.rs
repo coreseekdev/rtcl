@@ -234,7 +234,7 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
             OpCode::StoreVar(_) => (vec![depth - 1], None),
             OpCode::LappendVar(_) => (vec![depth - 1], Some(depth - 1)),
             OpCode::Neg | OpCode::Not | OpCode::BitNot => (vec![depth - 1], Some(depth - 1)),
-            OpCode::EvalScript | OpCode::EvalExpr => (vec![depth - 1], Some(depth - 1)),
+            OpCode::EvalScript | OpCode::EvalExpr | OpCode::EvalExprCond => (vec![depth - 1], Some(depth - 1)),
             OpCode::Call { .. } | OpCode::DynCall { .. } => {
                 ((base..depth).collect(), Some(base))
             }
@@ -333,7 +333,7 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
             )),
             OpCode::EvalScript => Some(snap(pc, cur_site, &bodies, &loops, true, FailKind::EvalScript, &mut fails)),
             OpCode::LappendVar(_) => Some(snap(pc, cur_site, &bodies, &loops, false, FailKind::Cold, &mut fails)),
-            OpCode::EvalExpr => Some(snap(pc, cur_site, &bodies, &loops, false, FailKind::EvalExpr, &mut fails)),
+            OpCode::EvalExpr | OpCode::EvalExprCond => Some(snap(pc, cur_site, &bodies, &loops, false, FailKind::EvalExpr, &mut fails)),
             OpCode::ForeachStart { .. } | OpCode::ForeachNext { .. } => Some(snap(
                 pc,
                 cur_site,

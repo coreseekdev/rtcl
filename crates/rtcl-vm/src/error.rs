@@ -511,6 +511,49 @@ impl Error {
             Error::Runtime { message, .. } if message.starts_with("domain error") => {
                 "ARITH DOMAIN {domain error: argument not in valid range}".to_string()
             }
+            // 9.1 的 expr 操作数分类错误（tclGetNumberFromObj 等）：
+            // 消息类别即 errorCode 类别（`1 + "a"` → ARITH DOMAIN
+            // {non-numeric string}、`~4.0` → ARITH DOMAIN {floating-point
+            // value}、`NaN + 1` → ARITH DOMAIN {non-numeric floating-point
+            // value}、`{"1 2" + 1}` → ARITH DOMAIN list、`0**-1` →
+            // ARITH DOMAIN {exponentiation of zero by negative power}）。
+            Error::Msg(m) if m.starts_with("cannot use non-numeric string") => {
+                "ARITH DOMAIN {non-numeric string}".to_string()
+            }
+            Error::Msg(m) if m.starts_with("cannot use non-numeric floating-point value") => {
+                "ARITH DOMAIN {non-numeric floating-point value}".to_string()
+            }
+            Error::Msg(m) if m.starts_with("cannot use floating-point value") => {
+                "ARITH DOMAIN {floating-point value}".to_string()
+            }
+            Error::Msg(m) if m.starts_with("cannot use a list") => {
+                "ARITH DOMAIN list".to_string()
+            }
+            Error::Msg(m) if m == "exponentiation of zero by negative power" => {
+                "ARITH DOMAIN {exponentiation of zero by negative power}".to_string()
+            }
+            Error::Msg(m) if m == "floating point value is Not a Number" => {
+                "TCL VALUE DOUBLE NAN".to_string()
+            }
+            // 布尔语境（&&/||/?:/if/while）的非布尔操作数（9.1 实测：
+            // `if {"a"} {}` 同为 TCL VALUE NUMBER）。
+            Error::Msg(m) if m.starts_with("expected boolean value but got") => {
+                "TCL VALUE NUMBER".to_string()
+            }
+            // tailcall 的 proc/lambda/method 合法性错误（9.1 实测
+            // TCL TAILCALL ILLEGAL；顶层与 namespace eval 体同码）。
+            Error::Runtime { message, .. } if message.starts_with("tailcall can only be called") => {
+                "TCL TAILCALL ILLEGAL".to_string()
+            }
+            // expr 数学函数的数值转换（int()/wide()/double()/abs()/
+            // round()/entier()，9.1 实测六个全为 TCL VALUE NUMBER；
+            // `expr {int("x")}` → TCL VALUE NUMBER）。
+            Error::Msg(m) if m.starts_with("expected number but got") => {
+                "TCL VALUE NUMBER".to_string()
+            }
+            Error::Msg(m) if m.starts_with("expected floating-point number but got") => {
+                "TCL VALUE NUMBER".to_string()
+            }
             // tclsh's variable errors (tclVar.c): a variable that is not
             // found, an array read as an element target (`$b(0)`), a
             // dangling link or a missing namespace blame the base name —

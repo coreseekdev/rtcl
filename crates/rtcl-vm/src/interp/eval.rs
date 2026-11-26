@@ -877,6 +877,16 @@ impl Interp {
                             );
                         }
                     }
+                    // 词级错误出口同样恢复命令语境（cur_source/word_srcs
+                    // 是逐命令换装的——泄漏会让下一个 dispatch 前的语境
+                    // 读取（catch 的 D-3 verbatim 检查、字面量门）切到
+                    // 本单元的源与词跨度（C16 折叠错误流实证的越界
+                    // panic：外层 catch 的词 span 切到内层脚本源）。
+                    self.cur_source = saved_source;
+                    self.cur_cmd_text = saved_text;
+                    self.cur_cmd_line = saved_line;
+                    self.cur_cmd_line_abs = saved_line_abs;
+                    self.cur_cmd_word_srcs = saved_srcs;
                     return Err(e);
                 }
             };
@@ -1006,9 +1016,23 @@ impl Interp {
         if let (Some(k), Some(t)) = (&exec_key, &cmdtext) {
             self.exec_fire_enter(k, t)?;
         }
-        self.call_depth += 1;
+        // C39（9.1 口径）：内联循环命令（while/for/foreach——tclsh 把体
+        // 内联编译进调用者单元，体不是求值层）不占递归深度：体递归的
+        // 每层只有 proc 调用 +1，9.1 实测到 ~998 层；每次分派 +1 会让
+        // 字节码语境的循环体递归在 500 层翻车。
+        // 仅字节码语境豁免：纯树走查（RTCL_NO_BYTECODE/回退语境）的
+        // 每层 Rust 栈 ≈ 8KB+，998 层会爆 8MB 栈——那里保留 per-dispatch
+        // 计数当栈防线（资源上限机制不动；树走查循环体递归停在资源
+        // 界 ~499，记账到 D3 树引擎删除时随根消掉）。其他 builtin 分派
+        // 照旧 +1——同为树走查栈防线。
+        let depth_free = matches!(cmd_name, "while" | "for" | "foreach");
+        if !depth_free {
+            self.call_depth += 1;
+        }
         let result = f(self, args);
-        self.call_depth -= 1;
+        if !depth_free {
+            self.call_depth -= 1;
+        }
         let result = self.fill_wrong_args(cmd_name, result);
         if let (Some(k), Some(t)) = (&exec_key, &cmdtext) {
             let (code, res) = match &result {
@@ -1671,36 +1695,20 @@ impl Interp {
             // D-3 残差：expr 错误的 INNER 条目 = syntax 特形——
             // `syntax {msg} {opts-dict}`（tclsh 实测；opts 为该错误自身
             // 的完整 options 形）。一次性预装同 cmd_error 通道。
-            // C2/C3（2026-11-16）：-errorinfo 载荷 = 抬升点已预装的
-            // err_info（解析错误带 (parsing expression …) 帧、ARITH 带
-            // 裸消息）；-errorcode = 解析错误的 TCL PARSE EXPR <CLASS>
-            // 抬升码（err_code_raised 已装全局），其余按变体派生。
-            let tec = if self.err_code_raised {
-                self.globals
-                    .get("errorCode")
-                    .map(|v| v.as_str().to_string())
-                    .unwrap_or_else(|| e.tcl_error_code())
-            } else {
-                e.tcl_error_code()
-            };
-            let msg = e.message_text();
-            let line = self.err_line;
-            let ei = self.err_info.clone().unwrap_or_else(|| msg.clone());
-            let opts = format!(
-                "-code 1 -level 0 -errorcode {} -errorinfo {} -errorline {}",
-                crate::value::tcl_quote(&tec),
-                crate::value::tcl_quote(&ei),
-                line
-            );
-            self.err_pending_inner =
-                Some(format!("syntax {} {}", crate::value::tcl_quote(&msg), crate::value::tcl_quote(&opts)));
-            if tec.starts_with("TCL PARSE EXPR") {
-                // A parse error is a new error: the next log event starts
-                // a fresh -errorstack with that entry (tclsh
-                // TclErrorStackResetIf).  Without this the event appended
-                // the frame and left the previous error's stack standing.
-                self.err_force_inner = true;
-            }
+            self.arm_expr_syntax_inner(e);
+        }
+        r
+    }
+
+    /// Condition-context expr evaluation（`if`/`elseif`/`while`/`for`）：
+    /// 不做结果规范化——tclsh 的 jumpFalse 转换先行（NaN 条件报转换错，
+    /// 见 [`crate::types::expr::eval_expr_cond`]）。INNER 预装同
+    /// [`Self::eval_expr`]。
+    pub fn eval_expr_cond(&mut self, expr: &str) -> Result<Value> {
+        crate::interp::dbgtrace::event("eval_expr_cond", "");
+        let r = crate::types::expr::eval_expr_cond(self, expr);
+        if let Err(e) = &r {
+            self.arm_expr_syntax_inner(e);
         }
         r
     }
@@ -1734,6 +1742,47 @@ impl Interp {
     /// 带替换下标的写一律走 DynCall 分派（命令自己替换实参）。
     pub fn jit_read_var_ref(&mut self, name: &str) -> Result<Value> {
         self.eval_var_ref(name)
+    }
+
+    /// expr 错误的 INNER errorstack 预装（D-3 残差收口）：条目 =
+    /// syntax 特形——`syntax {msg} {完整 options 形}`（tclsh 实测）。
+    /// 树走包装器（[`Interp::eval_expr`]）与 VM 的折叠错误 op
+    /// （`ExprFoldError`，C16）共用；opts 用该错误自身的
+    /// -errorcode/-errorinfo/-errorline。
+    pub(crate) fn arm_expr_syntax_inner(&mut self, e: &Error) {
+        // C2/C3（2026-11-16）：-errorinfo 载荷 = 抬升点已预装的
+        // err_info（解析错误带 (parsing expression …) 帧、ARITH 带
+        // 裸消息）；-errorcode = 解析错误的 TCL PARSE EXPR <CLASS>
+        // 抬升码（err_code_raised 已装全局），其余按变体派生。
+        let tec = if self.err_code_raised {
+            self.globals
+                .get("errorCode")
+                .map(|v| v.as_str().to_string())
+                .unwrap_or_else(|| e.tcl_error_code())
+        } else {
+            e.tcl_error_code()
+        };
+        let msg = e.message_text();
+        let line = self.err_line;
+        let ei = self.err_info.clone().unwrap_or_else(|| msg.clone());
+        let opts = format!(
+            "-code 1 -level 0 -errorcode {} -errorinfo {} -errorline {}",
+            crate::value::tcl_quote(&tec),
+            crate::value::tcl_quote(&ei),
+            line
+        );
+        self.err_pending_inner = Some(format!(
+            "syntax {} {}",
+            crate::value::tcl_quote(&msg),
+            crate::value::tcl_quote(&opts)
+        ));
+        if tec.starts_with("TCL PARSE EXPR") {
+            // A parse error is a new error: the next log event starts
+            // a fresh -errorstack with that entry (tclsh
+            // TclErrorStackResetIf).  Without this the event appended
+            // the frame and left the previous error's stack standing.
+            self.err_force_inner = true;
+        }
     }
 }
 

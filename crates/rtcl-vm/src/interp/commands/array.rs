@@ -671,17 +671,27 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 .collect();
             if pattern.is_none() {
                 // tclsh：无 pattern 的 array unset = 整数组 unset——变量
-                // 本身移除（D-35）、一次 {a {} unset} + 分派处 array op；
-                // 元素 unset trace 随整数组 unset 逐元素触发（D-37③，
-                // unset_var 全链）。
-                interp.unset_var(array_name)?;
+                // 本身移除（D-35）、一次 {a {} unset}（n2= 空，9.1 实测）
+                // + 分派处 array op；元素 unset trace 随整数组 unset
+                // 逐元素触发（D-37③，unset_var 全链）。
+                // 9.1（C 阶段钉形）：变量不存在 → 静默成功（8.6 报
+                // can't unset；9.1 静默）；标量 → no-op（exists 保持
+                // 1）；trace 抛错不传播（tcl 忽略 trace 的 error）。
+                if interp.is_array_semantic(array_name)
+                    || interp.array_element_count(array_name).unwrap_or(0) > 0
+                {
+                    let _ = interp.unset_var(array_name);
+                }
                 return Ok(Value::empty());
             }
             for elem in elements_to_remove {
                 // Through the name as given: `array unset ::a 1` inside a
                 // proc reached a local `a(1)` when the key was spelled
-                // for the owner's table, and unset nothing.
-                let _ = interp.unset_var(&format!("{}({})", array_name, elem));
+                // for the owner's table, and unset nothing.  裸名形：
+                // 整数组扫描的元素 unset trace 的 name1 = 裸数组名
+                // （9.1 实测 {tb j unset}，与 unset tb(j) 直元素的
+                // {tb(j) j unset} 相对，C 阶段钉形）。
+                let _ = interp.unset_var_form(&format!("{}({})", array_name, elem), false);
             }
             Ok(Value::empty())
         }

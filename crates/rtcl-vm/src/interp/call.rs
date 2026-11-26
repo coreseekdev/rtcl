@@ -42,7 +42,8 @@ impl Interp {
         // the same leak reason; installed at frame setup below).
         let prelink = self.frame_prelink.take();
         let mut prelink_done = prelink.is_none();
-        if self.call_depth > self.max_call_depth {
+        // 9.1 边界（C39）：完成层数 998 @limit 1000——== 也要拒。
+        if self.call_depth >= self.max_call_depth {
             return Err(Error::recursion_limit());
         }
         // The def's params/body/compiled are read through a reference for

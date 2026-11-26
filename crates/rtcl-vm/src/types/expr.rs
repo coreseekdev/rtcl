@@ -14,6 +14,19 @@ use crate::value::Value;
 
 /// Evaluate a Tcl expression
 pub fn eval_expr(interp: &mut Interp, expr: &str) -> Result<Value> {
+    eval_expr_gen(interp, expr, true)
+}
+
+/// Condition contexts (`if`/`elseif`/`while`/`for`): tclsh converts the
+/// condition value with jumpFalse BEFORE any result canonicalization, so
+/// a NaN condition errors with the conversion message
+/// (`while {NaN}` → floating point value is Not a Number) instead of the
+/// expr-command's canonicalization domain error (`expr {NaN}`).
+pub fn eval_expr_cond(interp: &mut Interp, expr: &str) -> Result<Value> {
+    eval_expr_gen(interp, expr, false)
+}
+
+fn eval_expr_gen(interp: &mut Interp, expr: &str, canon: bool) -> Result<Value> {
     // tclsh's parser rejects malformed expressions before any
     // evaluation; run the same syntax pre-pass and log its errorInfo
     // frame the way the C parser does (ERR_ALREADY_LOGGED: the harness
@@ -61,16 +74,26 @@ pub fn eval_expr(interp: &mut Interp, expr: &str) -> Result<Value> {
         crate::interp::commands::list::set_error_code(interp, class);
         return Err(Error::Msg(msg));
     }
-    let mut parser = ExprParser::new(expr, interp);
-    match parser.parse_ternary() {
-        Ok(v) => canonicalize_result(v),
+    let (result, fold_err) = {
+        let mut parser = ExprParser::new(expr, interp);
+        let r = parser.parse_ternary();
+        (r, parser.err_fold)
+    };
+    match result {
+        Ok(v) => if canon { canonicalize_result(v) } else { Ok(v) },
         Err(e) => {
             // C2（2026-11-16）：ARITH 运行期错误的 tclsh **双日志事件**
             // 模型——表达式机先记一次裸消息（无帧），expr 命令帧随后以
             // `invoked from within` 追加（`expr {1/0}` 首帧关键词）。
             // INNER 的 syntax 特形由 Interp::eval_expr 包装器预装，
             // err_force_inner 使 (Some, false) 臂消费它。
-            if interp.err_info.is_none() && e.tcl_error_code().starts_with("ARITH") {
+            //
+            // C16（9.1 oracle）：只有**折叠常量子树**里的错误才走这个
+            // 双日志模型（`invoked from within`）；含运行期值（变量、
+            // 命令替换、函数调用）的节点错误是普通命令错误，帧关键词
+            // 是 `while executing`（`expr {1/$z}`、`expr {sqrt(-1)}`）。
+            if interp.err_info.is_none() && fold_err == Some(true)
+            {
                 interp.err_info = Some(e.message_text());
                 interp.err_fresh = false;
                 interp.err_force_inner = true;
@@ -141,6 +164,17 @@ struct ExprParser<'a> {
     func_arg_depth: u32,
     /// Levels of recursive descent open (see [`EXPR_NEST_LIMIT`]).
     nest_depth: u32,
+    /// Runtime events seen so far (variable reads, command substitutions,
+    /// function calls).  tclsh compiles literal-only operand subtrees to
+    /// compile-time folds; an operator error over subtrees with no
+    /// runtime event between them is one of those deferred fold errors,
+    /// which tclsh surfaces with the `invoked from within` frame keyword
+    /// instead of `while executing` (C16, 9.1 oracle).
+    rt_events: u64,
+    /// Classification of the error in flight (`Some(pure)` where `pure`
+    /// is whether the failing node's operand subtrees were fold-constant).
+    /// Set at the innermost failing node; read by `eval_expr`.
+    err_fold: Option<bool>,
 }
 
 use rtcl_parser::expr_compile::EXPR_NEST_LIMIT;
@@ -153,7 +187,48 @@ impl<'a> ExprParser<'a> {
             interp,
             func_arg_depth: 0,
             nest_depth: 0,
+            rt_events: 0,
+            err_fold: None,
         }
+    }
+
+    /// Record one runtime event (variable read / command substitution /
+    /// function call): everything after it in the expression is
+    /// runtime-evaluated in tcl, never a compile fold.
+    fn note_event(&mut self) {
+        self.rt_events += 1;
+    }
+
+    /// Classify an operator error: `pure` is whether the failing node's
+    /// operand subtrees contained no runtime event.  The innermost
+    /// failing node wins (`err_fold` keeps its first setting).
+    fn fold_classify(&mut self, pure: bool, r: Result<Value>) -> Result<Value> {
+        if r.is_err() && self.err_fold.is_none() {
+            self.err_fold = Some(pure);
+        }
+        r
+    }
+
+    /// Whether the unparsed remainder can still contribute a runtime
+    /// event: a `$var`, a `[command]`, or a `func(` call (an identifier
+    /// character immediately before `(`, spaces skipped).  tclsh folds
+    /// an `&&`/`||`/`?:` operand conversion only when the WHOLE chain is
+    /// compile-time constant, so a boolean-conversion error there is a
+    /// deferred fold error (`invoked from within`) only in that case —
+    /// `{"a" && 1}` is inner while `{"a" && $z}` and `{"a" && int(1)}`
+    /// are runtime `while executing` (C16, 9.1 oracle).
+    fn remainder_constant(&self) -> bool {
+        let mut prev_sig = false; // last significant (non-space) char is identifier-ish
+        for &c in &self.chars[self.pos.min(self.chars.len())..] {
+            match c {
+                '$' | '[' => return false,
+                '(' if prev_sig => return false,
+                _ => {}
+            }
+            prev_sig = !(c == ' ' || c == '\t' || c == '\n' || c == '\r')
+                && (c.is_alphanumeric() || c == '_' || c == ':');
+        }
+        true
     }
 
     /// Enter one nesting level that the caller leaves by hand.
@@ -183,7 +258,17 @@ impl<'a> ExprParser<'a> {
         let cond = self.parse_or()?;
         self.skip_whitespace();
         if self.match_op("?") {
-            if super::expr_funcs::strict_bool(&cond)? {
+            // The condition conversion is a deferred fold error only
+            // when nothing ran before it and the rest of the chain stays
+            // constant (C16 whole-chain rule).
+            let cond_b = match super::expr_funcs::strict_bool(&cond) {
+                Ok(b) => b,
+                Err(e) => {
+                    let pure = self.rt_events == 0 && self.remainder_constant();
+                    return self.fold_classify(pure, Err(e));
+                }
+            };
+            if cond_b {
                 let then_val = self.parse_ternary()?;
                 self.expect(":")?;
                 // Skip the untaken else-branch without evaluating it
@@ -204,14 +289,29 @@ impl<'a> ExprParser<'a> {
     fn parse_or(&mut self) -> Result<Value> {
         let mut left = self.parse_and()?;
         while self.match_op("||") {
-            if super::expr_funcs::strict_bool(&left)? {
+            // Operand conversions are deferred fold errors only when the
+            // whole chain is constant (nothing ran before, and for the
+            // already-evaluated left side, nothing constant-breaking
+            // remains unparsed) — C16 whole-chain rule.
+            let lb = match super::expr_funcs::strict_bool(&left) {
+                Ok(b) => b,
+                Err(e) => {
+                    let pure = self.rt_events == 0 && self.remainder_constant();
+                    return self.fold_classify(pure, Err(e));
+                }
+            };
+            if lb {
                 // Short-circuit: skip parsing the RHS but consume the tokens
                 self.skip_or_operand()?;
                 // Tcl: the result is always a boolean, never the operand.
                 left = Value::from_bool(true);
             } else {
                 let right = self.parse_and()?;
-                left = Value::from_bool(super::expr_funcs::strict_bool(&right)?);
+                let rb = match super::expr_funcs::strict_bool(&right) {
+                    Ok(b) => b,
+                    Err(e) => return self.fold_classify(self.rt_events == 0, Err(e)),
+                };
+                left = Value::from_bool(rb);
             }
         }
         Ok(left)
@@ -221,13 +321,24 @@ impl<'a> ExprParser<'a> {
     fn parse_and(&mut self) -> Result<Value> {
         let mut left = self.parse_bitor()?;
         while self.match_op("&&") {
-            if !super::expr_funcs::strict_bool(&left)? {
+            let lb = match super::expr_funcs::strict_bool(&left) {
+                Ok(b) => b,
+                Err(e) => {
+                    let pure = self.rt_events == 0 && self.remainder_constant();
+                    return self.fold_classify(pure, Err(e));
+                }
+            };
+            if !lb {
                 // Short-circuit: skip parsing the RHS but consume the tokens
                 self.skip_and_operand()?;
                 left = Value::from_bool(false);
             } else {
                 let right = self.parse_bitor()?;
-                left = Value::from_bool(super::expr_funcs::strict_bool(&right)?);
+                let rb = match super::expr_funcs::strict_bool(&right) {
+                    Ok(b) => b,
+                    Err(e) => return self.fold_classify(self.rt_events == 0, Err(e)),
+                };
+                left = Value::from_bool(rb);
             }
         }
         Ok(left)
@@ -235,14 +346,19 @@ impl<'a> ExprParser<'a> {
 
     /// Bitwise OR `|`
     fn parse_bitor(&mut self) -> Result<Value> {
+        let e0 = self.rt_events;
         let mut left = self.parse_bitxor()?;
+        let mut lp = self.rt_events == e0;
         loop {
             self.skip_whitespace();
             // Match `|` but not `||`
             if self.peek() == '|' && self.peek_at(1) != '|' {
                 self.advance();
+                let e1 = self.rt_events;
                 let right = self.parse_bitxor()?;
-                left = expr_ops::int_bitop(&left, &right, '|')?;
+                let rp = self.rt_events == e1;
+                lp &= rp;
+                left = self.fold_classify(lp, expr_ops::int_bitop(&left, &right, '|'))?;
             } else {
                 break;
             }
@@ -252,13 +368,18 @@ impl<'a> ExprParser<'a> {
 
     /// Bitwise XOR `^`
     fn parse_bitxor(&mut self) -> Result<Value> {
+        let e0 = self.rt_events;
         let mut left = self.parse_bitand()?;
+        let mut lp = self.rt_events == e0;
         loop {
             self.skip_whitespace();
             if self.peek() == '^' {
                 self.advance();
+                let e1 = self.rt_events;
                 let right = self.parse_bitand()?;
-                left = expr_ops::int_bitop(&left, &right, '^')?;
+                let rp = self.rt_events == e1;
+                lp &= rp;
+                left = self.fold_classify(lp, expr_ops::int_bitop(&left, &right, '^'))?;
             } else {
                 break;
             }
@@ -268,14 +389,19 @@ impl<'a> ExprParser<'a> {
 
     /// Bitwise AND `&`
     fn parse_bitand(&mut self) -> Result<Value> {
+        let e0 = self.rt_events;
         let mut left = self.parse_equality()?;
+        let mut lp = self.rt_events == e0;
         loop {
             self.skip_whitespace();
             // Match `&` but not `&&`
             if self.peek() == '&' && self.peek_at(1) != '&' {
                 self.advance();
+                let e1 = self.rt_events;
                 let right = self.parse_equality()?;
-                left = expr_ops::int_bitop(&left, &right, '&')?;
+                let rp = self.rt_events == e1;
+                lp &= rp;
+                left = self.fold_classify(lp, expr_ops::int_bitop(&left, &right, '&'))?;
             } else {
                 break;
             }
@@ -397,12 +523,17 @@ impl<'a> ExprParser<'a> {
     /// `1 <<< 2` 解析为 `<<` 后随非法操作数（missing operand at _@_，
     /// bn13），扩展已移除对齐。
     fn parse_shift(&mut self) -> Result<Value> {
+        let e0 = self.rt_events;
         let mut left = self.parse_additive()?;
+        let mut lp = self.rt_events == e0;
         loop {
             if self.match_op("<<") || self.match_op(">>") {
                 let shl = self.chars[self.pos - 1] == '<';
+                let e1 = self.rt_events;
                 let right = self.parse_additive()?;
-                left = expr_ops::int_shift(&left, &right, shl)?;
+                let rp = self.rt_events == e1;
+                lp &= rp;
+                left = self.fold_classify(lp, expr_ops::int_shift(&left, &right, shl))?;
             } else {
                 break;
             }
@@ -412,19 +543,27 @@ impl<'a> ExprParser<'a> {
 
     /// Additive: `+`, `-`
     fn parse_additive(&mut self) -> Result<Value> {
+        let e0 = self.rt_events;
         let mut left = self.parse_multiplicative()?;
+        let mut lp = self.rt_events == e0;
         loop {
             self.skip_whitespace();
             if self.peek() == '+' {
                 self.advance();
+                let e1 = self.rt_events;
                 let right = self.parse_multiplicative()?;
-                left = expr_ops::numeric_binop(&left, &right, '+' )?;
+                let rp = self.rt_events == e1;
+                lp &= rp;
+                left = self.fold_classify(lp, expr_ops::numeric_binop(&left, &right, '+' ))?;
             } else if self.peek() == '-' {
                 // Distinguish unary minus from binary minus.
                 // Binary minus: there must have been a value on the left.
                 self.advance();
+                let e1 = self.rt_events;
                 let right = self.parse_multiplicative()?;
-                left = expr_ops::numeric_binop(&left, &right, '-')?;
+                let rp = self.rt_events == e1;
+                lp &= rp;
+                left = self.fold_classify(lp, expr_ops::numeric_binop(&left, &right, '-'))?;
             } else {
                 break;
             }
@@ -434,21 +573,32 @@ impl<'a> ExprParser<'a> {
 
     /// Multiplicative: `*`, `/`, `%`
     fn parse_multiplicative(&mut self) -> Result<Value> {
+        let e0 = self.rt_events;
         let mut left = self.parse_power()?;
+        let mut lp = self.rt_events == e0;
         loop {
             self.skip_whitespace();
             if self.peek() == '*' && self.peek_at(1) != '*' {
                 self.advance();
+                let e1 = self.rt_events;
                 let right = self.parse_power()?;
-                left = expr_ops::numeric_binop(&left, &right, '*')?;
+                let rp = self.rt_events == e1;
+                lp &= rp;
+                left = self.fold_classify(lp, expr_ops::numeric_binop(&left, &right, '*'))?;
             } else if self.peek() == '/' {
                 self.advance();
+                let e1 = self.rt_events;
                 let right = self.parse_power()?;
-                left = expr_ops::numeric_binop(&left, &right, '/')?;
+                let rp = self.rt_events == e1;
+                lp &= rp;
+                left = self.fold_classify(lp, expr_ops::numeric_binop(&left, &right, '/'))?;
             } else if self.peek() == '%' {
                 self.advance();
+                let e1 = self.rt_events;
                 let right = self.parse_power()?;
-                left = expr_ops::int_mod(&left, &right)?;
+                let rp = self.rt_events == e1;
+                lp &= rp;
+                left = self.fold_classify(lp, expr_ops::int_mod(&left, &right))?;
             } else {
                 break;
             }
@@ -458,11 +608,15 @@ impl<'a> ExprParser<'a> {
 
     /// Power: `**` (right-associative)
     fn parse_power(&mut self) -> Result<Value> {
+        let e0 = self.rt_events;
         let base = self.parse_unary()?;
+        let bp = self.rt_events == e0;
         if self.match_op("**") {
             // right-associative: recurse
+            let e1 = self.rt_events;
             let exp = self.nested(|p| p.parse_power())?;
-            expr_ops::op_pow(base, exp)
+            let ep = self.rt_events == e1;
+            self.fold_classify(bp && ep, expr_ops::op_pow(base, exp))
         } else {
             Ok(base)
         }
@@ -472,13 +626,17 @@ impl<'a> ExprParser<'a> {
     fn parse_unary(&mut self) -> Result<Value> {
         self.skip_whitespace();
         if self.match_op("!") {
+            let e0 = self.rt_events;
             let val = self.nested(|p| p.parse_unary())?;
-            return expr_ops::op_not(&val);
+            let p = self.rt_events == e0;
+            return self.fold_classify(p, expr_ops::op_not(&val));
         }
         if self.peek() == '~' {
             self.advance();
+            let e0 = self.rt_events;
             let val = self.nested(|p| p.parse_unary())?;
-            return expr_ops::op_bitnot(&val);
+            let p = self.rt_events == e0;
+            return self.fold_classify(p, expr_ops::op_bitnot(&val));
         }
         if self.peek() == '-' && !self.is_at_end() {
             // Only unary minus if we're at the start of unary context
@@ -512,10 +670,12 @@ impl<'a> ExprParser<'a> {
                     self.pos += 19;
                     return Ok(Value::from_int(i64::MIN));
                 }
+                let e0 = self.rt_events;
                 let val = self.nested(|p| p.parse_unary())?;
+                let p = self.rt_events == e0;
                 // Integer operands stay integers (-2 -> -2); float operands
                 // stay floats (-2.0 -> -2.0).
-                return expr_ops::op_neg(&val);
+                return self.fold_classify(p, expr_ops::op_neg(&val));
             }
             // Not unary minus, restore
             self.pos = saved;
@@ -551,6 +711,9 @@ impl<'a> ExprParser<'a> {
             if self.interp.lexical_body {
                 self.interp.next_eval_lexical = true;
             }
+            // A command substitution makes everything downstream
+            // runtime-evaluated (C16 fold classification).
+            self.note_event();
             // TIP 280: the bracket script's line 1 is the source line of
             // its `[`, so a failing command inside it reports the absolute
             // line (multi-line expression operand).
@@ -586,6 +749,7 @@ impl<'a> ExprParser<'a> {
         // Variable reference
         if self.peek() == '$' {
             self.advance();
+            self.note_event();
             if self.peek() == '{' {
                 // ${varname}
                 self.advance();
@@ -621,6 +785,9 @@ impl<'a> ExprParser<'a> {
         // Check for function call
         self.skip_whitespace();
         if self.peek() == '(' {
+            // Function calls are runtime-evaluated in tcl too — never a
+            // compile fold (C16 classification).
+            self.note_event();
             return self.parse_function_call(&ident);
         }
 
@@ -635,6 +802,7 @@ impl<'a> ExprParser<'a> {
 
         // Try as variable
         if self.interp.var_exists(&ident) {
+            self.note_event();
             return self.interp.get_var(&ident).cloned();
         }
 

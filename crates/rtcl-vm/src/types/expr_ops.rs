@@ -23,6 +23,72 @@ pub fn as_int_val(v: &Value) -> Result<i64> {
         .ok_or_else(|| Error::type_mismatch("integer", v.as_str()))
 }
 
+/// Operand position in a 9.1 `cannot use …` message: a unary op has no
+/// side, a binary op names the failing side (tclsh 9.1: `1 + "a"` →
+/// `as right operand of`, `"a" + 1` → `as left operand of`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Unary,
+    Left,
+    Right,
+}
+
+impl Side {
+    fn phrase(self) -> &'static str {
+        match self {
+            Side::Unary => "as operand of",
+            Side::Left => "as left operand of",
+            Side::Right => "as right operand of",
+        }
+    }
+}
+
+/// A value whose text parses as a Tcl list with more than one element is
+/// reported as a list, not as a string (9.1: `expr {"a b" + 1}` →
+/// `cannot use a list as left operand of "+"`; a malformed list (`a {b`)
+/// or a single-element one keeps the string form with the value
+/// verbatim).
+fn is_multi_element_list(v: &Value) -> bool {
+    crate::value::parse_list_full(v.as_str())
+        .map(|l| l.len() > 1)
+        .unwrap_or(false)
+}
+
+/// 9.1's operand-classification error.  Classification order: a
+/// multi-element list, a NaN float, any other float, then a
+/// non-numeric string.  The value is inserted verbatim between the
+/// quotes — tclsh does not escape embedded quotes
+/// (`cannot use non-numeric string "a"b" …`).  errorCode per class in
+/// [`crate::error::Error::tcl_error_code`].
+pub fn operand_class_error(v: &Value, op: &str, side: Side) -> Error {
+    if is_multi_element_list(v) {
+        return Error::Msg(format!("cannot use a list {} \"{op}\"", side.phrase()));
+    }
+    let s = v.as_str();
+    if let Some(f) = v.as_float() {
+        if f.is_nan() {
+            return Error::Msg(format!(
+                "cannot use non-numeric floating-point value \"{s}\" {} \"{op}\"",
+                side.phrase()
+            ));
+        }
+        return Error::Msg(format!(
+            "cannot use floating-point value \"{s}\" {} \"{op}\"",
+            side.phrase()
+        ));
+    }
+    Error::Msg(format!(
+        "cannot use non-numeric string \"{s}\" {} \"{op}\"",
+        side.phrase()
+    ))
+}
+
+/// Numeric-for-arithmetic (int rep, or a non-NaN float): NaN poisons a
+/// side on its own (`NaN + 1` names the left operand first).
+fn arith_ok(v: &Value) -> bool {
+    super::bignum::int_rep(v).is_some() || v.as_float().is_some_and(|f| !f.is_nan())
+}
+
 /// `+`, `-`, `*`, `/` — Tcl numeric semantics.
 ///
 /// Integer operands use integer arithmetic (`/` is floor division,
@@ -30,18 +96,13 @@ pub fn as_int_val(v: &Value) -> Result<i64> {
 /// bignum (`9223372036854775807 + 1` is `9223372036854775808`,
 /// tclsh-style).  If either side is float, compute in f64 and the
 /// result stays a float.
-/// Operand type error: Tcl distinguishes the empty string from other
-/// non-numeric text (`can't use empty string as operand of "+"`).
-fn operand_error(empty: bool, op: &str) -> Error {
-    let kind = if empty { "empty" } else { "non-numeric" };
-    Error::Msg(format!("can't use {kind} string as operand of \"{op}\""))
-}
-
+/// Operand type error: the first failing operand is named (left before
+/// right; NaN counts as failing), 9.1 wording with the value quoted.
 fn pair_operand_error(left: &Value, right: &Value, op: &str) -> Error {
-    // 9.1: the `can't use invalid octal number` arm is gone — `018`-shaped
-    // strings parse as decimals now, so an operand error here is always
-    // the plain non-numeric/empty form.
-    operand_error(left.as_str().is_empty() || right.as_str().is_empty(), op)
+    if !arith_ok(left) {
+        return operand_class_error(left, op, Side::Left);
+    }
+    operand_class_error(right, op, Side::Right)
 }
 
 pub fn numeric_binop(left: &Value, right: &Value, op: char) -> Result<Value> {
@@ -156,20 +217,22 @@ pub fn numeric_binop(left: &Value, right: &Value, op: char) -> Result<Value> {
             )),
         };
     }
-    // NaN operands can't take part in arithmetic (`"nan" + 0` →
-    // can't use non-numeric floating-point value as operand of "+").
-    // Checked only now, AFTER the both-integer fast path: an integer
-    // never carries NaN, and probing as_float first re-parsed every
-    // string operand as a float before the int parse could even run
-    // (double parse per `+` on bracket results — several percent of the
-    // fib profile).
-    if left.as_float().is_some_and(|f| f.is_nan()) || right.as_float().is_some_and(|f| f.is_nan()) {
-        return Err(Error::Msg(format!(
-            "can't use non-numeric floating-point value as operand of \"{op}\""
-        )));
-    }
+    // NaN operands can't take part in arithmetic (9.1: `NaN + 1` →
+    // `cannot use non-numeric floating-point value "NaN" as left operand
+    // of "+"`).  Checked only now, AFTER the both-integer fast path: an
+    // integer never carries NaN, and probing as_float first re-parsed
+    // every string operand as a float before the int parse could even
+    // run (double parse per `+` on bracket results — several percent of
+    // the fib profile).
     match (left.as_float(), right.as_float()) {
         (Some(a), Some(b)) => {
+            // The first NaN operand is named, left before right.
+            if a.is_nan() {
+                return Err(operand_class_error(left, &op.to_string(), Side::Left));
+            }
+            if b.is_nan() {
+                return Err(operand_class_error(right, &op.to_string(), Side::Right));
+            }
             let result = match op {
                 '+' => a + b,
                 '-' => a - b,
@@ -214,11 +277,11 @@ pub fn int_mod(left: &Value, right: &Value) -> Result<Value> {
         return Ok(to_value(IntRep::Big(big_mod(&ia.to_big(), &ib.to_big()))));
     }
     // Non-int operands: tclsh distinguishes a float operand
-    // (`1.5 % 2` → can't use floating-point value as operand of "%")
-    // from any other non-numeric one (`true % 2` → can't use
-    // non-numeric string as operand of "%").
-    let a = int_operand(left, "%")?;
-    let b = int_operand(right, "%")?;
+    // (`1.5 % 2` → cannot use floating-point value "1.5" as left operand
+    // of "%") from any other non-numeric one (`true % 2` → cannot use
+    // non-numeric string "true" as left operand of "%").
+    let a = int_operand(left, "%", Side::Left)?;
+    let b = int_operand(right, "%", Side::Right)?;
     if b == 0 {
         return Err(Error::DivisionByZero);
     }
@@ -238,7 +301,7 @@ pub fn int_shift(left: &Value, right: &Value, shl: bool) -> Result<Value> {
     // with the operator named, separately from other non-numeric
     // strings (`1.5 << 2` vs `"abc" << 1`).
     if int_rep(left).is_none() {
-        int_operand(left, op)?;
+        int_operand(left, op, Side::Left)?;
     }
     // Count: i64 fast path; a bignum count behaves like an unbounded
     // one (>> saturates below, << errors above — `-0x8000000000000001
@@ -251,7 +314,7 @@ pub fn int_shift(left: &Value, right: &Value, shl: bool) -> Result<Value> {
             }
             i64::MAX
         }
-        None => int_operand(right, op)?,
+        None => int_operand(right, op, Side::Right)?,
     };
     if count < 0 {
         return Err(Error::Msg("negative shift argument".to_string()));
@@ -330,9 +393,9 @@ pub fn int_bitop(left: &Value, right: &Value, op: char) -> Result<Value> {
         })));
     }
     // Non-int operands: tclsh rejects floats and other non-numeric
-    // strings with the operator in the message.
-    let a = int_operand(left, &op.to_string())?;
-    let b = int_operand(right, &op.to_string())?;
+    // strings with the operator in the message, naming the failing side.
+    let a = int_operand(left, &op.to_string(), Side::Left)?;
+    let b = int_operand(right, &op.to_string(), Side::Right)?;
     Ok(Value::from_int(match op {
         '|' => a | b,
         '^' => a ^ b,
@@ -520,6 +583,13 @@ pub fn op_pow(base: Value, exp: Value) -> Result<Value> {
     }
     match (base.as_float(), exp.as_float()) {
         (Some(a), Some(b)) => {
+            // The first NaN operand is named (left before right).
+            if a.is_nan() {
+                return Err(operand_class_error(&base, "**", Side::Left));
+            }
+            if b.is_nan() {
+                return Err(operand_class_error(&exp, "**", Side::Right));
+            }
             if a == 0.0 && b < 0.0 {
                 // 0.0**-1 / 0**-1.0 error like the integer form.
                 return Err(Error::Msg(
@@ -528,7 +598,14 @@ pub fn op_pow(base: Value, exp: Value) -> Result<Value> {
             }
             Ok(expr_funcs::float_value(a.powf(b)))
         }
-        _ => Err(Error::type_mismatch("number", "non-numeric value")),
+        _ => {
+            // 9.1: the first failing operand is named
+            // (`"a" ** 2` → as left operand of "**").
+            if !arith_ok(&base) {
+                return Err(operand_class_error(&base, "**", Side::Left));
+            }
+            Err(operand_class_error(&exp, "**", Side::Right))
+        }
     }
 }
 
@@ -538,19 +615,20 @@ pub fn op_not(val: &Value) -> Result<Value> {
 }
 
 /// `~` — two's-complement complement, exact on bignums
-/// (~2^63 is -9223372036854775809).
+/// (~2^63 is -9223372036854775809).  A float operand errors (9.1:
+/// `~4.0` → `cannot use floating-point value "4.0" as operand of "~"`).
 pub fn op_bitnot(val: &Value) -> Result<Value> {
     if let Some(rep) = bignum::int_rep(val) {
         return Ok(bignum::to_value(bignum::IntRep::Big(
             -rep.to_big() - num_bigint::BigInt::from(1),
         )));
     }
-    let n = as_int_val(val)?;
+    let n = int_operand(val, "~", Side::Unary)?;
     Ok(Value::from_int(!n))
 }
 
 /// Unary `-` — integer operands stay integers (bignum-exact on
-/// overflow), float operands stay floats.
+/// overflow), float operands stay floats (NaN errors).
 pub fn op_neg(val: &Value) -> Result<Value> {
     if let Some(rep) = bignum::int_rep(val) {
         return Ok(match rep {
@@ -564,23 +642,17 @@ pub fn op_neg(val: &Value) -> Result<Value> {
         });
     }
     match val.as_float() {
+        Some(n) if n.is_nan() => Err(operand_class_error(val, "-", Side::Unary)),
         Some(n) => Ok(expr_funcs::float_value(-n)),
-        None => Err(Error::type_mismatch("number", "non-numeric value")),
+        None => Err(operand_class_error(val, "-", Side::Unary)),
     }
 }
 
 /// Shift/bitop operand coercion: ints pass; the error names the
-/// operator and distinguishes floats from other non-numeric strings.
-fn int_operand(v: &Value, op: &str) -> Result<i64> {
+/// operator, the failing side, and the operand class (9.1 wording).
+fn int_operand(v: &Value, op: &str, side: Side) -> Result<i64> {
     if let Some(i) = v.as_int() {
         return Ok(i);
     }
-    if v.as_float().is_some() {
-        return Err(Error::Msg(format!(
-            "can't use floating-point value as operand of \"{op}\""
-        )));
-    }
-    Err(Error::Msg(format!(
-        "can't use non-numeric string as operand of \"{op}\""
-    )))
+    Err(operand_class_error(v, op, side))
 }

@@ -384,10 +384,82 @@ extern "Rust" fn cross_alias_dispatch(child: &mut Interp, args: &[Value]) -> Res
         child.remove_cross_alias(name);
         return Err(Error::invalid_command(name));
     };
-    if target == here {
-        return child.dispatch_values(&full);
+    let r = if target == here {
+        child.dispatch_values(&full)
+    } else {
+        run_words(child, target, &full)
+    };
+    // C38（9.1 钉形）：别名目标的 wrong-args 消息命令名 = **别名调用词**，
+    // 目标解释器是父（{pc a b}）还是兄弟（{sc a b}）同形（tclsh 8.6 自己
+    // 不一致——父目标写别名名、兄弟目标写目标名；9.1 统一为别名名；
+    // 原 rtcl 一律目标名）。带前缀实参的别名：名字后**不带**参数表
+    // （should be "x6"），无前缀的带目标参数表（should be "n6 a b"）。
+    // 9.1 只改写 **proc 目标**的 wrong-args（内建目标的自我用词原样——
+    // d21 a-sibling-err 钉形：alias → set 的报错仍是
+    // "set varName ?newValue?"）。
+    let name_only = alias.words.len() > 1;
+    let target_is_proc = alias_target_head_is_proc(
+        if target == here { child } else { unsafe { &*target } },
+        alias.words.first().map(|w| w.as_str()).unwrap_or(""),
+    );
+    match r {
+        Err(e)
+            if target_is_proc
+                && e.message_text().starts_with("wrong # args: should be \"") =>
+        {
+            Err(rename_wrong_args(&e, name, name_only))
+        }
+        other => other,
     }
-    run_words(child, target, &full)
+}
+
+/// 目标调用词头是否解析为 proc（9.1 的改写只对 proc 目标）。全局裸名 /
+/// `::` 限定 / 当前 ns 限定三形。
+pub(crate) fn alias_target_head_is_proc(interp: &Interp, head: &str) -> bool {
+    if head.is_empty() {
+        return false;
+    }
+    let qualified = super::namespace::qualify(&interp.current_namespace, head);
+    let dotted = format!("::{}", head);
+    let keys = [head, dotted.as_str(), qualified.as_str()];
+    keys.iter()
+        .any(|k| interp.procs.contains_key(*k))
+}
+
+/// 把 wrong-args 消息里的命令名改写为别名调用词（变体保持——
+/// WrongArgsMsg/WrongNumArgs 的 -errorcode TCL WRONGARGS 不变）。
+/// `name_only=true`（带前缀实参的别名）消息到名字为止。
+pub(crate) fn rename_wrong_args(e: &Error, name: &str, name_only: bool) -> Error {
+    const P: &str = "wrong # args: should be \"";
+    let msg = e.message_text();
+    let Some(rest) = msg.strip_prefix(P) else {
+        return e.clone();
+    };
+    let new_msg = if name_only {
+        format!("{}{}\"", P, name)
+    } else {
+        let Some(sp) = rest.find(' ').or_else(|| rest.find('"')) else {
+            return e.clone();
+        };
+        format!("{}{}{}", P, name, &rest[sp..])
+    };
+    match e {
+        Error::WrongArgsMsg(_) => Error::WrongArgsMsg(new_msg),
+        Error::WrongNumArgs { expected, actual, usage, .. } => Error::WrongNumArgs {
+            command: name.to_string(),
+            expected: *expected,
+            actual: *actual,
+            usage: usage.clone(),
+        },
+        Error::Msg(_) => Error::Msg(new_msg),
+        // dispatch_values 的目标 proc wrong-args 是 Runtime 形（消息已
+        // 预格式化）。
+        Error::Runtime { code, .. } => Error::runtime(new_msg, *code),
+        other => {
+            let _ = new_msg;
+            other.clone()
+        }
+    }
 }
 
 /// Run `words` in the interpreter at `target` on behalf of `source`.  The
@@ -1688,7 +1760,8 @@ fn alias_delete(interp: &mut Interp, path: &str, name: &str) -> Result<Value> {
 
 /// `interp alias path name ?masterPath? target ?arg …?`
 fn interp_alias(interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    const USAGE: &str = "slavePath slaveCmd ?masterPath masterCmd? ?arg ...?";
+    // 9.1 用语：slave/master → child/parent（rtcl 原 8.6 时代用词）。
+    const USAGE: &str = "childPath childCmd ?parentPath parentCmd? ?arg ...?";
     if args.len() < 4 {
         return Err(Error::wrong_args_with_usage("interp alias", 2, args.len(), USAGE));
     }

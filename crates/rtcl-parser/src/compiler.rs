@@ -307,7 +307,7 @@ impl Compiler {
             | OpCode::CmpVarVarJumpTrue(_, _, _, _) | OpCode::CmpVarVarJumpFalse(_, _, _, _)
             | OpCode::CmpVarImmJumpTrue(_, _, _, _) | OpCode::CmpVarImmJumpFalse(_, _, _, _)
             | OpCode::Return | OpCode::Exit(_)
-            | OpCode::EvalScript | OpCode::EvalExpr
+            | OpCode::EvalScript | OpCode::EvalExpr | OpCode::EvalExprCond
             | OpCode::Add | OpCode::Sub | OpCode::Mul | OpCode::Div | OpCode::Mod | OpCode::Pow
             | OpCode::Neg
             | OpCode::Eq | OpCode::Ne | OpCode::Lt | OpCode::Gt | OpCode::Le | OpCode::Ge
@@ -830,7 +830,7 @@ impl Compiler {
         let line = self.abs_line(cmd);
         let mut end_jumps = Vec::new();
         for (expr_idx, body_idx) in &arms {
-            self.compile_expr_word(&cmd.words[*expr_idx], line, cmd, *expr_idx);
+            self.compile_expr_word_cond(&cmd.words[*expr_idx], line, cmd, *expr_idx);
             let false_jump = self.bytecode.emit(OpCode::JumpFalse(0), line);
             self.compile_body_inline(&cmd.words[*body_idx], cmd, *body_idx);
             let end_jump = self.bytecode.emit(OpCode::Jump(0), line);
@@ -904,8 +904,9 @@ impl Compiler {
             lctx.continue_target = condition_pc;
         }
 
-        // Compile the test expression
-        self.compile_expr_word(&cmd.words[1], line, cmd, 1);
+        // Compile the test expression (condition context: no result
+        // canonicalization — tclsh's jumpFalse conversion precedes it).
+        self.compile_expr_word_cond(&cmd.words[1], line, cmd, 1);
         let exit_jump = self.bytecode.emit(OpCode::JumpFalse(0), line);
 
         // Compile the body inline (pre-checked above)
@@ -1003,7 +1004,7 @@ impl Compiler {
 
         let condition_pc = self.bytecode.current_offset();
 
-        self.compile_expr_word(&cmd.words[2], line, cmd, 2);
+        self.compile_expr_word_cond(&cmd.words[2], line, cmd, 2);
         let exit_jump = self.bytecode.emit(OpCode::JumpFalse(0), line);
 
         self.compile_body_inline(&cmd.words[4], cmd, 4);
@@ -1481,6 +1482,17 @@ impl Compiler {
     /// and basic operators, compiles to native comparison/arithmetic opcodes.
     /// Falls back to `PushConst + EvalExpr` for complex expressions.
     fn compile_expr_word(&mut self, word: &Word, line: u32, cmd: &Command, word_idx: usize) {
+        self.compile_expr_word_gen(word, line, cmd, word_idx, false)
+    }
+
+    /// Condition-context twin ([`Self::compile_expr_word`]): the runtime
+    /// fallback evaluates through `EvalExprCond` (no result
+    /// canonicalization — tclsh's jumpFalse conversion precedes it, C16).
+    fn compile_expr_word_cond(&mut self, word: &Word, line: u32, cmd: &Command, word_idx: usize) {
+        self.compile_expr_word_gen(word, line, cmd, word_idx, true)
+    }
+
+    fn compile_expr_word_gen(&mut self, word: &Word, line: u32, cmd: &Command, word_idx: usize, cond: bool) {
         match word {
             Word::Literal(s) => {
                 // Try inline compilation first.  The expression compiler
@@ -1507,7 +1519,10 @@ impl Compiler {
                 self.bytecode.sites.truncate(sites_mark);
                 // Fallback: runtime eval
                 self.bytecode.emit_push_const(s, line);
-                self.bytecode.emit(OpCode::EvalExpr, line);
+                self.bytecode.emit(
+                    if cond { OpCode::EvalExprCond } else { OpCode::EvalExpr },
+                    line,
+                );
             }
             _ => {
                 self.compile_word_spanned(word, line, cmd, word_idx);

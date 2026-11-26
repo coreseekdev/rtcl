@@ -53,10 +53,26 @@ pub fn strict_bool(v: &Value) -> Result<bool> {
         return Ok(i != 0);
     }
     if let Some(f) = v.as_float() {
+        // 9.1: a NaN is not a usable boolean (`if {NaN}` →
+        // floating point value is Not a Number, TCL VALUE DOUBLE NAN).
+        if f.is_nan() {
+            return Err(Error::Msg(
+                "floating point value is Not a Number".to_string(),
+            ));
+        }
         return Ok(f != 0.0);
     }
     if let Some(b) = bool_from_string(v.as_str()) {
         return Ok(b);
+    }
+    // A multi-element list value keeps the unquoted `a list` form
+    // (`if {$x} {}` with x={1 2} → expected boolean value but got a
+    // list); everything else quotes the text.
+    if crate::value::parse_list_full(v.as_str())
+        .map(|l| l.len() > 1)
+        .unwrap_or(false)
+    {
+        return Err(Error::Msg("expected boolean value but got a list".to_string()));
     }
     Err(Error::Msg(format!(
         "expected boolean value but got \"{}\"",
@@ -65,20 +81,32 @@ pub fn strict_bool(v: &Value) -> Result<bool> {
 }
 
 /// Operand coercion for unary `!`: accepts the same values as
-/// [`strict_bool`], but Tcl reports a different message for a
-/// non-numeric, non-boolean operand of `!`.
+/// [`strict_bool`], but Tcl reports the operand-class message for a
+/// non-numeric, non-boolean operand of `!` (9.1: `!$x` with x="a" →
+/// `cannot use non-numeric string "a" as operand of "!"`; NaN →
+/// `cannot use non-numeric floating-point value …`; a list →
+/// `cannot use a list as operand of "!"`).
 pub(crate) fn not_operand(v: &Value) -> Result<bool> {
     if let Some(i) = v.as_int() {
         return Ok(i != 0);
     }
     if let Some(f) = v.as_float() {
+        if f.is_nan() {
+            return Err(super::expr_ops::operand_class_error(
+                v,
+                "!",
+                super::expr_ops::Side::Unary,
+            ));
+        }
         return Ok(f != 0.0);
     }
     if let Some(b) = bool_from_string(v.as_str()) {
         return Ok(b);
     }
-    Err(Error::Msg(
-        "can't use non-numeric string as operand of \"!\"".to_string(),
+    Err(super::expr_ops::operand_class_error(
+        v,
+        "!",
+        super::expr_ops::Side::Unary,
     ))
 }
 

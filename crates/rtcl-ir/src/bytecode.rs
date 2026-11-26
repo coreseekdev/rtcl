@@ -14,6 +14,119 @@ enum FoldResult {
     Bool(bool),
 }
 
+/// An operand of a fold window: the exact value the `PushInt`/`PushFloat`
+/// would have pushed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FoldV {
+    Int(i64),
+    Float(f64),
+}
+
+impl FoldV {
+    /// Constant-pool form: decimals for ints; float bits hex under a
+    /// `#f` marker (the executor reconstructs the exact f64 — rtcl-ir
+    /// has no tcl-canonical float renderer).
+    fn const_form(self) -> String {
+        match self {
+            FoldV::Int(i) => i.to_string(),
+            FoldV::Float(f) => format!("#f{:x}", f.to_bits()),
+        }
+    }
+    fn as_int(&self) -> Option<i64> {
+        match self {
+            FoldV::Int(i) => Some(*i),
+            FoldV::Float(_) => None,
+        }
+    }
+    fn as_float(&self) -> Option<f64> {
+        match self {
+            FoldV::Int(_) => None,
+            FoldV::Float(f) => Some(*f),
+        }
+    }
+    fn is_zero(&self) -> bool {
+        self.as_int() == Some(0) || self.as_float() == Some(0.0)
+    }
+}
+
+/// The operator byte an [`OpCode::ExprFoldError`] carries, keyed to the
+/// executor's expr_ops dispatch (`/` Div, `%` Mod, `P` Pow, `<` Shl,
+/// `>` Shr, `&`/`|`/`^` BitAnd/Or/Xor, `~` BitNot).  `Some(())` when the
+/// window's constant evaluation the runtime refuses.
+fn fold_errors(op: &OpCode, a: FoldV, b: FoldV) -> bool {
+    let (ai, af) = (a.as_int(), a.as_float());
+    let (bi, bf) = (b.as_int(), b.as_float());
+    let float_involved = af.is_some() || bf.is_some();
+    match op {
+        // 1/0 and friends: divide by zero.  With a float involved only
+        // 0/0.0 errors (domain, either form — `0.0/0` too); x/0.0 (x≠0)
+        // is ±Inf per IEEE.
+        OpCode::Div => {
+            let a_zero = ai == Some(0) || af == Some(0.0);
+            let b_zero = bi == Some(0) || bf == Some(0.0);
+            if float_involved {
+                a_zero && b_zero
+            } else {
+                bi == Some(0)
+            }
+        }
+        // % takes ints only: any float operand errors (left first);
+        // otherwise a zero divisor.
+        OpCode::Mod => float_involved || bi == Some(0),
+        // 0**neg errors; other int bases with a negative exponent give 0;
+        // the ≥2^28-bit magnitude cap errors except for the units
+        // short-circuits (0**n, 1**n, (-1)**n) — the runtime checks the
+        // units first.  A float base errors only for 0.0**neg.
+        OpCode::Pow => {
+            if let (Some(x), Some(y)) = (ai, bi) {
+                if x == 0 && y < 0 {
+                    true
+                } else if y < 0 {
+                    false
+                } else {
+                    x != 0 && x.unsigned_abs() != 1 && y >= (1 << 28)
+                }
+            } else {
+                let base_zero = ai == Some(0) || af == Some(0.0);
+                let exp = bi.map(|v| v as f64).or(bf).unwrap_or(0.0);
+                base_zero && exp < 0.0
+            }
+        }
+        // Shifts take ints only; a negative count errors; `<<` past
+        // rtcl's bignum cap errors ("integer value too large to
+        // represent" — the runtime int_shift raises it before shifting).
+        OpCode::Shl | OpCode::Shr => {
+            if float_involved {
+                true
+            } else {
+                match bi {
+                    Some(c) if c < 0 => true,
+                    Some(c) => *op == OpCode::Shl && c > (1 << 27),
+                    None => false,
+                }
+            }
+        }
+        // Bitwise ops take ints only.
+        OpCode::BitAnd | OpCode::BitOr | OpCode::BitXor => float_involved,
+        _ => false,
+    }
+}
+
+/// The ExprFoldError operator byte for `op` when it errors over `a`/`b`.
+fn fold_error_char(op: &OpCode, a: FoldV, b: FoldV) -> Option<u8> {
+    fold_errors(op, a, b).then(|| match op {
+        OpCode::Div => b'/',
+        OpCode::Mod => b'%',
+        OpCode::Pow => b'P',
+        OpCode::Shl => b'<',
+        OpCode::Shr => b'>',
+        OpCode::BitAnd => b'&',
+        OpCode::BitOr => b'|',
+        OpCode::BitXor => b'^',
+        _ => 0,
+    })
+}
+
 /// Byte span into a compilation unit's source text (see [`ByteCode::source`]).
 /// Copy-only; resolving to `&str` is `span.slice(&code.source)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1321,6 +1434,95 @@ impl ByteCode {
             return false;
         }
         let mut changed = false;
+
+        // --- 2-op literal negation fold ---
+        //
+        // [PushInt k, Neg] → PushInt(-k) (checked; i64::MIN stays
+        // runtime — Neg widens to the exact bignum there).  Without it
+        // `0**-1` compiles to [0, 1, Neg, Pow] and the fold-error window
+        // below never sees [0, -1, Pow].
+        {
+            let len = self.ops.len();
+            let mut i = 0;
+            while i + 1 < len {
+                if let (OpCode::PushInt(k), OpCode::Neg) = (&self.ops[i], &self.ops[i + 1]) {
+                    let k = *k;
+                    if let Some(neg) = k.checked_neg() {
+                        self.ops[i] = OpCode::PushInt(neg);
+                        self.ops[i + 1] = OpCode::Nop;
+                        changed = true;
+                        i += 2;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+
+        // --- 3-op fold-error windows (C16) ---
+        //
+        // A [PushInt/PushFloat, PushInt/PushFloat, ArithOp] window whose
+        // constant evaluation the runtime refuses (1/0, 1%0.0, 0**-1,
+        // 3**268435456, negative shifts, float bit-operands, 0/0.0) is
+        // replaced with ExprFoldError carrying the two constants: the
+        // executor re-raises the exact runtime error at that point in
+        // the op stream, and the expr command frame appends with tclsh
+        // 9.1's folded-literal keyword `invoked from within` — tclsh
+        // plants the same deferred error when its compile-time fold of
+        // the constant subtree fails.  Successfully folding windows are
+        // left to the value fold below; everything else runs at runtime.
+        if len >= 3 {
+            let mut i = 0;
+            while i + 2 < len {
+                let av = match &self.ops[i] {
+                    OpCode::PushInt(k) => Some(FoldV::Int(*k)),
+                    OpCode::PushFloat(f) => Some(FoldV::Float(*f)),
+                    _ => None,
+                };
+                let bv = match &self.ops[i + 1] {
+                    OpCode::PushInt(k) => Some(FoldV::Int(*k)),
+                    OpCode::PushFloat(f) => Some(FoldV::Float(*f)),
+                    _ => None,
+                };
+                if let (Some(av), Some(bv)) = (av, bv) {
+                    if let Some(opc) = fold_error_char(&self.ops[i + 2], av, bv) {
+                        let ia = self.add_const(&av.const_form());
+                        let ib = self.add_const(&bv.const_form());
+                        self.ops[i] = OpCode::ExprFoldError(opc, ia, ib);
+                        self.ops[i + 1] = OpCode::Nop;
+                        self.ops[i + 2] = OpCode::Nop;
+                        changed = true;
+                        i += 3;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+
+        // Unary window: [PushFloat f, BitNot] — a float operand of `~`
+        // errors at fold (9.1: `~4.0` → cannot use floating-point value
+        // "4.0" as operand of "~").  The pending PushFloat stays: the
+        // fold error raises before any stack consumer and the unwind
+        // discards it.  (Outside the 3-op guard above: `expr {~4.0}` is
+        // exactly two ops.)
+        {
+            let len = self.ops.len();
+            let mut i = 0;
+            while i + 1 < len {
+                if let OpCode::PushFloat(f) = &self.ops[i] {
+                    if matches!(self.ops[i + 1], OpCode::BitNot) {
+                        let idx = self.add_const(&FoldV::Float(*f).const_form());
+                        self.ops[i + 1] = OpCode::ExprFoldError(b'~', idx, idx);
+                        changed = true;
+                        i += 2;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+
 
         // --- 3-op constant folding ---
         //

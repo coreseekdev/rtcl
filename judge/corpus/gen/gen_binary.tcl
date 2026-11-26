@@ -1405,6 +1405,13 @@ set __judge_c [catch {
     binary format r2 {1.6}
 } __judge_r]
 if {$__judge_c == 1 && $__judge_r eq {number of elements in list does not match count}} {puts PASS} else {puts "FAIL binary-53.16"}
+# case: binary-53.22 cmd=binary
+set __judge_c [catch {
+    binary scan [binary format R Inf] R inf
+    binary scan [binary format R -Inf] R inf_
+    list $inf $inf_
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {Inf -Inf}} {puts PASS} else {puts "FAIL binary-53.22"}
 # case: binary-53.23 cmd=binary
 set __judge_c [catch {
     binary scan [binary format H* 7f7fffff] R fltmax
@@ -1421,6 +1428,20 @@ set __judge_c [catch {
     expr {$fltmax eq $fltmax1}
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL binary-53.24"}
+# case: binary-53.25 cmd=binary
+set __judge_c [catch {
+    binary scan [binary format H* 47effffff0000001] Q round_to_inf
+    binary scan [binary format R $round_to_inf] R inf1
+    expr {$inf1 eq Inf}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL binary-53.25"}
+# case: binary-53.26 cmd=binary
+set __judge_c [catch {
+    binary scan [binary format H* c7effffff0000001] Q round_to_inf
+    binary scan [binary format R $round_to_inf] R inf1
+    expr {$inf1 eq -Inf}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL binary-53.26"}
 # case: binary-54.1 cmd=binary
 set __judge_c [catch {
     binary scan abc t
@@ -1682,6 +1703,11 @@ set __judge_c [catch {
     string length [binary encode base64 -maxlen 3 -wrapchar \xCA abc]
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {5}} {puts PASS} else {puts "FAIL binary-72.29"}
+# case: binary-72.30 cmd=string
+set __judge_c [catch {
+    string length [binary encode base64 -maxlen 4294967296 abc]
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {4}} {puts PASS} else {puts "FAIL binary-72.30"}
 # case: binary-73.2 cmd=binary
 set __judge_c [catch {
     binary decode base64 YWJj

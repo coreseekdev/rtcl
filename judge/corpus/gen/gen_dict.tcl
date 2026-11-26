@@ -1229,3 +1229,103 @@ set __judge_c [catch {
     }}
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL dict-25.1"}
+# case: dict-26.1 cmd=dict
+set __judge_c [catch {
+    dict getdef {a b} a c
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {b}} {puts PASS} else {puts "FAIL dict-26.1"}
+# case: dict-26.2 cmd=dict
+set __judge_c [catch {
+    dict getdef {a b} b c
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {c}} {puts PASS} else {puts "FAIL dict-26.2"}
+# case: dict-26.3 cmd=dict
+set __judge_c [catch {
+    dict getdef {a {b c}} a b d
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {c}} {puts PASS} else {puts "FAIL dict-26.3"}
+# case: dict-26.4 cmd=dict
+set __judge_c [catch {
+    dict getdef {a {b c}} a c d
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {d}} {puts PASS} else {puts "FAIL dict-26.4"}
+# case: dict-26.5 cmd=dict
+set __judge_c [catch {
+    dict getdef {a {b c}} b c d
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {d}} {puts PASS} else {puts "FAIL dict-26.5"}
+# case: dict-26.6 cmd=dict
+set __judge_c [catch {
+    dict getdef {a {b c d}} a b d
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {missing value to go with key}} {puts PASS} else {puts "FAIL dict-26.6"}
+# case: dict-26.7 cmd=dict
+set __judge_c [catch {
+    dict getdef
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "dict getdef dictionary ?key ...? key default"}} {puts PASS} else {puts "FAIL dict-26.7"}
+# case: dict-26.8 cmd=dict
+set __judge_c [catch {
+    dict getdef {}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "dict getdef dictionary ?key ...? key default"}} {puts PASS} else {puts "FAIL dict-26.8"}
+# case: dict-26.9 cmd=dict
+set __judge_c [catch {
+    dict getdef {} {}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "dict getdef dictionary ?key ...? key default"}} {puts PASS} else {puts "FAIL dict-26.9"}
+# case: dict-26.10 cmd=dict
+set __judge_c [catch {
+    dict getdef {a b c} d e
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {missing value to go with key}} {puts PASS} else {puts "FAIL dict-26.10"}
+# case: dict-27.1 cmd=dict
+set __judge_c [catch {
+    dict getwithdefault {a b} a c
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {b}} {puts PASS} else {puts "FAIL dict-27.1"}
+# case: dict-27.2 cmd=dict
+set __judge_c [catch {
+    dict getwithdefault {a b} b c
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {c}} {puts PASS} else {puts "FAIL dict-27.2"}
+# case: dict-27.3 cmd=dict
+set __judge_c [catch {
+    dict getwithdefault {a {b c}} a b d
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {c}} {puts PASS} else {puts "FAIL dict-27.3"}
+# case: dict-27.4 cmd=dict
+set __judge_c [catch {
+    dict getwithdefault {a {b c}} a c d
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {d}} {puts PASS} else {puts "FAIL dict-27.4"}
+# case: dict-27.5 cmd=dict
+set __judge_c [catch {
+    dict getwithdefault {a {b c}} b c d
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {d}} {puts PASS} else {puts "FAIL dict-27.5"}
+# case: dict-27.6 cmd=dict
+set __judge_c [catch {
+    dict getwithdefault {a {b c d}} a b d
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {missing value to go with key}} {puts PASS} else {puts "FAIL dict-27.6"}
+# case: dict-27.7 cmd=dict
+set __judge_c [catch {
+    dict getwithdefault
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "dict getwithdefault dictionary ?key ...? key default"}} {puts PASS} else {puts "FAIL dict-27.7"}
+# case: dict-27.8 cmd=dict
+set __judge_c [catch {
+    dict getwithdefault {}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "dict getwithdefault dictionary ?key ...? key default"}} {puts PASS} else {puts "FAIL dict-27.8"}
+# case: dict-27.9 cmd=dict
+set __judge_c [catch {
+    dict getwithdefault {} {}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "dict getwithdefault dictionary ?key ...? key default"}} {puts PASS} else {puts "FAIL dict-27.9"}
+# case: dict-27.10 cmd=dict
+set __judge_c [catch {
+    dict getwithdefault {a b c} d e
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {missing value to go with key}} {puts PASS} else {puts "FAIL dict-27.10"}

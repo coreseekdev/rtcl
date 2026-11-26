@@ -76,6 +76,12 @@ set __judge_c [catch {
     list $err $msg
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {1 {wrong # args: should be "while test command"}}} {puts PASS} else {puts "FAIL while-old-4.3"}
+# case: while-old-4.4 cmd=set
+set __judge_c [catch {
+    set err [catch {while {"a"+"b"} {error "loop aborted"}} msg]
+    list $err $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "a" as left operand of "+"}}} {puts PASS} else {puts "FAIL while-old-4.4"}
 # case: while-old-4.5 cmd=catch
 set __judge_c [catch {
     catch {unset x}

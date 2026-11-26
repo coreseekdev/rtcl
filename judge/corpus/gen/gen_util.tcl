@@ -142,6 +142,16 @@ set __judge_c [catch {
     string index abcd { 01 }
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {b}} {puts PASS} else {puts "FAIL util-9.0.7"}
+# case: util-9.0.8 cmd=string
+set __judge_c [catch {
+    string index abcd { 0d0 }
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {a}} {puts PASS} else {puts "FAIL util-9.0.8"}
+# case: util-9.0.9 cmd=string
+set __judge_c [catch {
+    string index abcd { -0d0 }
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {a}} {puts PASS} else {puts "FAIL util-9.0.9"}
 # case: util-9.1.0 cmd=string
 set __judge_c [catch {
     string index abcd 3
@@ -162,6 +172,16 @@ set __judge_c [catch {
     string index abcdefghijk { 0xa }
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {k}} {puts PASS} else {puts "FAIL util-9.1.3"}
+# case: util-9.1.4 cmd=string
+set __judge_c [catch {
+    string index abcdefghijk 0d10
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {k}} {puts PASS} else {puts "FAIL util-9.1.4"}
+# case: util-9.1.5 cmd=string
+set __judge_c [catch {
+    string index abcdefghijk { 0d10 }
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {k}} {puts PASS} else {puts "FAIL util-9.1.5"}
 # case: util-9.2.0 cmd=string
 set __judge_c [catch {
     string index abcd end
@@ -247,6 +267,76 @@ set __judge_c [catch {
     string index abcd { -1--2 }
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {b}} {puts PASS} else {puts "FAIL util-9.18"}
+# case: util-9.32 cmd=string
+set __judge_c [catch {
+    string index a 0x1FFFFFFFF+0
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL util-9.32"}
+# case: util-9.33 cmd=string
+set __judge_c [catch {
+    string index a 100000000000+0
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL util-9.33"}
+# case: util-9.33.1 cmd=string
+set __judge_c [catch {
+    string index a 0d100000000000+0
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL util-9.33.1"}
+# case: util-9.44 cmd=string
+set __judge_c [catch {
+    string index a 0+1000000000000
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL util-9.44"}
+# case: util-9.45 cmd=string
+set __judge_c [catch {
+    string index abcd end+2305843009213693950
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL util-9.45"}
+# case: util-9.46 cmd=string
+set __judge_c [catch {
+    string index abcd end+4294967294
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL util-9.46"}
+# case: util-9.47 cmd=string
+set __judge_c [catch {
+    string index abcd 0x10000000000000000
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL util-9.47"}
+# case: util-9.48 cmd=string
+set __judge_c [catch {
+    string index abcd -0x10000000000000000
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL util-9.48"}
+# case: util-9.54 cmd=string
+set __judge_c [catch {
+    string index abcd end-0x10000000000000000
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL util-9.54"}
+# case: util-9.55 cmd=string
+set __judge_c [catch {
+    string index abcd end+0x10000000000000000
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL util-9.55"}
+# case: util-9.56 cmd=string
+set __judge_c [catch {
+    string index abcd end--0x10000000000000000
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL util-9.56"}
+# case: util-9.57 cmd=string
+set __judge_c [catch {
+    string index abcd end+-0x10000000000000000
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL util-9.57"}
+# case: util-9.58 cmd=string
+set __judge_c [catch {
+    string index abcd end--0x8000000000000000
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL util-9.58"}
+# case: util-9.59 cmd=string
+set __judge_c [catch {
+    string index abcd 0-0x10000000000000000
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL util-9.59"}
 # case: util-11.1 cmd=expr
 set __judge_c [catch {
     expr {1.1e-5}

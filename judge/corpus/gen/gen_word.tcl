@@ -44,6 +44,11 @@ set __judge_c [catch {
     tcl_endOfWord "ab cd" end-1
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {-1}} {puts PASS} else {puts "FAIL word-1.8"}
+# case: word-1.9 cmd=tcl_endOfWord
+set __judge_c [catch {
+    tcl_endOfWord "ab cd" {}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {2}} {puts PASS} else {puts "FAIL word-1.9"}
 # case: word-2.0 cmd=tcl_startOfPreviousWord
 set __judge_c [catch {
     tcl_startOfPreviousWord "ab cd" -1
@@ -139,6 +144,11 @@ set __judge_c [catch {
     tcl_startOfNextWord "ab cd" end-1
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {-1}} {puts PASS} else {puts "FAIL word-3.8"}
+# case: word-3.9 cmd=tcl_startOfNextWord
+set __judge_c [catch {
+    tcl_startOfNextWord "ab cd" {}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {3}} {puts PASS} else {puts "FAIL word-3.9"}
 # case: word-4.0 cmd=tcl_wordBreakBefore
 set __judge_c [catch {
     tcl_wordBreakBefore "ab cd" -1
@@ -184,6 +194,11 @@ set __judge_c [catch {
     tcl_startOfNextWord "ab cd" end-1
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {-1}} {puts PASS} else {puts "FAIL word-4.8"}
+# case: word-4.9 cmd=tcl_wordBreakBefore
+set __judge_c [catch {
+    tcl_wordBreakBefore "ab cd" {}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {-1}} {puts PASS} else {puts "FAIL word-4.9"}
 # case: word-5.0 cmd=tcl_wordBreakAfter
 set __judge_c [catch {
     tcl_wordBreakAfter "ab cd" -1
@@ -229,3 +244,8 @@ set __judge_c [catch {
     tcl_wordBreakAfter "ab cd" end-1
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {-1}} {puts PASS} else {puts "FAIL word-5.8"}
+# case: word-5.9 cmd=tcl_wordBreakAfter
+set __judge_c [catch {
+    tcl_wordBreakAfter "ab cd" {}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {2}} {puts PASS} else {puts "FAIL word-5.9"}

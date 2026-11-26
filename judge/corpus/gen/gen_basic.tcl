@@ -10,6 +10,20 @@ set __judge_c [catch {
 	 [namespace delete test_ns_basic]
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {::test_ns_basic {}}} {puts PASS} else {puts "FAIL basic-15.1"}
+# case: basic-15.3 cmd=namespace
+set __judge_c [catch {
+    namespace eval ns {
+	proc p {} {}; proc q {} {};
+	namespace delete [namespace current];
+	proc p {} {}; proc q {} {}
+    }
+    # APN - current behavior is that namespace continues to exist
+    # as it is recreated by the proc calls after the ns delete.
+    # I am not sure this is consistent with proc ns::foo raising
+    # an error if ns does not exist. But whatever ...
+    namespace exists ns
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL basic-15.3"}
 # case: basic-18.1 cmd=catch
 set __judge_c [catch {
     catch {namespace delete {*}[namespace children :: test_ns_*]}

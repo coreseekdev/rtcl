@@ -14,6 +14,11 @@ set __judge_c [catch {
     chan configure stdout -eofchar [list \x27 \x80]
 } __judge_r]
 if {$__judge_c == 1 && $__judge_r eq {bad value for -eofchar: must be non-NUL ASCII character}} {puts PASS} else {puts "FAIL chan-4.5"}
+# case: chan-4.6 cmd=chan
+set __judge_c [catch {
+    chan configure stdout -eofchar [list {} \x27]
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {bad value for -eofchar: must be non-NUL ASCII character}} {puts PASS} else {puts "FAIL chan-4.6"}
 # case: chan-16.5 cmd=chan
 set __judge_c [catch {
     chan pending input stdout

@@ -24,6 +24,11 @@ set __judge_c [catch {
     lsearch -exact {foo bar cat} bar
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL lsearch-2.5"}
+# case: lsearch-2.6 cmd=lsearch
+set __judge_c [catch {
+    lsearch -regexp {xyz bbcc *bc*} *bc*
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {cannot compile regular expression pattern: invalid quantifier operand}} {puts PASS} else {puts "FAIL lsearch-2.6"}
 # case: lsearch-2.7 cmd=lsearch
 set __judge_c [catch {
     lsearch -regexp {b.x ^bc xy bcx} ^bc
@@ -39,6 +44,11 @@ set __judge_c [catch {
     lsearch -glob {b.x ^bc xy bcx} ^bc
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL lsearch-2.9"}
+# case: lsearch-2.10 cmd=lsearch
+set __judge_c [catch {
+    lsearch -glib {b.x bx xy bcx} b.x
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {bad option "-glib": must be -all, -ascii, -bisect, -decreasing, -dictionary, -exact, -glob, -increasing, -index, -inline, -integer, -nocase, -not, -real, -regexp, -sorted, -start, -stride, or -subindices}} {puts PASS} else {puts "FAIL lsearch-2.10"}
 # case: lsearch-2.11 cmd=lsearch
 set __judge_c [catch {
     lsearch -exact -nocase {a b c A B C} A
@@ -79,6 +89,16 @@ set __judge_c [catch {
     lsearch a
 } __judge_r]
 if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "lsearch ?-option value ...? list pattern"}} {puts PASS} else {puts "FAIL lsearch-3.2"}
+# case: lsearch-3.3 cmd=lsearch
+set __judge_c [catch {
+    lsearch a b c
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {bad option "a": must be -all, -ascii, -bisect, -decreasing, -dictionary, -exact, -glob, -increasing, -index, -inline, -integer, -nocase, -not, -real, -regexp, -sorted, -start, -stride, or -subindices}} {puts PASS} else {puts "FAIL lsearch-3.3"}
+# case: lsearch-3.4 cmd=lsearch
+set __judge_c [catch {
+    lsearch a b c d
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {bad option "a": must be -all, -ascii, -bisect, -decreasing, -dictionary, -exact, -glob, -increasing, -index, -inline, -integer, -nocase, -not, -real, -regexp, -sorted, -start, -stride, or -subindices}} {puts PASS} else {puts "FAIL lsearch-3.4"}
 # case: lsearch-3.5 cmd=lsearch
 set __judge_c [catch {
     lsearch "\{" b
@@ -303,6 +323,31 @@ set __judge_c [catch {
     lsearch -index {} [list \{] \{
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {0}} {puts PASS} else {puts "FAIL lsearch-17.10"}
+# case: lsearch-17.12 cmd=lsearch
+set __judge_c [catch {
+    lsearch -index -2 a a
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {index "-2" out of range}} {puts PASS} else {puts "FAIL lsearch-17.12"}
+# case: lsearch-17.13 cmd=lsearch
+set __judge_c [catch {
+    lsearch -index -1-1 a a
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {index "-1-1" out of range}} {puts PASS} else {puts "FAIL lsearch-17.13"}
+# case: lsearch-17.14 cmd=lsearch
+set __judge_c [catch {
+    lsearch -index end--1 a a
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {index "end--1" out of range}} {puts PASS} else {puts "FAIL lsearch-17.14"}
+# case: lsearch-17.15 cmd=lsearch
+set __judge_c [catch {
+    lsearch -index end+1 a a
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {index "end+1" out of range}} {puts PASS} else {puts "FAIL lsearch-17.15"}
+# case: lsearch-17.16 cmd=lsearch
+set __judge_c [catch {
+    lsearch -index end+2 a a
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {index "end+2" out of range}} {puts PASS} else {puts "FAIL lsearch-17.16"}
 # case: lsearch-18.1 cmd=lsearch
 set __judge_c [catch {
     lsearch -index {0 0} {{{x x} {x b} {a d}} {{a c} {a b} {a a}}} a
@@ -405,6 +450,89 @@ set __judge_c [catch {
     lsearch -sorted -integer {5 5 5 5} 5
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {0}} {puts PASS} else {puts "FAIL lsearch-22.6"}
+# case: lsearch-23.1 cmd=lsearch
+set __judge_c [catch {
+    lsearch -stride {a b} a
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {"-stride" option must be followed by stride length}} {puts PASS} else {puts "FAIL lsearch-23.1"}
+# case: lsearch-23.2 cmd=lsearch
+set __judge_c [catch {
+    lsearch -stride 0 {a b} a
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {stride length must be at least 1}} {puts PASS} else {puts "FAIL lsearch-23.2"}
+# case: lsearch-23.3 cmd=lsearch
+set __judge_c [catch {
+    lsearch -stride 2 {a b c} a
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {list size must be a multiple of the stride length}} {puts PASS} else {puts "FAIL lsearch-23.3"}
+# case: lsearch-23.4 cmd=lsearch
+set __judge_c [catch {
+    lsearch -stride 5 {a b c} a
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {list size must be a multiple of the stride length}} {puts PASS} else {puts "FAIL lsearch-23.4"}
+# case: lsearch-23.5 cmd=?
+set __judge_c [catch {
+    # Stride equal to length is ok
+    lsearch -stride 3 {a b c} a
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0}} {puts PASS} else {puts "FAIL lsearch-23.5"}
+# case: lsearch-24.1 cmd=lsearch
+set __judge_c [catch {
+    lsearch -stride 2 {a b c d e f g h} d
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {-1}} {puts PASS} else {puts "FAIL lsearch-24.1"}
+# case: lsearch-24.2 cmd=lsearch
+set __judge_c [catch {
+    lsearch -stride 2 {a b c d e f g h} e
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {4}} {puts PASS} else {puts "FAIL lsearch-24.2"}
+# case: lsearch-24.3 cmd=lsearch
+set __judge_c [catch {
+    lsearch -stride 3 {a b c d e f g h i} e
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {-1}} {puts PASS} else {puts "FAIL lsearch-24.3"}
+# case: lsearch-24.4 cmd=?
+set __judge_c [catch {
+    # Result points first in group
+    lsearch -stride 3 -index 1 {a b c d e f g h i} e
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {3}} {puts PASS} else {puts "FAIL lsearch-24.4"}
+# case: lsearch-24.5 cmd=lsearch
+set __judge_c [catch {
+    lsearch -inline -stride 2 {a b c d e f g h} d
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL lsearch-24.5"}
+# case: lsearch-24.7 cmd=lsearch
+set __judge_c [catch {
+    lsearch -inline -stride 3 {a b c d e f g h i} e
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL lsearch-24.7"}
+# case: lsearch-24.11 cmd=?
+set __judge_c [catch {
+    # Stride 1 is same as no stride
+    lsearch -stride 1 {a b c d e f g h} d
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {3}} {puts PASS} else {puts "FAIL lsearch-24.11"}
+# case: lsearch-25.1 cmd=lsearch
+set __judge_c [catch {
+    lsearch -inline -subindices -index {0 0} {{{x x} {x b} {a d}} {{a c} {a b} {a a}}} a
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {a}} {puts PASS} else {puts "FAIL lsearch-25.1"}
+# case: lsearch-25.2 cmd=lsearch
+set __judge_c [catch {
+    lsearch -inline -subindices -index {2 0} -exact {{{x x} {x b} {a d}} {{a c} {a b} {a a}}} a
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {a}} {puts PASS} else {puts "FAIL lsearch-25.2"}
+# case: lsearch-25.3 cmd=lsearch
+set __judge_c [catch {
+    lsearch -inline -subindices -index {1 1} -glob {{{ab cb} {ab bb} {ab ab}} {{ab cb} {ab bb} {ab ab}}} b*
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {bb}} {puts PASS} else {puts "FAIL lsearch-25.3"}
+# case: lsearch-25.4 cmd=lsearch
+set __judge_c [catch {
+    lsearch -inline -subindices -index {0 1} -regexp {{{ab cb} {ab bb} {ab ab}} {{ab cb} {ab bb} {ab ab}}} {[cb]b}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {cb}} {puts PASS} else {puts "FAIL lsearch-25.4"}
 # case: lsearch-25.5 cmd=lsearch
 set __judge_c [catch {
     lsearch -inline -subindices -all -index {0 0} -exact {{{a c} {a b} {d a}} {{a c} {a b} {d a}}} a
@@ -415,3 +543,118 @@ set __judge_c [catch {
     lsearch -inline -subindices -all -index {1 0} -exact {{{a c} {a b} {d a}} {{a c} {a b} {d a}}} a
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {a a}} {puts PASS} else {puts "FAIL lsearch-25.6"}
+# case: lsearch-26.1 cmd=lsearch
+set __judge_c [catch {
+    lsearch -stride 3 -subindices -index {0 0} {{x x} {x b} {a d} {a c} {a b} {a a}} a
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {3 0}} {puts PASS} else {puts "FAIL lsearch-26.1"}
+# case: lsearch-26.2 cmd=lsearch
+set __judge_c [catch {
+    lsearch -stride 3 -subindices -index {2 0} -exact {{x x} {x b} {a d} {a c} {a b} {a a}} a
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {2 0}} {puts PASS} else {puts "FAIL lsearch-26.2"}
+# case: lsearch-26.3 cmd=lsearch
+set __judge_c [catch {
+    lsearch -stride 3 -subindices -index {1 1} -glob {{ab cb} {ab bb} {ab ab} {ab cb} {ab bb} {ab ab}} b*
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 1}} {puts PASS} else {puts "FAIL lsearch-26.3"}
+# case: lsearch-26.4 cmd=lsearch
+set __judge_c [catch {
+    lsearch -stride 3 -subindices -index {0 1} -regexp {{ab cb} {ab bb} {ab ab} {ab cb} {ab bb} {ab ab}} {[cb]b}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0 1}} {puts PASS} else {puts "FAIL lsearch-26.4"}
+# case: lsearch-26.5 cmd=lsearch
+set __judge_c [catch {
+    lsearch -stride 3 -subindices -all -index {0 0} -exact {{a c} {a b} {d a} {a c} {a b} {d a}} a
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{0 0} {3 0}}} {puts PASS} else {puts "FAIL lsearch-26.5"}
+# case: lsearch-26.6 cmd=lsearch
+set __judge_c [catch {
+    lsearch -stride 3 -subindices -all -index {1 0} -exact {{a c} {a b} {d a} {x c} {a b} {d a}} a
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{1 0} {4 0}}} {puts PASS} else {puts "FAIL lsearch-26.6"}
+# case: lsearch-27.1 cmd=lsearch
+set __judge_c [catch {
+    lsearch -inline -stride 3 -subindices -index {0 0} {{x x} {x b} {a d} {a c} {a b} {a a}} a
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {a}} {puts PASS} else {puts "FAIL lsearch-27.1"}
+# case: lsearch-27.2 cmd=lsearch
+set __judge_c [catch {
+    lsearch -inline -stride 3 -subindices -index {2 0} -exact {{x x} {x b} {a d} {a c} {a b} {a a}} a
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {a}} {puts PASS} else {puts "FAIL lsearch-27.2"}
+# case: lsearch-27.3 cmd=lsearch
+set __judge_c [catch {
+    lsearch -inline -stride 3 -subindices -index {1 1} -glob {{ab cb} {ab bb} {ab ab} {ab cb} {ab bb} {ab ab}} b*
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {bb}} {puts PASS} else {puts "FAIL lsearch-27.3"}
+# case: lsearch-27.4 cmd=lsearch
+set __judge_c [catch {
+    lsearch -inline -stride 3 -subindices -index {0 1} -regexp {{ab cb} {ab bb} {ab ab} {ab cb} {ab bb} {ab ab}} {[cb]b}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {cb}} {puts PASS} else {puts "FAIL lsearch-27.4"}
+# case: lsearch-27.5 cmd=lsearch
+set __judge_c [catch {
+    lsearch -inline -stride 3 -subindices -all -index {0 0} -exact {{a c} {a b} {d a} {a c} {a b} {d a}} a
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {a a}} {puts PASS} else {puts "FAIL lsearch-27.5"}
+# case: lsearch-27.6 cmd=lsearch
+set __judge_c [catch {
+    lsearch -inline -stride 3 -subindices -all -index {1 0} -exact {{a c} {a b} {d a} {x c} {a b} {d a}} a
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {a a}} {puts PASS} else {puts "FAIL lsearch-27.6"}
+# case: lsearch-27.7 cmd=lsearch
+set __judge_c [catch {
+    lsearch -inline -stride 3 -subindices -all -index 1  {{x a} {y b} {x c} {xx a} {xx b} {xx c} {xxx a} {y b} {xxx c}} {y b}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{y b} {y b}}} {puts PASS} else {puts "FAIL lsearch-27.7"}
+# case: lsearch-27.8 cmd=lsearch
+set __judge_c [catch {
+    lsearch -inline -stride 3 -subindices -all -index end {{x a} {y b} {xc} {xx a} {xx b} {xx c} {xxx a} {y b} {}} *
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {xc {xx c} {}}} {puts PASS} else {puts "FAIL lsearch-27.8"}
+# case: lsearch-28.1 cmd=lsearch
+set __judge_c [catch {
+    lsearch -sorted -stride 2 {5 3 7 8 9 2} 5
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0}} {puts PASS} else {puts "FAIL lsearch-28.1"}
+# case: lsearch-28.2 cmd=lsearch
+set __judge_c [catch {
+    lsearch -sorted -stride 2 {5 3 7 8 9 2} 3
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {-1}} {puts PASS} else {puts "FAIL lsearch-28.2"}
+# case: lsearch-28.3 cmd=lsearch
+set __judge_c [catch {
+    lsearch -sorted -stride 2 {5 3 7 8 9 2} 7
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {2}} {puts PASS} else {puts "FAIL lsearch-28.3"}
+# case: lsearch-28.4 cmd=lsearch
+set __judge_c [catch {
+    lsearch -sorted -stride 2 {5 3 7 8 9 2} 8
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {-1}} {puts PASS} else {puts "FAIL lsearch-28.4"}
+# case: lsearch-28.5 cmd=lsearch
+set __judge_c [catch {
+    lsearch -sorted -stride 2 {5 3 7 8 9 2} 9
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {4}} {puts PASS} else {puts "FAIL lsearch-28.5"}
+# case: lsearch-28.6 cmd=lsearch
+set __judge_c [catch {
+    lsearch -sorted -stride 2 {5 3 7 8 9 2} 2
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {-1}} {puts PASS} else {puts "FAIL lsearch-28.6"}
+# case: lsearch-28.7 cmd=lsearch
+set __judge_c [catch {
+    lsearch -sorted -stride 2 -index 0 -subindices {5 3 7 8 9 2} 9
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {4}} {puts PASS} else {puts "FAIL lsearch-28.7"}
+# case: lsearch-28.8 cmd=lsearch
+set __judge_c [catch {
+    lsearch -sorted -stride 2 -index 1 -subindices {3 5 8 7 2 9} 9
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {5}} {puts PASS} else {puts "FAIL lsearch-28.8"}
+# case: lsearch-28.9 cmd=lsearch
+set __judge_c [catch {
+    lsearch -sorted -stride 2 -index 1 -subindices -inline {3 5 8 7 2 9} 9
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {9}} {puts PASS} else {puts "FAIL lsearch-28.9"}

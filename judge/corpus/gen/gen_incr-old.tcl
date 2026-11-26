@@ -74,3 +74,9 @@ set __judge_c [catch {
     list [catch {incr x 1} msg] $msg
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {1 {expected integer but got "+"}}} {puts PASS} else {puts "FAIL incr-old-2.9"}
+# case: incr-old-2.10 cmd=set
+set __judge_c [catch {
+    set x {20 x}
+    list [catch {incr x 1} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {expected integer but got a list}}} {puts PASS} else {puts "FAIL incr-old-2.10"}

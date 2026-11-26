@@ -4,6 +4,11 @@ set __judge_c [catch {
     while
 } __judge_r]
 if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "while test command"}} {puts PASS} else {puts "FAIL while-1.1"}
+# case: while-1.3 cmd=while
+set __judge_c [catch {
+    while {"a"+"b"} {error "loop aborted"}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {cannot use non-numeric string "a" as left operand of "+"}} {puts PASS} else {puts "FAIL while-1.3"}
 # case: while-1.6 cmd=set
 set __judge_c [catch {
     set i 0
@@ -16,3 +21,9 @@ set __judge_c [catch {
     while {$i < 5}
 } __judge_r]
 if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "while test command"}} {puts PASS} else {puts "FAIL while-1.7"}
+# case: while-4.4 cmd=set
+set __judge_c [catch {
+    set z while
+    $z {"a"+"b"} {error "loop aborted"}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {cannot use non-numeric string "a" as left operand of "+"}} {puts PASS} else {puts "FAIL while-4.4"}

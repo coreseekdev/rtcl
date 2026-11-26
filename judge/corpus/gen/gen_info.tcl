@@ -320,6 +320,16 @@ if {$__judge_c == 0 && $__judge_r eq {a}} {puts PASS} else {puts "FAIL info-19.5
 # case: info-20.1 cmd=info
 set __judge_c [catch {info functions sin} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {sin}} {puts PASS} else {puts "FAIL info-20.1"}
+# case: info-20.3 cmd=lsort
+set __judge_c [catch {
+    lsort [info functions a*]
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {abs acos acosh asin asinh atan atan2 atanh}} {puts PASS} else {puts "FAIL info-20.3"}
+# case: info-20.4 cmd=lsort
+set __judge_c [catch {
+    lsort [info functions *tan*]
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {atan atan2 atanh tan tanh}} {puts PASS} else {puts "FAIL info-20.4"}
 # case: info-20.5 cmd=info
 set __judge_c [catch {
     info functions raise an error
@@ -330,8 +340,58 @@ set __judge_c [catch {
     info
 } __judge_r]
 if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "info subcommand ?arg ...?"}} {puts PASS} else {puts "FAIL info-21.1"}
+# case: info-21.2 cmd=info
+set __judge_c [catch {
+    info gorp
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {unknown or ambiguous subcommand "gorp": must be args, body, class, cmdcount, cmdtype, commands, complete, constant, consts, coroutine, default, errorstack, exists, frame, functions, globals, hostname, level, library, loaded, locals, nameofexecutable, object, patchlevel, procs, script, sharedlibextension, tclversion, or vars}} {puts PASS} else {puts "FAIL info-21.2"}
+# case: info-21.3 cmd=info
+set __judge_c [catch {
+    info c
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {unknown or ambiguous subcommand "c": must be args, body, class, cmdcount, cmdtype, commands, complete, constant, consts, coroutine, default, errorstack, exists, frame, functions, globals, hostname, level, library, loaded, locals, nameofexecutable, object, patchlevel, procs, script, sharedlibextension, tclversion, or vars}} {puts PASS} else {puts "FAIL info-21.3"}
+# case: info-21.4 cmd=info
+set __judge_c [catch {
+    info l
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {unknown or ambiguous subcommand "l": must be args, body, class, cmdcount, cmdtype, commands, complete, constant, consts, coroutine, default, errorstack, exists, frame, functions, globals, hostname, level, library, loaded, locals, nameofexecutable, object, patchlevel, procs, script, sharedlibextension, tclversion, or vars}} {puts PASS} else {puts "FAIL info-21.4"}
+# case: info-21.5 cmd=info
+set __judge_c [catch {
+    info s
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {unknown or ambiguous subcommand "s": must be args, body, class, cmdcount, cmdtype, commands, complete, constant, consts, coroutine, default, errorstack, exists, frame, functions, globals, hostname, level, library, loaded, locals, nameofexecutable, object, patchlevel, procs, script, sharedlibextension, tclversion, or vars}} {puts PASS} else {puts "FAIL info-21.5"}
 # case: info-9.13 cmd=uplevel
 set __judge_c [catch {
     uplevel #0 {info level 2}
 } __judge_r]
 if {$__judge_c == 1 && $__judge_r eq {bad level "2"}} {puts PASS} else {puts "FAIL info-9.13"}
+# case: info-40.1 cmd=info
+set __judge_c [catch {
+    info cmdtype
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "info cmdtype commandName"}} {puts PASS} else {puts "FAIL info-40.1"}
+# case: info-40.2 cmd=info
+set __judge_c [catch {
+    info cmdtype foo bar
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "info cmdtype commandName"}} {puts PASS} else {puts "FAIL info-40.2"}
+# case: info-40.3 cmd=info
+set __judge_c [catch {
+    info cmdtype ::testinfocmdtype::foo
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {unknown command "::testinfocmdtype::foo"}} {puts PASS} else {puts "FAIL info-40.3"}
+# case: info-40.4 cmd=info
+set __judge_c [catch {
+    info cmdtype ::if
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {native}} {puts PASS} else {puts "FAIL info-40.4"}
+# case: info-40.5 cmd=info
+set __judge_c [catch {
+    info cmdtype ::puts
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {native}} {puts PASS} else {puts "FAIL info-40.5"}
+# case: info-40.6 cmd=info
+set __judge_c [catch {
+    info cmdtype ::yield
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {native}} {puts PASS} else {puts "FAIL info-40.6"}

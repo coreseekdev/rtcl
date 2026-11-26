@@ -194,6 +194,21 @@ set __judge_c [catch {
     lappend result [info object methods foo] [foo destroy]
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {{} bar {}}} {puts PASS} else {puts "FAIL oo-16.6"}
+# case: oo-16.17 cmd=info
+set __judge_c [catch {
+    info object creationid nosuchobject
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {nosuchobject does not refer to an object}} {puts PASS} else {puts "FAIL oo-16.17"}
+# case: oo-16.18 cmd=info
+set __judge_c [catch {
+    info object creationid
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "info object creationid objName"}} {puts PASS} else {puts "FAIL oo-16.18"}
+# case: oo-16.18.1 cmd=info
+set __judge_c [catch {
+    info object creationid oo::object gorp
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "info object creationid objName"}} {puts PASS} else {puts "FAIL oo-16.18.1"}
 # case: oo-17.7 cmd=info
 set __judge_c [catch {
     info class superclasses oo::class
@@ -270,6 +285,11 @@ set __judge_c [catch {
     oo::define oo::object variable bad(var)
 } __judge_r]
 if {$__judge_c == 1 && $__judge_r eq {invalid declared variable name "bad(var)": must not refer to an array element}} {puts PASS} else {puts "FAIL oo-27.9"}
+# case: oo-34.2 cmd=lsort
+set __judge_c [catch {
+    lsort [info class instances oo::Slot]
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {::oo::configuresupport::objreadableproperties ::oo::configuresupport::objwritableproperties ::oo::configuresupport::readableproperties ::oo::configuresupport::writableproperties ::oo::define::filter ::oo::define::mixin ::oo::define::superclass ::oo::define::variable ::oo::objdefine::filter ::oo::objdefine::mixin ::oo::objdefine::variable}} {puts PASS} else {puts "FAIL oo-34.2"}
 # case: oo-35.3 cmd=?
 set __judge_c [catch {
     # Bug makes this crash, especially with mem-debugging on
@@ -286,3 +306,72 @@ set __judge_c [catch {
     namespace eval [info object namespace D] [list [namespace which B] destroy]
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL oo-35.4"}
+# case: oo-36.1 cmd=oo::define
+set __judge_c [catch {
+    oo::define oo::object self
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {::oo::object}} {puts PASS} else {puts "FAIL oo-36.1"}
+# case: oo-37.5 cmd=oo::define::private
+set __judge_c [catch {
+    oo::define::private error "xyz"
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {this command may only be called from within the context of an ::oo::define or ::oo::objdefine command}} {puts PASS} else {puts "FAIL oo-37.5"}
+# case: oo-37.6 cmd=oo::objdefine::private
+set __judge_c [catch {
+    oo::objdefine::private error "xyz"
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {this command may only be called from within the context of an ::oo::define or ::oo::objdefine command}} {puts PASS} else {puts "FAIL oo-37.6"}
+# case: oo-42.1 cmd=info
+set __judge_c [catch {
+    info class definitionnamespace oo::object
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL oo-42.1"}
+# case: oo-42.2 cmd=info
+set __judge_c [catch {
+    info class definitionnamespace oo::object -class
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL oo-42.2"}
+# case: oo-42.3 cmd=info
+set __judge_c [catch {
+    info class definitionnamespace oo::object -instance
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {::oo::objdefine}} {puts PASS} else {puts "FAIL oo-42.3"}
+# case: oo-42.4 cmd=info
+set __judge_c [catch {
+    info class definitionnamespace oo::object -gorp
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {bad kind "-gorp": must be -class or -instance}} {puts PASS} else {puts "FAIL oo-42.4"}
+# case: oo-42.5 cmd=info
+set __judge_c [catch {
+    info class definitionnamespace oo::object -class x
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "info class definitionnamespace className ?kind?"}} {puts PASS} else {puts "FAIL oo-42.5"}
+# case: oo-42.6 cmd=info
+set __judge_c [catch {
+    info class definitionnamespace oo::class
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {::oo::define}} {puts PASS} else {puts "FAIL oo-42.6"}
+# case: oo-42.7 cmd=info
+set __judge_c [catch {
+    info class definitionnamespace oo::class -class
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {::oo::define}} {puts PASS} else {puts "FAIL oo-42.7"}
+# case: oo-42.8 cmd=info
+set __judge_c [catch {
+    info class definitionnamespace oo::class -instance
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL oo-42.8"}
+# case: oo-43.9 cmd=oo::class
+set __judge_c [catch {
+    oo::class create foo {
+	definitionnamespace -gorp foodef
+    }
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {bad kind "-gorp": must be -class or -instance}} {puts PASS} else {puts "FAIL oo-43.9"}
+# case: oo-43.10 cmd=oo::class
+set __judge_c [catch {
+    oo::class create foo {
+	definitionnamespace -class foodef x
+    }
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "definitionnamespace ?kind? namespace"}} {puts PASS} else {puts "FAIL oo-43.10"}

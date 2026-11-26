@@ -435,6 +435,22 @@ if {$__judge_c == 0 && $__judge_r eq {1 {expected integer but got "1a"} {expecte
     (reading increment)
     invoked from within
 "incr x 1a"}}} {puts PASS} else {puts "FAIL incr-2.31"}
+# case: incr-2.32 cmd=list
+set __judge_c [catch {
+    list [catch {incr x [list 1 2]} msg] $msg $::errorInfo
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {expected integer but got a list} {expected integer but got a list
+    (reading increment)
+    invoked from within
+"incr x [list 1 2]"}}} {puts PASS} else {puts "FAIL incr-2.32"}
+# case: incr-2.33 cmd=list
+set __judge_c [catch {
+    list [catch {incr x [dict create 1 2]} msg] $msg $::errorInfo
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {expected integer but got a list} {expected integer but got a list
+    (reading increment)
+    invoked from within
+"incr x [dict create 1 2]"}}} {puts PASS} else {puts "FAIL incr-2.33"}
 # case: incr-3.1 cmd=set
 set __judge_c [catch {
     set x 0

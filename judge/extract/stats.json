@@ -70,8 +70,8 @@
    "skip-opt-setup": 4,
    "skip-opt-cleanup": 2,
    "skip-opt-constraints": 5,
-   "verify-dropped": 1,
-   "kept": 9
+   "verify-dropped": 0,
+   "kept": 10
   },
   "bigdata": {
    "found": 8,
@@ -86,8 +86,8 @@
    "skip-opt-setup": 44,
    "skip-opt-constraints": 19,
    "skip-returncodes": 1,
-   "verify-dropped": 4,
-   "kept": 328
+   "verify-dropped": 0,
+   "kept": 332
   },
   "brodnik": {},
   "chan": {
@@ -98,8 +98,8 @@
    "extracted": 8,
    "skip-opt-constraints": 1,
    "skip-opt-cleanup": 2,
-   "verify-dropped": 1,
-   "kept": 7
+   "verify-dropped": 0,
+   "kept": 8
   },
   "chanio": {},
   "clock-ivm": {},
@@ -141,8 +141,8 @@
    "skip-shape": 2,
    "skip-opt-constraints": 5,
    "skip-returncodes": 1,
-   "verify-dropped": 25,
-   "kept": 111
+   "verify-dropped": 0,
+   "kept": 136
   },
   "cmdInfo": {
    "found": 12,
@@ -154,8 +154,8 @@
    "extracted": 133,
    "skip-opt-match": 48,
    "skip-shape": 3,
-   "verify-dropped": 14,
-   "kept": 119
+   "verify-dropped": 1,
+   "kept": 132
   },
   "compExpr": {
    "found": 82,
@@ -217,8 +217,8 @@
    "skip-opt-constraints": 5,
    "skip-returncodes": 9,
    "skip-result-subst": 1,
-   "verify-dropped": 48,
-   "kept": 209
+   "verify-dropped": 28,
+   "kept": 229
   },
   "dstring": {
    "found": 46,
@@ -284,8 +284,8 @@
    "skip-shape": 27,
    "skip-blacklist": 4,
    "skip-opt-constraints": 7,
-   "verify-dropped": 40,
-   "kept": 342
+   "verify-dropped": 5,
+   "kept": 377
   },
   "expr": {
    "found": 1883,
@@ -297,8 +297,8 @@
    "skip-opt-constraints": 6,
    "skip-blacklist": 1,
    "skip-opt-setup": 1,
-   "verify-dropped": 158,
-   "kept": 463
+   "verify-dropped": 102,
+   "kept": 519
   },
   "fCmd": {
    "found": 306,
@@ -356,15 +356,15 @@
    "skip-opt-constraints": 2,
    "skip-returncodes": 1,
    "skip-opt-match": 2,
-   "verify-dropped": 18,
-   "kept": 98
+   "verify-dropped": 0,
+   "kept": 116
   },
   "get": {
    "found": 23,
    "skip-shape": 17,
    "extracted": 6,
-   "verify-dropped": 2,
-   "kept": 4
+   "verify-dropped": 0,
+   "kept": 6
   },
   "grapheme": {},
   "history": {
@@ -418,8 +418,8 @@
    "found": 14,
    "extracted": 13,
    "skip-opt-match": 1,
-   "verify-dropped": 1,
-   "kept": 12
+   "verify-dropped": 0,
+   "kept": 13
   },
   "incr": {
    "found": 69,
@@ -428,8 +428,8 @@
    "skip-opt-match": 4,
    "skip-opt-cleanup": 3,
    "skip-result-subst": 1,
-   "verify-dropped": 3,
-   "kept": 48
+   "verify-dropped": 1,
+   "kept": 50
   },
   "indexObj": {
    "found": 65,
@@ -447,8 +447,8 @@
    "skip-result-subst": 7,
    "skip-opt-match": 4,
    "unparseable-cmd": 4,
-   "verify-dropped": 63,
-   "kept": 54
+   "verify-dropped": 51,
+   "kept": 66
   },
   "init": {
    "found": 11,
@@ -483,8 +483,8 @@
    "skip-shape": 17,
    "skip-opt-match": 108,
    "skip-result-subst": 4,
-   "verify-dropped": 18,
-   "kept": 25
+   "verify-dropped": 0,
+   "kept": 43
   },
   "ioTrans": {
    "found": 106,
@@ -506,8 +506,8 @@
   "lfilter": {
    "found": 26,
    "extracted": 26,
-   "verify-dropped": 26,
-   "kept": 0
+   "verify-dropped": 0,
+   "kept": 26
   },
   "lindex": {
    "found": 84,
@@ -583,8 +583,8 @@
    "extracted": 30,
    "skip-opt-match": 4,
    "skip-opt-constraints": 4,
-   "verify-dropped": 30,
-   "kept": 0
+   "verify-dropped": 0,
+   "kept": 30
   },
   "lrange": {
    "found": 38,
@@ -608,8 +608,8 @@
    "extracted": 117,
    "skip-returncodes": 4,
    "skip-result-subst": 2,
-   "verify-dropped": 60,
-   "kept": 57
+   "verify-dropped": 0,
+   "kept": 117
   },
   "lsearch": {
    "found": 165,
@@ -617,8 +617,8 @@
    "skip-result-subst": 27,
    "skip-opt-setup": 4,
    "skip-returncodes": 1,
-   "verify-dropped": 52,
-   "kept": 81
+   "verify-dropped": 4,
+   "kept": 129
   },
   "lseq": {
    "found": 145,
@@ -629,8 +629,8 @@
    "skip-result-subst": 4,
    "skip-opt-constraints": 28,
    "skip-opt-match": 3,
-   "verify-dropped": 50,
-   "kept": 0
+   "verify-dropped": 0,
+   "kept": 50
   },
   "lset": {
    "found": 89,
@@ -654,15 +654,15 @@
    "found": 98,
    "extracted": 88,
    "skip-opt-match": 10,
-   "verify-dropped": 88,
-   "kept": 0
+   "verify-dropped": 0,
+   "kept": 88
   },
   "mathop": {
    "found": 110,
    "extracted": 90,
    "skip-result-subst": 20,
-   "verify-dropped": 90,
-   "kept": 0
+   "verify-dropped": 54,
+   "kept": 36
   },
   "misc": {
    "found": 2,
@@ -679,8 +679,8 @@
    "skip-result-subst": 1,
    "skip-opt-setup": 3,
    "skip-blacklist": 1,
-   "verify-dropped": 27,
-   "kept": 94
+   "verify-dropped": 24,
+   "kept": 97
   },
   "namespace": {
    "found": 314,
@@ -710,8 +710,8 @@
    "found": 84,
    "skip-shape": 81,
    "extracted": 3,
-   "verify-dropped": 2,
-   "kept": 1
+   "verify-dropped": 0,
+   "kept": 3
   },
   "oo": {
    "found": 388,
@@ -723,8 +723,8 @@
    "extracted": 59,
    "skip-returncodes": 6,
    "skip-opt-cleanup": 19,
-   "verify-dropped": 31,
-   "kept": 28
+   "verify-dropped": 14,
+   "kept": 45
   },
   "ooNext2": {
    "found": 52,
@@ -763,8 +763,8 @@
    "skip-opt-match": 3,
    "extracted": 52,
    "skip-result-subst": 12,
-   "verify-dropped": 1,
-   "kept": 51
+   "verify-dropped": 0,
+   "kept": 52
   },
   "parseOld": {
    "found": 96,
@@ -815,8 +815,8 @@
    "skip-opt-cleanup": 9,
    "skip-opt-setup": 2,
    "skip-opt-constraints": 1,
-   "verify-dropped": 5,
-   "kept": 0
+   "verify-dropped": 0,
+   "kept": 5
   },
   "pwd": {
    "found": 3,
@@ -826,14 +826,13 @@
    "verify-dropped": 0,
    "kept": 1
   },
-  "range": {},
   "reg": {
    "found": 47,
    "extracted": 32,
    "skip-shape": 13,
    "skip-opt-cleanup": 2,
-   "verify-dropped": 1,
-   "kept": 31
+   "verify-dropped": 0,
+   "kept": 32
   },
   "regexp": {
    "found": 257,
@@ -842,8 +841,8 @@
    "skip-opt-setup": 4,
    "skip-shape": 5,
    "skip-opt-constraints": 1,
-   "verify-dropped": 17,
-   "kept": 197
+   "verify-dropped": 0,
+   "kept": 214
   },
   "regexpComp": {
    "found": 153,
@@ -920,8 +919,8 @@
    "extracted": 149,
    "skip-blacklist": 2,
    "skip-result-subst": 2,
-   "verify-dropped": 13,
-   "kept": 136
+   "verify-dropped": 12,
+   "kept": 137
   },
   "set": {
    "found": 64,
@@ -962,16 +961,16 @@
    "skip-opt-setup": 3,
    "skip-blacklist": 3,
    "skip-opt-match": 1,
-   "verify-dropped": 17,
-   "kept": 44
+   "verify-dropped": 4,
+   "kept": 57
   },
   "switch": {
    "found": 143,
    "extracted": 139,
    "skip-result-subst": 4,
    "unparseable-cmd": 1,
-   "verify-dropped": 42,
-   "kept": 97
+   "verify-dropped": 9,
+   "kept": 130
   },
   "tailcall": {
    "found": 40,
@@ -999,8 +998,8 @@
    "skip-opt-cleanup": 8,
    "skip-opt-constraints": 7,
    "skip-opt-match": 2,
-   "verify-dropped": 25,
-   "kept": 0
+   "verify-dropped": 0,
+   "kept": 25
   },
   "tm": {
    "found": 21,
@@ -1064,8 +1063,8 @@
    "extracted": 52,
    "skip-opt-setup": 4,
    "skip-opt-cleanup": 1,
-   "verify-dropped": 20,
-   "kept": 32
+   "verify-dropped": 11,
+   "kept": 41
   },
   "upvar": {
    "found": 70,
@@ -1084,8 +1083,8 @@
    "skip-result-subst": 9,
    "skip-opt-cleanup": 1,
    "skip-opt-constraints": 1,
-   "verify-dropped": 20,
-   "kept": 63
+   "verify-dropped": 0,
+   "kept": 83
   },
   "utfext": {},
   "util": {
@@ -1097,8 +1096,8 @@
    "skip-opt-match": 34,
    "unparseable-cmd": 131,
    "skip-opt-constraints": 2,
-   "verify-dropped": 69,
-   "kept": 68
+   "verify-dropped": 51,
+   "kept": 86
   },
   "var": {
    "found": 221,
@@ -1109,23 +1108,23 @@
    "skip-result-subst": 2,
    "skip-opt-match": 2,
    "skip-blacklist": 1,
-   "verify-dropped": 64,
-   "kept": 37
+   "verify-dropped": 5,
+   "kept": 96
   },
   "while-old": {
    "found": 15,
    "extracted": 14,
    "skip-blacklist": 1,
-   "verify-dropped": 1,
-   "kept": 13
+   "verify-dropped": 0,
+   "kept": 14
   },
   "while": {
    "found": 46,
    "extracted": 5,
    "skip-opt-cleanup": 39,
    "skip-opt-setup": 2,
-   "verify-dropped": 2,
-   "kept": 3
+   "verify-dropped": 0,
+   "kept": 5
   },
   "winConsole": {
    "found": 25,
@@ -1164,8 +1163,8 @@
    "found": 55,
    "extracted": 50,
    "skip-returncodes": 5,
-   "verify-dropped": 4,
-   "kept": 46
+   "verify-dropped": 0,
+   "kept": 50
   },
   "zipfs": {
    "found": 38,
@@ -1186,8 +1185,8 @@
   "skip-result-subst": 667,
   "skip-opt-cleanup": 510,
   "skip-opt-setup": 1540,
-  "verify-dropped": 1629,
-  "kept": 4072,
+  "verify-dropped": 852,
+  "kept": 4849,
   "skip-blacklist": 8252,
   "skip-name": 177,
   "skip-opt-match": 468,

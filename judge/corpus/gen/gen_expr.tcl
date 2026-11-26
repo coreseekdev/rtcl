@@ -129,6 +129,11 @@ set __judge_c [catch {
     expr {[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]] || [string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]] || [string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]] || [string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]&&[string compare [format %c $i] [string index $a $i]]}
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL expr-4.9"}
+# case: expr-4.10 cmd=list
+set __judge_c [catch {
+    list [catch {expr {!"a"}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "a" as operand of "!"}}} {puts PASS} else {puts "FAIL expr-4.10"}
 # case: expr-4.11 cmd=list
 set __judge_c [catch {
     list [catch {expr {"a"||0}} msg] $msg
@@ -181,6 +186,16 @@ if {$__judge_c == 0 && $__judge_r eq {7}} {puts PASS} else {puts "FAIL expr-6.5"
 # case: expr-6.6 cmd=expr
 set __judge_c [catch {expr -1^7} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {-8}} {puts PASS} else {puts "FAIL expr-6.6"}
+# case: expr-6.9 cmd=list
+set __judge_c [catch {
+    list [catch {expr {24.0^3}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use floating-point value "24.0" as left operand of "^"}}} {puts PASS} else {puts "FAIL expr-6.9"}
+# case: expr-6.10 cmd=list
+set __judge_c [catch {
+    list [catch {expr {"a"^"b"}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "a" as left operand of "^"}}} {puts PASS} else {puts "FAIL expr-6.10"}
 # case: expr-7.1 cmd=expr
 set __judge_c [catch {expr 3==2} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {0}} {puts PASS} else {puts "FAIL expr-7.1"}
@@ -205,6 +220,16 @@ if {$__judge_c == 0 && $__judge_r eq {2}} {puts PASS} else {puts "FAIL expr-7.8"
 # case: expr-7.9 cmd=expr
 set __judge_c [catch {expr -1&-7} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {-7}} {puts PASS} else {puts "FAIL expr-7.9"}
+# case: expr-7.12 cmd=list
+set __judge_c [catch {
+    list [catch {expr {24.0&3}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use floating-point value "24.0" as left operand of "&"}}} {puts PASS} else {puts "FAIL expr-7.12"}
+# case: expr-7.13 cmd=list
+set __judge_c [catch {
+    list [catch {expr {"a"&"b"}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "a" as left operand of "&"}}} {puts PASS} else {puts "FAIL expr-7.13"}
 # case: expr-7.14 cmd=expr
 set __judge_c [catch {expr 3eq2} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {0}} {puts PASS} else {puts "FAIL expr-7.14"}
@@ -298,6 +323,34 @@ set __judge_c [catch {
     expr {"fake" != "bob"}
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL expr-8.30"}
+# case: expr-8.36 cmd=set
+set __judge_c [catch {
+    set x 012
+    set y 0x0
+    list [expr {$x < $y}] [expr {$x lt $y}] [expr {$x lt $x}]
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0 1 0}} {puts PASS} else {puts "FAIL expr-8.36"}
+# case: expr-8.37 cmd=set
+set __judge_c [catch {
+    set x 012
+    set y 0x0
+    list [expr {$x <= $y}] [expr {$x le $y}] [expr {$x le $x}]
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0 1 1}} {puts PASS} else {puts "FAIL expr-8.37"}
+# case: expr-8.38 cmd=set
+set __judge_c [catch {
+    set x 012
+    set y 0x0
+    list [expr {$x > $y}] [expr {$x gt $y}] [expr {$x gt $x}]
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 0 0}} {puts PASS} else {puts "FAIL expr-8.38"}
+# case: expr-8.39 cmd=set
+set __judge_c [catch {
+    set x 012
+    set y 0x0
+    list [expr {$x >= $y}] [expr {$x ge $y}] [expr {$x ge $x}]
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 0 1}} {puts PASS} else {puts "FAIL expr-8.39"}
 # case: expr-9.1 cmd=expr
 set __judge_c [catch {expr 3<<2} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {12}} {puts PASS} else {puts "FAIL expr-9.1"}
@@ -310,6 +363,11 @@ if {$__judge_c == 0 && $__judge_r eq {-1}} {puts PASS} else {puts "FAIL expr-9.3
 # case: expr-9.4 cmd=expr
 set __judge_c [catch {expr {1<<3}} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {8}} {puts PASS} else {puts "FAIL expr-9.4"}
+# case: expr-9.5 cmd=expr
+set __judge_c [catch {
+    expr {int(1<<63)}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {9223372036854775808}} {puts PASS} else {puts "FAIL expr-9.5"}
 # case: expr-9.7 cmd=expr
 set __judge_c [catch {expr 0xff>=+0x3} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL expr-9.7"}
@@ -334,6 +392,16 @@ if {$__judge_c == 0 && $__judge_r eq {31}} {puts PASS} else {puts "FAIL expr-10.
 # case: expr-10.7 cmd=expr
 set __judge_c [catch {expr -0xf2<<0x3} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {-1936}} {puts PASS} else {puts "FAIL expr-10.7"}
+# case: expr-10.10 cmd=list
+set __judge_c [catch {
+    list [catch {expr {24.0>>43}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use floating-point value "24.0" as left operand of ">>"}}} {puts PASS} else {puts "FAIL expr-10.10"}
+# case: expr-10.11 cmd=list
+set __judge_c [catch {
+    list [catch {expr {"a"<<"b"}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "a" as left operand of "<<"}}} {puts PASS} else {puts "FAIL expr-10.11"}
 # case: expr-11.1 cmd=expr
 set __judge_c [catch {expr 4*-2} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {-8}} {puts PASS} else {puts "FAIL expr-11.1"}
@@ -352,11 +420,36 @@ if {$__judge_c == 0 && $__judge_r eq {258}} {puts PASS} else {puts "FAIL expr-11
 # case: expr-11.7 cmd=expr
 set __judge_c [catch {expr -0xf2--0x3} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {-239}} {puts PASS} else {puts "FAIL expr-11.7"}
+# case: expr-11.10 cmd=list
+set __judge_c [catch {
+    list [catch {expr {24.0+"xx"}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "xx" as right operand of "+"}}} {puts PASS} else {puts "FAIL expr-11.10"}
+# case: expr-11.11 cmd=list
+set __judge_c [catch {
+    list [catch {expr {"a"-"b"}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "a" as left operand of "-"}}} {puts PASS} else {puts "FAIL expr-11.11"}
 # case: expr-11.12 cmd=list
 set __judge_c [catch {
     list [catch {expr {3/0}} msg] $msg
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {1 {divide by zero}}} {puts PASS} else {puts "FAIL expr-11.12"}
+# case: expr-11.14 cmd=list
+set __judge_c [catch {
+    list [catch {expr {24.0+[lseq 2 4]}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use a list as right operand of "+"}}} {puts PASS} else {puts "FAIL expr-11.14"}
+# case: expr-11.15 cmd=list
+set __judge_c [catch {
+    list [catch {expr {{1 2 "}+24.0}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "1 2 "" as left operand of "+"}}} {puts PASS} else {puts "FAIL expr-11.15"}
+# case: expr-11.16 cmd=list
+set __judge_c [catch {
+    list [catch {expr {~[dict create foo bar]}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use a list as operand of "~"}}} {puts PASS} else {puts "FAIL expr-11.16"}
 # case: expr-12.1 cmd=expr
 set __judge_c [catch {expr ~4} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {-5}} {puts PASS} else {puts "FAIL expr-12.1"}
@@ -375,6 +468,16 @@ if {$__judge_c == 0 && $__judge_r eq {765}} {puts PASS} else {puts "FAIL expr-12
 # case: expr-12.7 cmd=expr
 set __judge_c [catch {expr -0xf2%-0x3} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {-2}} {puts PASS} else {puts "FAIL expr-12.7"}
+# case: expr-12.10 cmd=list
+set __judge_c [catch {
+    list [catch {expr {24.0*"xx"}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "xx" as right operand of "*"}}} {puts PASS} else {puts "FAIL expr-12.10"}
+# case: expr-12.11 cmd=list
+set __judge_c [catch {
+    list [catch {expr {"a"/"b"}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "a" as left operand of "/"}}} {puts PASS} else {puts "FAIL expr-12.11"}
 # case: expr-13.1 cmd=expr
 set __judge_c [catch {expr -0xff} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {-255}} {puts PASS} else {puts "FAIL expr-13.1"}
@@ -396,6 +499,16 @@ if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL expr-13.6
 # case: expr-13.7 cmd=expr
 set __judge_c [catch {expr !0xef} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {0}} {puts PASS} else {puts "FAIL expr-13.7"}
+# case: expr-13.10 cmd=list
+set __judge_c [catch {
+    list [catch {expr {~"xx"}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "xx" as operand of "~"}}} {puts PASS} else {puts "FAIL expr-13.10"}
+# case: expr-13.11 cmd=list
+set __judge_c [catch {
+    list [catch {expr ~4.0} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use floating-point value "4.0" as operand of "~"}}} {puts PASS} else {puts "FAIL expr-13.11"}
 # case: expr-13.12 cmd=expr
 set __judge_c [catch {expr 0x123} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {291}} {puts PASS} else {puts "FAIL expr-13.12"}
@@ -675,6 +788,23 @@ if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL expr-21.1
 # case: expr-21.12 cmd=expr
 set __judge_c [catch {expr !yes  } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {0}} {puts PASS} else {puts "FAIL expr-21.12"}
+# case: expr-21.14 cmd=list
+set __judge_c [catch {
+    list [catch {expr !"truef"} err] $err
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "truef" as operand of "!"}}} {puts PASS} else {puts "FAIL expr-21.14"}
+# case: expr-21.15 cmd=set
+set __judge_c [catch {
+    set v truef
+    list [catch {expr {!$v}} err] $err
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "truef" as operand of "!"}}} {puts PASS} else {puts "FAIL expr-21.15"}
+# case: expr-21.16 cmd=set
+set __judge_c [catch {
+    set v "true "
+    list [catch {expr {!$v}} err] $err
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "true " as operand of "!"}}} {puts PASS} else {puts "FAIL expr-21.16"}
 # case: expr-21.17 cmd=set
 set __judge_c [catch {
     set v "tru"
@@ -699,11 +829,39 @@ set __judge_c [catch {
     list [catch {expr {!$v}} err] $err
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {0 1}} {puts PASS} else {puts "FAIL expr-21.20"}
+# case: expr-21.21 cmd=set
+set __judge_c [catch {
+    set v "o"
+    list [catch {expr {!$v}} err] $err
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "o" as operand of "!"}}} {puts PASS} else {puts "FAIL expr-21.21"}
+# case: expr-21.22 cmd=set
+set __judge_c [catch {
+    set v ""
+    list [catch {expr {!$v}} err] $err
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "" as operand of "!"}}} {puts PASS} else {puts "FAIL expr-21.22"}
+# case: expr-22.1 cmd=list
+set __judge_c [catch {
+    list [catch {expr {NaN + 1}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric floating-point value "NaN" as left operand of "+"}}} {puts PASS} else {puts "FAIL expr-22.1"}
+# case: expr-22.3 cmd=set
+set __judge_c [catch {
+    set nan NaN
+    list [catch {expr {$nan + 1}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric floating-point value "NaN" as left operand of "+"}}} {puts PASS} else {puts "FAIL expr-22.3"}
 # case: expr-22.5 cmd=list
 set __judge_c [catch {
     list [catch {expr NaN} msg] $msg
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {1 {domain error: argument not in valid range}}} {puts PASS} else {puts "FAIL expr-22.5"}
+# case: expr-22.7 cmd=list
+set __judge_c [catch {
+    list [catch {expr {1 / NaN}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric floating-point value "NaN" as right operand of "/"}}} {puts PASS} else {puts "FAIL expr-22.7"}
 # case: expr-22.9 cmd=set
 set __judge_c [catch {
     set x NaN
@@ -737,6 +895,16 @@ if {$__judge_c == 0 && $__judge_r eq {612220032}} {puts PASS} else {puts "FAIL e
 # case: expr-23.6 cmd=expr
 set __judge_c [catch {expr 0xff**0x3} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {16581375}} {puts PASS} else {puts "FAIL expr-23.6"}
+# case: expr-23.9 cmd=list
+set __judge_c [catch {
+    list [catch {expr {24.0**"xx"}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "xx" as right operand of "**"}}} {puts PASS} else {puts "FAIL expr-23.9"}
+# case: expr-23.10 cmd=list
+set __judge_c [catch {
+    list [catch {expr {"a"**2}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "a" as left operand of "**"}}} {puts PASS} else {puts "FAIL expr-23.10"}
 # case: expr-23.11 cmd=list
 set __judge_c [catch {
     list [catch {expr {0**-1}} msg] $msg
@@ -1514,6 +1682,9 @@ if {$__judge_c == 0 && $__judge_r eq {0}} {puts PASS} else {puts "FAIL expr-24.4
 # case: expr-24.5 cmd=expr
 set __judge_c [catch {expr int(5<<32)} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {21474836480}} {puts PASS} else {puts "FAIL expr-24.5"}
+# case: expr-24.6 cmd=expr
+set __judge_c [catch {expr int(5<<63)} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {46116860184273879040}} {puts PASS} else {puts "FAIL expr-24.6"}
 # case: expr-24.7 cmd=expr
 set __judge_c [catch {expr wide(5)<<32} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {21474836480}} {puts PASS} else {puts "FAIL expr-24.7"}
@@ -2251,11 +2422,21 @@ set __judge_c [catch {
     set trouble
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL expr-47.13"}
+# case: expr-47.14 cmd=list
+set __judge_c [catch {
+    list [catch {expr {isqrt([lseq 1 3])}} result] $result
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {expected number but got a list}}} {puts PASS} else {puts "FAIL expr-47.14"}
 # case: expr-47.15 cmd=list
 set __judge_c [catch {
     list [catch {expr {isqrt({1 2 "})}} result] $result
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {1 {expected number but got "1 2 ""}}} {puts PASS} else {puts "FAIL expr-47.15"}
+# case: expr-47.16 cmd=list
+set __judge_c [catch {
+    list [catch {expr {isqrt([dict create foo bar])}} result] $result
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {expected number but got a list}}} {puts PASS} else {puts "FAIL expr-47.16"}
 # case: expr-48.1 cmd=expr
 set __judge_c [catch {
     expr {-0x8000000000000001 >> 0x8000000000000000}
@@ -2279,6 +2460,125 @@ set __judge_c [catch {
 		::tcl::unsupported::representation $a]]
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {0 0 1 1}} {puts PASS} else {puts "FAIL expr-52.1"}
+# case: expr-59.10 cmd=fpclassify
+set __judge_c [catch {
+    fpclassify
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "fpclassify floatValue"}} {puts PASS} else {puts "FAIL expr-59.10"}
+# case: expr-59.11 cmd=fpclassify
+set __judge_c [catch {
+    fpclassify a b
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "fpclassify floatValue"}} {puts PASS} else {puts "FAIL expr-59.11"}
+# case: expr-59.12 cmd=fpclassify
+set __judge_c [catch {
+    fpclassify gorp
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {expected number but got "gorp"}} {puts PASS} else {puts "FAIL expr-59.12"}
+# case: expr-60.1 cmd=expr
+set __judge_c [catch {
+    expr isunordered()
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {not enough arguments for math function "isunordered"}} {puts PASS} else {puts "FAIL expr-60.1"}
+# case: expr-60.2 cmd=expr
+set __judge_c [catch {
+    expr isunordered(1)
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {not enough arguments for math function "isunordered"}} {puts PASS} else {puts "FAIL expr-60.2"}
+# case: expr-60.3 cmd=expr
+set __judge_c [catch {
+    expr {isunordered(1, 2, 3)}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {too many arguments for math function "isunordered"}} {puts PASS} else {puts "FAIL expr-60.3"}
+# case: expr-60.4 cmd=expr
+set __judge_c [catch {
+    expr {isunordered(true, 1.0)}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {expected number but got "true"}} {puts PASS} else {puts "FAIL expr-60.4"}
+# case: expr-60.5 cmd=expr
+set __judge_c [catch {
+    expr {isunordered("gorp", 1.0)}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {expected number but got "gorp"}} {puts PASS} else {puts "FAIL expr-60.5"}
+# case: expr-60.6a cmd=expr
+set __judge_c [catch {
+    expr "isunordered(0x[string repeat f 100], 0x7fffffffffffffff)"
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0}} {puts PASS} else {puts "FAIL expr-60.6a"}
+# case: expr-60.6b cmd=expr
+set __judge_c [catch {
+    expr "isunordered(0x[string repeat f 1000], 0x7fffffffffffffff)"
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0}} {puts PASS} else {puts "FAIL expr-60.6b"}
+# case: expr-60.7 cmd=expr
+set __judge_c [catch {
+    expr {isunordered(1.0, true)}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {expected number but got "true"}} {puts PASS} else {puts "FAIL expr-60.7"}
+# case: expr-60.8 cmd=expr
+set __judge_c [catch {
+    expr {isunordered(1.0, "gorp")}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {expected number but got "gorp"}} {puts PASS} else {puts "FAIL expr-60.8"}
+# case: expr-60.9a cmd=expr
+set __judge_c [catch {
+    expr "isunordered(0x7fffffffffffffff, 0x[string repeat f 100])"
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0}} {puts PASS} else {puts "FAIL expr-60.9a"}
+# case: expr-60.9b cmd=expr
+set __judge_c [catch {
+    expr "isunordered(0x7fffffffffffffff, 0x[string repeat f 1000])"
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0}} {puts PASS} else {puts "FAIL expr-60.9b"}
+# case: expr-62.1 cmd=expr
+set __judge_c [catch {
+    expr {1 # + 2}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL expr-62.1"}
+# case: expr-62.2 cmd=expr
+set __judge_c [catch {
+    expr "1 #\n+ 2"
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {3}} {puts PASS} else {puts "FAIL expr-62.2"}
+# case: expr-62.5 cmd=set
+set __judge_c [catch {
+    set a False
+    expr {$a#don't splice
+ne#don't splice
+false}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL expr-62.5"}
+# case: expr-62.6 cmd=expr
+set __judge_c [catch {
+    expr {0x2#don't splice
+ne#don't splice
+2}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL expr-62.6"}
+# case: expr-62.7 cmd=expr
+set __judge_c [catch {
+    expr {max(1,# comment
+	      2)}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {2}} {puts PASS} else {puts "FAIL expr-62.7"}
+# case: expr-62.8 cmd=expr
+set __judge_c [catch {
+    expr {max(1# comment
+	      ,2)}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {2}} {puts PASS} else {puts "FAIL expr-62.8"}
+# case: expr-62.9 cmd=expr
+set __judge_c [catch {
+    expr {max(# comment
+	      1,2)}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {2}} {puts PASS} else {puts "FAIL expr-62.9"}
+# case: expr-62.10 cmd=expr
+set __judge_c [catch {
+    expr {max# comment
+	     (1,2)}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {2}} {puts PASS} else {puts "FAIL expr-62.10"}
 # case: expr-bug-8dd2807066 cmd=expr
 set __judge_c [catch {
     expr {max(abs(-668336881543038127783364011867))}

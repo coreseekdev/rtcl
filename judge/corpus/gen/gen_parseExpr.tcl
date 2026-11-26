@@ -230,6 +230,12 @@ set __judge_c [catch {
 } __judge_r]
 if {$__judge_c == 1 && $__judge_r eq {missing "
 in expression "...012345678901234567890*"abcdefghijklmnopqrstuv..."}} {puts PASS} else {puts "FAIL parseExpr-21.42"}
+# case: parseExpr-21.44 cmd=expr
+set __judge_c [catch {
+    expr {123456789012345678901234567890*"foo$bar(abcdefghijklmnopqrstuvwxyz"}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {invalid character in array index
+in expression "...8901234567890*"foo$bar(abcdefghijklmnopqrstu..."}} {puts PASS} else {puts "FAIL parseExpr-21.44"}
 # case: parseExpr-21.45 cmd=expr
 set __judge_c [catch {
     expr {123456789012345678901234567890*"foo$bar([{}abcdefghijklmnopqrstuvwxyz])"}

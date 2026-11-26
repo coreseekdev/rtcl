@@ -159,6 +159,21 @@ set __judge_c [catch {
     }
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {{{b i g} 12345} {{d e m o} 34512} {{c o d e} 54321} {{b l a h} 94729}}} {puts PASS} else {puts "FAIL cmdIL-1.36"}
+# case: cmdIL-1.41 cmd=lsort
+set __judge_c [catch {
+    lsort -stride 2 -index -2 {a 2 b 1}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {index "-2" out of range}} {puts PASS} else {puts "FAIL cmdIL-1.41"}
+# case: cmdIL-1.42 cmd=lsort
+set __judge_c [catch {
+    lsort -stride 2 -index -1-1 {a 2 b 1}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {index "-1-1" out of range}} {puts PASS} else {puts "FAIL cmdIL-1.42"}
+# case: cmdIL-1.43 cmd=lsort
+set __judge_c [catch {
+    lsort -stride 4294967296 bar
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {list size must be a multiple of the stride length}} {puts PASS} else {puts "FAIL cmdIL-1.43"}
 # case: cmdIL-3.1 cmd=set
 set __judge_c [catch {
     set ::x 0
@@ -200,6 +215,21 @@ set __judge_c [catch {
     lsort -index 1+3 {{1 . c} {2 . b} {3 . a}}
 } __judge_r]
 if {$__judge_c == 1 && $__judge_r eq {element 4 missing from sublist "1 . c"}} {puts PASS} else {puts "FAIL cmdIL-3.5.1"}
+# case: cmdIL-3.5.2 cmd=lsort
+set __judge_c [catch {
+    lsort -index -1-1 {{1 . c} {2 . b} {3 . a}}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {index "-1-1" out of range}} {puts PASS} else {puts "FAIL cmdIL-3.5.2"}
+# case: cmdIL-3.5.3 cmd=lsort
+set __judge_c [catch {
+    lsort -index -2 {{1 . c} {2 . b} {3 . a}}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {index "-2" out of range}} {puts PASS} else {puts "FAIL cmdIL-3.5.3"}
+# case: cmdIL-3.5.4 cmd=lsort
+set __judge_c [catch {
+    lsort -index end-4 {{1 . c} {2 . b} {3 . a}}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {element end-4 missing from sublist "1 . c"}} {puts PASS} else {puts "FAIL cmdIL-3.5.4"}
 # case: cmdIL-3.5.5 cmd=lsort
 set __judge_c [catch {
     lsort -index {} {a b}
@@ -210,6 +240,21 @@ set __judge_c [catch {
     lsort -index {} [list a \{]
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {a \{}} {puts PASS} else {puts "FAIL cmdIL-3.5.6"}
+# case: cmdIL-3.5.7 cmd=lsort
+set __judge_c [catch {
+    lsort -index end--1 {{1 . c} {2 . b} {3 . a}}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {index "end--1" out of range}} {puts PASS} else {puts "FAIL cmdIL-3.5.7"}
+# case: cmdIL-3.5.8 cmd=lsort
+set __judge_c [catch {
+    lsort -index end+1 {{1 . c} {2 . b} {3 . a}}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {index "end+1" out of range}} {puts PASS} else {puts "FAIL cmdIL-3.5.8"}
+# case: cmdIL-3.5.9 cmd=lsort
+set __judge_c [catch {
+    lsort -index end+2 {{1 . c} {2 . b} {3 . a}}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {index "end+2" out of range}} {puts PASS} else {puts "FAIL cmdIL-3.5.9"}
 # case: cmdIL-3.5.10 cmd=lsort
 set __judge_c [catch {
     lsort -index 0 {{}}
@@ -240,6 +285,11 @@ set __judge_c [catch {
     lsort -integer {3 q}
 } __judge_r]
 if {$__judge_c == 1 && $__judge_r eq {expected integer but got "q"}} {puts PASS} else {puts "FAIL cmdIL-3.10"}
+# case: cmdIL-3.11 cmd=lsort
+set __judge_c [catch {
+    lsort -integer {35 21 0x20 0d30 0o23 100 8}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {8 0o23 21 0d30 0x20 35 100}} {puts PASS} else {puts "FAIL cmdIL-3.11"}
 # case: cmdIL-3.12 cmd=lsort
 set __judge_c [catch {
     lsort -real {6...4 3}
@@ -666,3 +716,78 @@ set __judge_c [catch {
     lreverse [list]
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL cmdIL-7.7"}
+# case: cmdIL-8.1 cmd=lremove
+set __judge_c [catch {
+    lremove
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "lremove list ?index ...?"}} {puts PASS} else {puts "FAIL cmdIL-8.1"}
+# case: cmdIL-8.2 cmd=lremove
+set __judge_c [catch {
+    lremove {{}{}}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {list element in braces followed by "{}" instead of space}} {puts PASS} else {puts "FAIL cmdIL-8.2"}
+# case: cmdIL-8.3 cmd=lremove
+set __judge_c [catch {
+    lremove {a b c} gorp
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {bad index "gorp": must be integer?[+-]integer? or end?[+-]integer?}} {puts PASS} else {puts "FAIL cmdIL-8.3"}
+# case: cmdIL-8.4 cmd=lremove
+set __judge_c [catch {
+    lremove {a b c}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {a b c}} {puts PASS} else {puts "FAIL cmdIL-8.4"}
+# case: cmdIL-8.5 cmd=lremove
+set __judge_c [catch {
+    lremove {a b c} -1
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {a b c}} {puts PASS} else {puts "FAIL cmdIL-8.5"}
+# case: cmdIL-8.6 cmd=lremove
+set __judge_c [catch {
+    lremove {a b c} 3
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {a b c}} {puts PASS} else {puts "FAIL cmdIL-8.6"}
+# case: cmdIL-8.7 cmd=lremove
+set __judge_c [catch {
+    lremove {a b c} 0
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {b c}} {puts PASS} else {puts "FAIL cmdIL-8.7"}
+# case: cmdIL-8.8 cmd=lremove
+set __judge_c [catch {
+    lremove {a b c} 1
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {a c}} {puts PASS} else {puts "FAIL cmdIL-8.8"}
+# case: cmdIL-8.9 cmd=lremove
+set __judge_c [catch {
+    lremove {a b c} end
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {a b}} {puts PASS} else {puts "FAIL cmdIL-8.9"}
+# case: cmdIL-8.10 cmd=lremove
+set __judge_c [catch {
+    lremove {a b c} end-1
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {a c}} {puts PASS} else {puts "FAIL cmdIL-8.10"}
+# case: cmdIL-8.11 cmd=lremove
+set __judge_c [catch {
+    lremove {a b c d e} 1 3
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {a c e}} {puts PASS} else {puts "FAIL cmdIL-8.11"}
+# case: cmdIL-8.12 cmd=lremove
+set __judge_c [catch {
+    lremove {a b c d e} 3 1
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {a c e}} {puts PASS} else {puts "FAIL cmdIL-8.12"}
+# case: cmdIL-8.13 cmd=lremove
+set __judge_c [catch {
+    lremove {a b c d e} 2 2
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {a b d e}} {puts PASS} else {puts "FAIL cmdIL-8.13"}
+# case: cmdIL-8.14 cmd=lremove
+set __judge_c [catch {
+    lremove {a b c d e} 3 end-1
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {a b c e}} {puts PASS} else {puts "FAIL cmdIL-8.14"}
+# case: cmdIL-8.15 cmd=lremove
+set __judge_c [catch {
+    lremove {a b c d e} 1 3 1 4 0
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {c}} {puts PASS} else {puts "FAIL cmdIL-8.15"}

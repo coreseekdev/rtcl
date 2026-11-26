@@ -342,6 +342,302 @@ set __judge_c [catch {
     rename foo {}
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL var-19.1"}
+# case: var-23.1 cmd=array
+set __judge_c [catch {
+    array for {k v} c d e {}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "array for {key value} arrayName script"}} {puts PASS} else {puts "FAIL var-23.1"}
+# case: var-23.2 cmd=array
+set __judge_c [catch {
+    array for {k v} {}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "array for {key value} arrayName script"}} {puts PASS} else {puts "FAIL var-23.2"}
+# case: var-24.2 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	array set ary {a 3}
+	array default set ary 7
+	list $ary(a) $ary(b) [info exist ary(a)] [info exist ary(b)] \
+	    [array default get ary]
+    }}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {3 7 1 0 7}} {puts PASS} else {puts "FAIL var-24.2"}
+# case: var-24.4 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	array set ary {a 3}
+	array default set ary 7
+	list $ary(a) $ary(b) [array default unset ary] $ary(a) \
+	    [catch {set ary(b)}]
+    }}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {3 7 {} 3 1}} {puts PASS} else {puts "FAIL var-24.4"}
+# case: var-24.6 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	array set ary {a 3}
+	lappend result [info exists ary],[array exists ary],[array default exists ary]
+	array default set ary 7
+	lappend result [info exists ary],[array exists ary],[array default exists ary]
+	array default unset ary
+	lappend result [info exists ary],[array exists ary],[array default exists ary]
+	unset ary
+	lappend result [info exists ary],[array exists ary],[array default exists ary]
+	array default set ary 11
+	lappend result [info exists ary],[array exists ary],[array default exists ary]
+    }}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1,1,0 1,1,1 1,1,0 0,0,0 1,1,1}} {puts PASS} else {puts "FAIL var-24.6"}
+# case: var-24.8 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	array default set ary grill
+	lappend result [array size ary] [info exist ary(x)]
+	append ary(x) abc
+	lappend result [array size ary] $ary(x)
+	array default unset ary
+	append ary(x) def
+	append ary(y) ghi
+	lappend result [array size ary] $ary(x) $ary(y)
+    }}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0 0 1 grillabc 2 grillabcdef ghi}} {puts PASS} else {puts "FAIL var-24.8"}
+# case: var-24.10 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	array default set ary grill
+	lappend result [array size ary] [info exist ary(x)]
+	lappend ary(x) abc
+	lappend result [array size ary] $ary(x)
+	array default unset ary
+	lappend ary(x) def
+	lappend ary(y) ghi
+	lappend result [array size ary] $ary(x) $ary(y)
+    }}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0 0 1 {grill abc} 2 {grill abc def} ghi}} {puts PASS} else {puts "FAIL var-24.10"}
+# case: var-24.12 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	array default set ary 7
+	lappend result [array size ary] [info exist ary(x)]
+	incr ary(x) 11
+	lappend result [array size ary] $ary(x)
+	array default unset ary
+	incr ary(x)
+	incr ary(y)
+	lappend result [array size ary] $ary(x) $ary(y)
+    }}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0 0 1 18 2 19 1}} {puts PASS} else {puts "FAIL var-24.12"}
+# case: var-24.14 cmd=lsort
+set __judge_c [catch {
+    lsort -stride 2 -index 0 [apply {{} {
+	array default set ary {x y}
+	dict lappend ary(p) x z
+	dict update ary(q) x y {
+	    set y z
+	}
+	dict with ary(r) {
+	    set x 123
+	}
+	array get ary
+    }}]
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {p {x {y z}} q {x z} r {x 123}}} {puts PASS} else {puts "FAIL var-24.14"}
+# case: var-24.15 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	array set ary {a 3}
+	array default set ary 7
+	apply {{} {
+	    upvar 1 ary ary ary(c) c
+	    lappend result $ary(a) $ary(b) $c
+	    lappend result [info exist ary(a)] [info exist ary(b)] [info exist c]
+	    lappend result [array default get ary]
+	}}
+    }}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {3 7 7 1 0 0 7}} {puts PASS} else {puts "FAIL var-24.15"}
+# case: var-25.1 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	const
+	return $X
+    }}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "const varName value"}} {puts PASS} else {puts "FAIL var-25.1"}
+# case: var-25.2 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	const X
+	return $X
+    }}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "const varName value"}} {puts PASS} else {puts "FAIL var-25.2"}
+# case: var-25.3 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	set res [const X gorp]
+	return [list $res $X]
+    }}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{} gorp}} {puts PASS} else {puts "FAIL var-25.3"}
+# case: var-25.4 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	const X gorp foo
+	return $X
+    }}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "const varName value"}} {puts PASS} else {puts "FAIL var-25.4"}
+# case: var-25.5 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	const X gorp foo bar
+	return $X
+    }}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "const varName value"}} {puts PASS} else {puts "FAIL var-25.5"}
+# case: var-25.6 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	const ::nosuchns::x 10
+    }}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't const "::nosuchns::x": parent namespace doesn't exist}} {puts PASS} else {puts "FAIL var-25.6"}
+# case: var-25.7 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	set const const
+	$const ::nosuchns::x 10
+    }}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't const "::nosuchns::x": parent namespace doesn't exist}} {puts PASS} else {puts "FAIL var-25.7"}
+# case: var-26.1 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	const X 123
+	set X gorp
+    }}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't set "X": variable is a constant}} {puts PASS} else {puts "FAIL var-26.1"}
+# case: var-26.2 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	const X 123
+	append X gorp
+    }}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't set "X": variable is a constant}} {puts PASS} else {puts "FAIL var-26.2"}
+# case: var-26.3 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	const X 123
+	lappend X gorp
+    }}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't set "X": variable is a constant}} {puts PASS} else {puts "FAIL var-26.3"}
+# case: var-26.4 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	const X 123
+	incr X
+    }}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't incr "X": variable is a constant}} {puts PASS} else {puts "FAIL var-26.4"}
+# case: var-26.5 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	const X {a 123}
+	dict set X a gorp
+    }}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't set "X": variable is a constant}} {puts PASS} else {puts "FAIL var-26.5"}
+# case: var-26.6 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	const X abcabc
+	regsub -all {a(.)} $X {\1\1} X
+    }}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't set "X": variable is a constant}} {puts PASS} else {puts "FAIL var-26.6"}
+# case: var-26.8 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	array set X {a b}
+	const X 1
+	return $X
+    }}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't make constant "X": variable is array}} {puts PASS} else {puts "FAIL var-26.8"}
+# case: var-26.9.1 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	array set X {a b}
+	const X(a) 1
+	return $X(a)
+    }}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't make constant "X(a)": name refers to an element in an array}} {puts PASS} else {puts "FAIL var-26.9.1"}
+# case: var-26.9.2 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	array set X {a b}
+	const X(b) 1
+	return $X(b)
+    }}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't make constant "X(b)": name refers to an element in an array}} {puts PASS} else {puts "FAIL var-26.9.2"}
+# case: var-26.10.1 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	const X 1
+	const X 2
+	return $X
+    }}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL var-26.10.1"}
+# case: var-26.10.2 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	lmap x {1 2 3} {
+	    const A 2
+	    const B 3
+	    const C 5
+	    expr {$A * $x**2 + $B * $x + $C}
+	}
+    }}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {10 19 32}} {puts PASS} else {puts "FAIL var-26.10.2"}
+# case: var-26.11 cmd=apply
+set __judge_c [catch {
+   apply {{} {
+	const X 1
+	unset X
+   }}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't unset "X": variable is a constant}} {puts PASS} else {puts "FAIL var-26.11"}
+# case: var-26.12 cmd=apply
+set __judge_c [catch {
+   apply {{} {
+	const X 1
+	unset -nocomplain X
+	return $X
+   }}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL var-26.12"}
+# case: var-26.13 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	trace add variable X write {apply {args {
+	    error "ERR: $args"
+	}}}
+	const X gorp
+	return $X
+    }}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't set "X": ERR: X {} write}} {puts PASS} else {puts "FAIL var-26.13"}
 # case: var-26.14 cmd=apply
 set __judge_c [catch {
     apply {{} {
@@ -358,6 +654,130 @@ set __judge_c [catch {
     }}
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {123}} {puts PASS} else {puts "FAIL var-26.14"}
+# case: var-27.1 cmd=apply
+set __judge_c [catch {
+    apply {const {
+	$const X 123
+	set X gorp
+    }} const
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't set "X": variable is a constant}} {puts PASS} else {puts "FAIL var-27.1"}
+# case: var-27.2 cmd=apply
+set __judge_c [catch {
+    apply {const {
+	$const X 123
+	append X gorp
+    }} const
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't set "X": variable is a constant}} {puts PASS} else {puts "FAIL var-27.2"}
+# case: var-27.3 cmd=apply
+set __judge_c [catch {
+    apply {const {
+	$const X 123
+	lappend X gorp
+    }} const
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't set "X": variable is a constant}} {puts PASS} else {puts "FAIL var-27.3"}
+# case: var-27.4 cmd=apply
+set __judge_c [catch {
+    apply {const {
+	$const X 123
+	incr X
+    }} const
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't incr "X": variable is a constant}} {puts PASS} else {puts "FAIL var-27.4"}
+# case: var-27.5 cmd=apply
+set __judge_c [catch {
+    apply {const {
+	$const X {a 123}
+	dict set X a gorp
+    }} const
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't set "X": variable is a constant}} {puts PASS} else {puts "FAIL var-27.5"}
+# case: var-27.6 cmd=apply
+set __judge_c [catch {
+    apply {const {
+	$const X abcabc
+	regsub -all {a(.)} $X {\1\1} X
+    }} const
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't set "X": variable is a constant}} {puts PASS} else {puts "FAIL var-27.6"}
+# case: var-27.8 cmd=apply
+set __judge_c [catch {
+    apply {const {
+	array set X {a b}
+	$const X 1
+	return $X
+    }} const
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't make constant "X": variable is array}} {puts PASS} else {puts "FAIL var-27.8"}
+# case: var-27.9.1 cmd=apply
+set __judge_c [catch {
+    apply {const {
+	array set X {a b}
+	$const X(a) 1
+	return $X(a)
+    }} const
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't make constant "X(a)": name refers to an element in an array}} {puts PASS} else {puts "FAIL var-27.9.1"}
+# case: var-27.9.2 cmd=apply
+set __judge_c [catch {
+    apply {const {
+	array set X {a b}
+	$const X(b) 1
+	return $X(b)
+    }} const
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't make constant "X(b)": name refers to an element in an array}} {puts PASS} else {puts "FAIL var-27.9.2"}
+# case: var-27.10.1 cmd=apply
+set __judge_c [catch {
+    apply {const {
+	$const X 1
+	$const X 2
+	return $X
+    }} const
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL var-27.10.1"}
+# case: var-27.10.2 cmd=apply
+set __judge_c [catch {
+    apply {const {
+	lmap x {1 2 3} {
+	    $const A 2
+	    $const B 3
+	    $const C 5
+	    expr {$A * $x**2 + $B * $x + $C}
+	}
+    }} const
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {10 19 32}} {puts PASS} else {puts "FAIL var-27.10.2"}
+# case: var-27.11 cmd=apply
+set __judge_c [catch {
+   apply {const {
+	$const X 1
+	unset X
+   }} const
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't unset "X": variable is a constant}} {puts PASS} else {puts "FAIL var-27.11"}
+# case: var-27.12 cmd=apply
+set __judge_c [catch {
+   apply {const {
+	$const X 1
+	unset -nocomplain X
+	return $X
+   }} const
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL var-27.12"}
+# case: var-27.13 cmd=apply
+set __judge_c [catch {
+    apply {const {
+	trace add variable X write {apply {args {
+	    error "ERR: $args"
+	}}}
+	$const X gorp
+	return $X
+    }} const
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't set "X": ERR: X {} write}} {puts PASS} else {puts "FAIL var-27.13"}
 # case: var-27.14 cmd=apply
 set __judge_c [catch {
     apply {const {
@@ -374,3 +794,123 @@ set __judge_c [catch {
     }} const
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {123}} {puts PASS} else {puts "FAIL var-27.14"}
+# case: var-30.1 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	lappend consts [lsort [info consts]] [info constant X]
+	const X 1
+	lappend consts [lsort [info consts]] [info constant X]
+	const Y 2
+	lappend consts [lsort [info consts]]
+	const X 3
+	lappend consts [lsort [info consts]]
+    }}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{} 0 X 1 {X Y} {X Y}}} {puts PASS} else {puts "FAIL var-30.1"}
+# case: var-30.2 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	lappend consts [lsort [info consts X]]
+	const X 1
+	lappend consts [lsort [info consts X]]
+	const Y 2
+	lappend consts [lsort [info consts X]]
+	const X 3
+	lappend consts [lsort [info consts X]]
+    }}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{} X X X}} {puts PASS} else {puts "FAIL var-30.2"}
+# case: var-30.3 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	lappend consts [lsort [info consts ?]]
+	const X 1
+	lappend consts [lsort [info consts ?]]
+	const Y 2
+	lappend consts [lsort [info consts ?]]
+	const XX 3
+	lappend consts [lsort [info consts ?]]
+    }}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{} X {X Y} {X Y}}} {puts PASS} else {puts "FAIL var-30.3"}
+# case: var-30.4 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	lappend consts [lsort [info consts X]]
+	set X 1
+	lappend consts [lsort [info consts X]]
+	set Y 2
+	lappend consts [lsort [info consts X]]
+	set X 3
+	lappend consts [lsort [info consts X]]
+    }}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{} {} {} {}}} {puts PASS} else {puts "FAIL var-30.4"}
+# case: var-30.7 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	info constant a(b)
+    }}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0}} {puts PASS} else {puts "FAIL var-30.7"}
+# case: var-30.8 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	array set a {}
+	info constant a
+    }}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0}} {puts PASS} else {puts "FAIL var-30.8"}
+# case: var-30.9 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	info constant a
+    }}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0}} {puts PASS} else {puts "FAIL var-30.9"}
+# case: var-30.10 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	info constant ::var29::no::such::ns::a
+    }}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0}} {puts PASS} else {puts "FAIL var-30.10"}
+# case: var-30.11 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	upvar 0 no_var a
+	info constant a
+    }}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0}} {puts PASS} else {puts "FAIL var-30.11"}
+# case: var-30.12 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	info constant a(b
+    }}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0}} {puts PASS} else {puts "FAIL var-30.12"}
+# case: var-30.13 cmd=apply
+set __judge_c [catch {
+    apply {{} {
+	array set b {c d}
+	upvar 0 b(c) a
+	info constant a(d)
+    }}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0}} {puts PASS} else {puts "FAIL var-30.13"}
+# case: var-31.1 cmd=info
+set __judge_c [catch {
+    info constant
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "info constant varName"}} {puts PASS} else {puts "FAIL var-31.1"}
+# case: var-31.2 cmd=info
+set __judge_c [catch {
+    info constant foo bar
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "info constant varName"}} {puts PASS} else {puts "FAIL var-31.2"}
+# case: var-31.3 cmd=info
+set __judge_c [catch {
+    info consts foo bar
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {wrong # args: should be "info consts ?pattern?"}} {puts PASS} else {puts "FAIL var-31.3"}

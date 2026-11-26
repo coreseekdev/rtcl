@@ -164,6 +164,16 @@ if {$__judge_c == 0 && $__judge_r eq {7}} {puts PASS} else {puts "FAIL compExpr-
 # case: compExpr-old-6.6 cmd=expr
 set __judge_c [catch {expr -1^7} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {-8}} {puts PASS} else {puts "FAIL compExpr-old-6.6"}
+# case: compExpr-old-6.9 cmd=list
+set __judge_c [catch {
+    list [catch {expr {24.0^3}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use floating-point value "24.0" as left operand of "^"}}} {puts PASS} else {puts "FAIL compExpr-old-6.9"}
+# case: compExpr-old-6.10 cmd=list
+set __judge_c [catch {
+    list [catch {expr {"a"^"b"}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "a" as left operand of "^"}}} {puts PASS} else {puts "FAIL compExpr-old-6.10"}
 # case: compExpr-old-7.1 cmd=expr
 set __judge_c [catch {expr 3==2} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {0}} {puts PASS} else {puts "FAIL compExpr-old-7.1"}
@@ -188,6 +198,16 @@ if {$__judge_c == 0 && $__judge_r eq {2}} {puts PASS} else {puts "FAIL compExpr-
 # case: compExpr-old-7.9 cmd=expr
 set __judge_c [catch {expr -1&-7} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {-7}} {puts PASS} else {puts "FAIL compExpr-old-7.9"}
+# case: compExpr-old-7.12 cmd=list
+set __judge_c [catch {
+    list [catch {expr {24.0&3}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use floating-point value "24.0" as left operand of "&"}}} {puts PASS} else {puts "FAIL compExpr-old-7.12"}
+# case: compExpr-old-7.13 cmd=list
+set __judge_c [catch {
+    list [catch {expr {"a"&"b"}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "a" as left operand of "&"}}} {puts PASS} else {puts "FAIL compExpr-old-7.13"}
 # case: compExpr-old-8.1 cmd=expr
 set __judge_c [catch {expr 3>=2} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL compExpr-old-8.1"}
@@ -224,6 +244,11 @@ if {$__judge_c == 0 && $__judge_r eq {-1}} {puts PASS} else {puts "FAIL compExpr
 # case: compExpr-old-9.4 cmd=expr
 set __judge_c [catch {expr {1<<3}} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {8}} {puts PASS} else {puts "FAIL compExpr-old-9.4"}
+# case: compExpr-old-9.5 cmd=expr
+set __judge_c [catch {
+    expr {int(1<<63)}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {9223372036854775808}} {puts PASS} else {puts "FAIL compExpr-old-9.5"}
 # case: compExpr-old-9.7 cmd=expr
 set __judge_c [catch {expr 0xff>=+0x3} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL compExpr-old-9.7"}
@@ -248,6 +273,16 @@ if {$__judge_c == 0 && $__judge_r eq {31}} {puts PASS} else {puts "FAIL compExpr
 # case: compExpr-old-10.7 cmd=expr
 set __judge_c [catch {expr -0xf2<<0x3} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {-1936}} {puts PASS} else {puts "FAIL compExpr-old-10.7"}
+# case: compExpr-old-10.10 cmd=list
+set __judge_c [catch {
+    list [catch {expr {24.0>>43}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use floating-point value "24.0" as left operand of ">>"}}} {puts PASS} else {puts "FAIL compExpr-old-10.10"}
+# case: compExpr-old-10.11 cmd=list
+set __judge_c [catch {
+    list [catch {expr {"a"<<"b"}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "a" as left operand of "<<"}}} {puts PASS} else {puts "FAIL compExpr-old-10.11"}
 # case: compExpr-old-11.1 cmd=expr
 set __judge_c [catch {expr 4*-2} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {-8}} {puts PASS} else {puts "FAIL compExpr-old-11.1"}
@@ -266,6 +301,16 @@ if {$__judge_c == 0 && $__judge_r eq {258}} {puts PASS} else {puts "FAIL compExp
 # case: compExpr-old-11.7 cmd=expr
 set __judge_c [catch {expr -0xf2--0x3} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {-239}} {puts PASS} else {puts "FAIL compExpr-old-11.7"}
+# case: compExpr-old-11.10 cmd=list
+set __judge_c [catch {
+    list [catch {expr {24.0+"xx"}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "xx" as right operand of "+"}}} {puts PASS} else {puts "FAIL compExpr-old-11.10"}
+# case: compExpr-old-11.11 cmd=list
+set __judge_c [catch {
+    list [catch {expr {"a"-"b"}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "a" as left operand of "-"}}} {puts PASS} else {puts "FAIL compExpr-old-11.11"}
 # case: compExpr-old-11.12 cmd=list
 set __judge_c [catch {
     list [catch {expr {3/0}} msg] $msg
@@ -289,6 +334,16 @@ if {$__judge_c == 0 && $__judge_r eq {765}} {puts PASS} else {puts "FAIL compExp
 # case: compExpr-old-12.7 cmd=expr
 set __judge_c [catch {expr -0xf2%-0x3} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {-2}} {puts PASS} else {puts "FAIL compExpr-old-12.7"}
+# case: compExpr-old-12.10 cmd=list
+set __judge_c [catch {
+    list [catch {expr {24.0*"xx"}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "xx" as right operand of "*"}}} {puts PASS} else {puts "FAIL compExpr-old-12.10"}
+# case: compExpr-old-12.11 cmd=list
+set __judge_c [catch {
+    list [catch {expr {"a"/"b"}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "a" as left operand of "/"}}} {puts PASS} else {puts "FAIL compExpr-old-12.11"}
 # case: compExpr-old-13.1 cmd=expr
 set __judge_c [catch {expr -0xff} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {-255}} {puts PASS} else {puts "FAIL compExpr-old-13.1"}
@@ -310,6 +365,16 @@ if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL compExpr-
 # case: compExpr-old-13.7 cmd=expr
 set __judge_c [catch {expr !0xef} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {0}} {puts PASS} else {puts "FAIL compExpr-old-13.7"}
+# case: compExpr-old-13.10 cmd=list
+set __judge_c [catch {
+    list [catch {expr {~"xx"}} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use non-numeric string "xx" as operand of "~"}}} {puts PASS} else {puts "FAIL compExpr-old-13.10"}
+# case: compExpr-old-13.11 cmd=list
+set __judge_c [catch {
+    list [catch {expr ~4.0} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot use floating-point value "4.0" as operand of "~"}}} {puts PASS} else {puts "FAIL compExpr-old-13.11"}
 # case: compExpr-old-13.12 cmd=expr
 set __judge_c [catch {expr 0x123} __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {291}} {puts PASS} else {puts "FAIL compExpr-old-13.12"}

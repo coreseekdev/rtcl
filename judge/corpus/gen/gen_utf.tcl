@@ -14,6 +14,11 @@ set __judge_c [catch {
     string length \xA2
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL utf-2.4"}
+# case: utf-2.8 cmd=string
+set __judge_c [catch {
+    string length 𐀀
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL utf-2.8"}
 # case: utf-2.9 cmd=string
 set __judge_c [catch {
     string length \U10FFFF
@@ -43,6 +48,36 @@ set __judge_c [catch {
     string index 乎ɚÿՃ 2
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {ÿ}} {puts PASS} else {puts "FAIL utf-8.4"}
+# case: utf-8.7 cmd=string
+set __judge_c [catch {
+    string index 😀G 0
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {😀}} {puts PASS} else {puts "FAIL utf-8.7"}
+# case: utf-8.8 cmd=string
+set __judge_c [catch {
+    string index 😀G 1
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {G}} {puts PASS} else {puts "FAIL utf-8.8"}
+# case: utf-8.9 cmd=string
+set __judge_c [catch {
+    string index 😀G 2
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL utf-8.9"}
+# case: utf-8.10 cmd=string
+set __judge_c [catch {
+    string index 😀G 0
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {😀}} {puts PASS} else {puts "FAIL utf-8.10"}
+# case: utf-8.11 cmd=string
+set __judge_c [catch {
+    string index 😀G 1
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {G}} {puts PASS} else {puts "FAIL utf-8.11"}
+# case: utf-8.12 cmd=string
+set __judge_c [catch {
+    string index 😀G 2
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL utf-8.12"}
 # case: utf-9.1 cmd=string
 set __judge_c [catch {
     string range abcd 0 2
@@ -53,6 +88,36 @@ set __judge_c [catch {
     string range 乎ɚÿՃklmnop 1 5
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {ɚÿՃkl}} {puts PASS} else {puts "FAIL utf-9.2"}
+# case: utf-9.3 cmd=string
+set __judge_c [catch {
+    string range 😀G 0 0
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {😀}} {puts PASS} else {puts "FAIL utf-9.3"}
+# case: utf-9.4 cmd=string
+set __judge_c [catch {
+    string range 😀G 1 1
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {G}} {puts PASS} else {puts "FAIL utf-9.4"}
+# case: utf-9.5 cmd=string
+set __judge_c [catch {
+    string range 😀G 2 2
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL utf-9.5"}
+# case: utf-9.6 cmd=string
+set __judge_c [catch {
+    string range 😀G 0 0
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {😀}} {puts PASS} else {puts "FAIL utf-9.6"}
+# case: utf-9.7 cmd=string
+set __judge_c [catch {
+    string range 😀G 1 1
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {G}} {puts PASS} else {puts "FAIL utf-9.7"}
+# case: utf-9.8 cmd=string
+set __judge_c [catch {
+    string range 😀G 2 2
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL utf-9.8"}
 # case: utf-10.1 cmd=set
 set __judge_c [catch {
     set x \n
@@ -79,6 +144,16 @@ set __judge_c [catch {
     string toupper აᲐ
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {ᲐᲐ}} {puts PASS} else {puts "FAIL utf-11.5"}
+# case: utf-11.6 cmd=string
+set __judge_c [catch {
+    string toupper 𐐨
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {𐐀}} {puts PASS} else {puts "FAIL utf-11.6"}
+# case: utf-11.7 cmd=string
+set __judge_c [catch {
+    string toupper 𐐨
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {𐐀}} {puts PASS} else {puts "FAIL utf-11.7"}
 # case: utf-12.1 cmd=string
 set __judge_c [catch {
     string tolower {}
@@ -104,6 +179,16 @@ set __judge_c [catch {
     string tolower აᲐ
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {აა}} {puts PASS} else {puts "FAIL utf-12.5"}
+# case: utf-12.7 cmd=string
+set __judge_c [catch {
+    string tolower 𐐀
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {𐐨}} {puts PASS} else {puts "FAIL utf-12.7"}
+# case: utf-12.8 cmd=string
+set __judge_c [catch {
+    string tolower 𐐀
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {𐐨}} {puts PASS} else {puts "FAIL utf-12.8"}
 # case: utf-13.1 cmd=string
 set __judge_c [catch {
     string totitle {}
@@ -134,6 +219,16 @@ set __judge_c [catch {
     string totitle Აა
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {Აა}} {puts PASS} else {puts "FAIL utf-13.6"}
+# case: utf-13.8 cmd=string
+set __judge_c [catch {
+    string totitle 𐐨𐐀
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {𐐀𐐨}} {puts PASS} else {puts "FAIL utf-13.8"}
+# case: utf-13.9 cmd=string
+set __judge_c [catch {
+    string totitle 𐐨𐐀
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {𐐀𐐨}} {puts PASS} else {puts "FAIL utf-13.9"}
 # case: utf-14.1 cmd=string
 set __judge_c [catch {
     string compare -nocase a b
@@ -209,6 +304,11 @@ set __judge_c [catch {
     string totitle !
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {!}} {puts PASS} else {puts "FAIL utf-18.5"}
+# case: utf-20.1 cmd=string
+set __judge_c [catch {
+    string compare [string range [format %c 0xFFFF] 0 0] [string range [format %c 0x10000] 0 0]
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {-1}} {puts PASS} else {puts "FAIL utf-20.1"}
 # case: utf-20.2 cmd=set
 set __judge_c [catch {
     set one [format %c 0xFFFF]

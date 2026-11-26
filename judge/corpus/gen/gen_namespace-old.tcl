@@ -334,6 +334,13 @@ set __judge_c [catch {
     list [test_ns_cache1::trigger] [test_ns_cache1::test_ns_cache2::trigger]
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {{cache2 version} {cache2 version}}} {puts PASS} else {puts "FAIL namespace-old-6.11"}
+# case: namespace-old-6.12 cmd=variable
+set __judge_c [catch {
+    variable test_ns_cache_var "global version"
+    set trigger {set test_ns_cache_var}
+    list [catch {namespace eval test_ns_cache1 $trigger} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {can't read "test_ns_cache_var": no such variable}}} {puts PASS} else {puts "FAIL namespace-old-6.12"}
 # case: namespace-old-6.13 cmd=namespace
 set __judge_c [catch {
     namespace eval test_ns_cache1 {
@@ -342,6 +349,26 @@ set __judge_c [catch {
     namespace eval test_ns_cache1 $trigger
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {cache1 version}} {puts PASS} else {puts "FAIL namespace-old-6.13"}
+# case: namespace-old-6.14 cmd=namespace
+set __judge_c [catch {
+    namespace eval test_ns_cache1 {
+	variable test_ns_cache_var "cache1 version"
+    }
+    list [namespace eval test_ns_cache1 $trigger] \
+	[namespace eval test_ns_cache1 {unset test_ns_cache_var}] \
+	[catch {namespace eval test_ns_cache1 $trigger}]
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{cache1 version} {} 1}} {puts PASS} else {puts "FAIL namespace-old-6.14"}
+# case: namespace-old-6.15 cmd=namespace
+set __judge_c [catch {
+    namespace eval test_ns_cache2 {
+	variable test_ns_cache_var "global cache2 version"
+    }
+    set trigger2 {set test_ns_cache2::test_ns_cache_var}
+    catch {list [namespace eval test_ns_cache1 $trigger2] \
+	       [namespace eval test_ns_cache1::test_ns_cache2 $trigger]}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1}} {puts PASS} else {puts "FAIL namespace-old-6.15"}
 # case: namespace-old-6.16 cmd=variable
 set __judge_c [catch {
     variable test_ns_cache1::test_ns_cache2::test_ns_cache_var "cache2 version"

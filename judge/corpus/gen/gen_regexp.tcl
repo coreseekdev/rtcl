@@ -287,6 +287,16 @@ set __judge_c [catch {
     list [catch {regexp -gorp a} msg] $msg
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {1 {bad option "-gorp": must be -all, -about, -indices, -inline, -expanded, -line, -linestop, -lineanchor, -nocase, -start, or --}}} {puts PASS} else {puts "FAIL regexp-6.3"}
+# case: regexp-6.4 cmd=list
+set __judge_c [catch {
+    list [catch {regexp a( b} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot compile regular expression pattern: parentheses () not balanced}}} {puts PASS} else {puts "FAIL regexp-6.4"}
+# case: regexp-6.5 cmd=list
+set __judge_c [catch {
+    list [catch {regexp a( b} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot compile regular expression pattern: parentheses () not balanced}}} {puts PASS} else {puts "FAIL regexp-6.5"}
 # case: regexp-6.6 cmd=list
 set __judge_c [catch {
     list [catch {regexp a a f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1 f1} msg] $msg
@@ -302,6 +312,11 @@ set __judge_c [catch {
     list [catch {regexp -start bogus {^$} {}} msg] $msg
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {1 {bad index "bogus": must be integer?[+-]integer? or end?[+-]integer?}}} {puts PASS} else {puts "FAIL regexp-6.9"}
+# case: regexp-6.10 cmd=list
+set __judge_c [catch {
+    list [catch {regexp {a[} b} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot compile regular expression pattern: brackets [] not balanced}}} {puts PASS} else {puts "FAIL regexp-6.10"}
 # case: regexp-7.1 cmd=list
 set __judge_c [catch {
     list [regsub aa+ xaxaaaxaa 111&222 foo] $foo
@@ -537,6 +552,16 @@ set __judge_c [catch {
     list [catch {regsub a b c d e f} msg] $msg
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {1 {wrong # args: should be "regsub ?-option ...? exp string subSpec ?varName?"}}} {puts PASS} else {puts "FAIL regexp-11.4"}
+# case: regexp-11.5 cmd=list
+set __judge_c [catch {
+    list [catch {regsub -gorp a b c} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {bad option "-gorp": must be -all, -command, -expanded, -line, -linestop, -lineanchor, -nocase, -start, or --}}} {puts PASS} else {puts "FAIL regexp-11.5"}
+# case: regexp-11.6 cmd=list
+set __judge_c [catch {
+    list [catch {regsub -nocase a( b c d} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {cannot compile regular expression pattern: parentheses () not balanced}}} {puts PASS} else {puts "FAIL regexp-11.6"}
 # case: regexp-11.8 cmd=list
 set __judge_c [catch {
     list [catch {regsub -start bogus pattern string rep var} msg] $msg
@@ -1189,3 +1214,71 @@ set __judge_c [catch {
     regexp -all -inline -- {a*} "b\n"
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {{} {}}} {puts PASS} else {puts "FAIL regexp-26.13"}
+# case: regexp-27.1 cmd=regsub
+set __judge_c [catch {
+    regsub -command {.x.} {abcxdef} {string length}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {ab3ef}} {puts PASS} else {puts "FAIL regexp-27.1"}
+# case: regexp-27.2 cmd=regsub
+set __judge_c [catch {
+    regsub -command {.x.} {abcxdefxghi} {string length}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {ab3efxghi}} {puts PASS} else {puts "FAIL regexp-27.2"}
+# case: regexp-27.3 cmd=set
+set __judge_c [catch {
+    set x 0
+    regsub -all -command {(?=.)} abcde {apply {args {incr ::x}}}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1a2b3c4d5e}} {puts PASS} else {puts "FAIL regexp-27.3"}
+# case: regexp-27.4 cmd=regsub
+set __judge_c [catch {
+    regsub -command {.x.} {abcxdef} error
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {cxd}} {puts PASS} else {puts "FAIL regexp-27.4"}
+# case: regexp-27.5 cmd=regsub
+set __judge_c [catch {
+    regsub -command {(.)(.)} {abcdef} {list ,}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {, ab a bcdef}} {puts PASS} else {puts "FAIL regexp-27.5"}
+# case: regexp-27.6 cmd=regsub
+set __judge_c [catch {
+    regsub -command -all {(.)(.)} {abcdef} {list ,}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {, ab a b, cd c d, ef e f}} {puts PASS} else {puts "FAIL regexp-27.6"}
+# case: regexp-27.7 cmd=set
+set __judge_c [catch {
+    set ::s {123=456 789}
+    regsub -command -all {\d+} $::s {apply {n {
+	expr {[llength $::s] + $n}
+    }}}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {125=458 791}} {puts PASS} else {puts "FAIL regexp-27.7"}
+# case: regexp-27.8 cmd=set
+set __judge_c [catch {
+    set ::t {apply {n {
+	expr {[llength [lindex $::t 1 1 1]] + $n}
+    }}}
+    regsub -command -all {\d+} "123=456 789" $::t
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {131=464 797}} {puts PASS} else {puts "FAIL regexp-27.8"}
+# case: regexp-27.10 cmd=regsub
+set __judge_c [catch {
+    regsub -command . abc "def \{ghi"
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {unmatched open brace in list}} {puts PASS} else {puts "FAIL regexp-27.10"}
+# case: regexp-27.11 cmd=regsub
+set __judge_c [catch {
+    regsub -command . abc {}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {command prefix must be a list of at least one element}} {puts PASS} else {puts "FAIL regexp-27.11"}
+# case: regexp-27.12 cmd=set
+set __judge_c [catch {
+    set s {list (.+)}
+    regsub -command $s {list list} $s
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {(.+) {list list} list}} {puts PASS} else {puts "FAIL regexp-27.12"}
+# case: regexp-28.1 cmd=regexp
+set __judge_c [catch {
+	regexp {} $nosuchvar
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't read "nosuchvar": no such variable}} {puts PASS} else {puts "FAIL regexp-28.1"}

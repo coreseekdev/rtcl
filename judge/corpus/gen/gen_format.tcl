@@ -4,6 +4,16 @@ set __judge_c [catch {
     format "%*d %d %d %d" 6 34 16923 -12 -1
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {    34 16923 -12 -1}} {puts PASS} else {puts "FAIL format-1.1"}
+# case: format-1.2 cmd=format
+set __judge_c [catch {
+    format "%4d %4d %4d %4d %d %#x %#X" 6 34 16923 -12 -1 14 12
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {   6   34 16923  -12 -1 0xe 0xC}} {puts PASS} else {puts "FAIL format-1.2"}
+# case: format-1.3 cmd=format
+set __judge_c [catch {
+    format "%4u %4u %4u %4u %d %#o" 6 34 16923 -12 -1 0
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {   6   34 16923 4294967284 -1 0}} {puts PASS} else {puts "FAIL format-1.3"}
 # case: format-1.4 cmd=format
 set __judge_c [catch {
     format "%-4d %-4i %-4d %-4ld" 6 34 16923 -12 -1
@@ -19,6 +29,51 @@ set __judge_c [catch {
     format "%00*d" 6 34
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {000034}} {puts PASS} else {puts "FAIL format-1.6"}
+# case: format-1.7 cmd=format
+set __judge_c [catch {
+    format "%4x %4x %4x %4x" 6 34 16923 -12 -1
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {   6   22 421b fffffff4}} {puts PASS} else {puts "FAIL format-1.7"}
+# case: format-1.8 cmd=format
+set __judge_c [catch {
+    format "%#x %#x %#X %#X %#x" 0 6 34 16923 -12 -1
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0 0x6 0x22 0x421B 0xfffffff4}} {puts PASS} else {puts "FAIL format-1.8"}
+# case: format-1.9 cmd=format
+set __judge_c [catch {
+    format "%#5x %#20x %#20x %#20x %#20x" 0 6 34 16923 -12 -1
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {    0                  0x6                 0x22               0x421b           0xfffffff4}} {puts PASS} else {puts "FAIL format-1.9"}
+# case: format-1.10 cmd=format
+set __judge_c [catch {
+    format "%-#5x %-#20x %-#20x %-#20x %-#20x" 0 6 34 16923 -12 -1
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0     0x6                  0x22                 0x421b               0xfffffff4          }} {puts PASS} else {puts "FAIL format-1.10"}
+# case: format-1.11 cmd=format
+set __judge_c [catch {
+    format "%-#5o %-#20o %#-20o %#-20o %#-20o" 0 6 34 16923 -12 -1
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0     0o6                  0o42                 0o41033              0o37777777764       }} {puts PASS} else {puts "FAIL format-1.11"}
+# case: format-1.12 cmd=format
+set __judge_c [catch {
+    format "%b %#b %#b %llb" 5 0 5 [expr {2**100}]
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {101 0 0b101 10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000}} {puts PASS} else {puts "FAIL format-1.12"}
+# case: format-1.13 cmd=format
+set __judge_c [catch {
+    format "%#0d %#0d %#0d %#0d %#0d" 0 6 34 16923 -12 -1
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0 0d6 0d34 0d16923 -0d12}} {puts PASS} else {puts "FAIL format-1.13"}
+# case: format-1.14 cmd=format
+set __judge_c [catch {
+    format "%#05d %#020d %#020d %#020d %#020d" 0 6 34 16923 -12 -1
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {00000 0d000000000000000006 0d000000000000000034 0d000000000000016923 -0d00000000000000012}} {puts PASS} else {puts "FAIL format-1.14"}
+# case: format-1.15 cmd=format
+set __judge_c [catch {
+    format "%-#05d %-#020d %-#020d %-#020d %-#020d" 0 6 34 16923 -12 -1
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {00000 0d000000000000000006 0d000000000000000034 0d000000000000016923 -0d00000000000000012}} {puts PASS} else {puts "FAIL format-1.15"}
 # case: format-2.1 cmd=format
 set __judge_c [catch {
     format "%s %s %c %s" abcd {This is a very long test string.} 120 x
@@ -310,6 +365,16 @@ set __judge_c [catch {
     set msg
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {expected integer but got "xyz"}} {puts PASS} else {puts "FAIL format-8.23"}
+# case: format-8.24 cmd=format
+set __judge_c [catch {
+    format "%zd %td %d" [expr {2**30}] [expr {2**30}] [expr {2**30}]
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1073741824 1073741824 1073741824}} {puts PASS} else {puts "FAIL format-8.24"}
+# case: format-8.26 cmd=format
+set __judge_c [catch {
+    format "%p %#x" [expr {2**31}] [expr {2**31}]
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0x80000000 0x80000000}} {puts PASS} else {puts "FAIL format-8.26"}
 # case: format-9.1 cmd=set
 set __judge_c [catch {
     set a {1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ 1 2 3 4 5 6 7 8 9 0 a b c d e f g h i j k l m n o p q r s t u v w x y z A B C D E F G H I J K L M N O P Q R S T U V W X Y Z}
@@ -403,6 +468,16 @@ set __judge_c [catch {
     list [catch {format {%2$*d} 4 5 6} msg] $msg
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {0 {    6}}} {puts PASS} else {puts "FAIL format-11.12"}
+# case: format-11.13 cmd=format
+set __judge_c [catch {
+    format {%2$.*s %4$d} 1 -4294967298 abcdefghijklmnop 44
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq { 44}} {puts PASS} else {puts "FAIL format-11.13"}
+# case: format-11.14 cmd=format
+set __judge_c [catch {
+    format {%2$.*s %4$d} 1 4294967298 abcdefghijklmnop 44
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {abcdefghijklmnop 44}} {puts PASS} else {puts "FAIL format-11.14"}
 # case: format-12.1 cmd=format
 set __judge_c [catch {
     format "%*d" -47 25
@@ -507,6 +582,11 @@ set __judge_c [catch {
     format "(%+1d) (%+1d)" 10 -10
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {(+10) (-10)}} {puts PASS} else {puts "FAIL format-15.6"}
+# case: format-17.1 cmd=format
+set __judge_c [catch {
+    format %d 7810179016327718216
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1819043144}} {puts PASS} else {puts "FAIL format-17.1"}
 # case: format-17.2 cmd=format
 set __judge_c [catch {
     format %ld 7810179016327718216
@@ -522,6 +602,11 @@ set __judge_c [catch {
     format %lf 1
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {1.000000}} {puts PASS} else {puts "FAIL format-17.4"}
+# case: format-17.5 cmd=format
+set __judge_c [catch {
+    format %llu 0xabcdef0123456789abcdef
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {207698809136909011942886895}} {puts PASS} else {puts "FAIL format-17.5"}
 # case: format-18.1 cmd=set
 set __judge_c [catch {
     set a 0xaaaaaaaa
@@ -538,6 +623,13 @@ set __judge_c [catch {
     lappend result [expr {$a == $b}]
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {1 1 1 1}} {puts PASS} else {puts "FAIL format-18.1"}
+# case: format-18.2 cmd=set
+set __judge_c [catch {
+    set a [expr {0xaaaaaaaaaa + 1}]
+    set b 0xaaaaaaaaab
+    list [format %08x $a] [expr {$a == $b}]
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {aaaaaaab 1}} {puts PASS} else {puts "FAIL format-18.2"}
 # case: format-19.2 cmd=format
 set __judge_c [catch {
     format %llx 0

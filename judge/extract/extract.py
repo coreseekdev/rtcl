@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Extract deterministic, self-contained cases from Tcl's official tcltest
-suite (.refer/tcl/tests/*.test) into judge corpus scripts.
+suite into judge corpus scripts.
+
+Extraction source: the Tcl 9.1.0 release suite
+(.refer/tcl910/tcl9.1.0/tests/*.test, 2026-11-26 起——对标迁移重提取;
+此前 8.6 时代语料提取自 .refer/tcl/tests，见 git 历史)。环境变量
+JUDGE_TESTS 可覆盖提取源目录。
 
 Strategy:
   1. Tokenize each .test file with a minimal Tcl parser.
@@ -27,7 +32,10 @@ import sys
 from collections import Counter
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-TESTS = os.path.join(ROOT, ".refer", "tcl", "tests")
+# 提取源（2026-11-26 起默认 9.1.0 release 套件）；JUDGE_TESTS 可覆盖，
+# 例：JUDGE_TESTS=$ROOT/.refer/tcl/tests 重提 8.6.17 历史语料。
+TESTS = os.environ.get("JUDGE_TESTS") or os.path.join(
+    ROOT, ".refer", "tcl910", "tcl9.1.0", "tests")
 OUT = os.path.join(ROOT, "judge", "corpus", "gen")
 STATS = os.path.join(ROOT, "judge", "extract", "stats.json")
 # 提取自检 oracle（2026-11-25 起默认 9.1.0）；JUDGE_ORACLE 可覆盖。

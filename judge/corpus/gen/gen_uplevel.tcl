@@ -117,11 +117,41 @@ set __judge_c [catch {
     apply {{} {uplevel #[expr 1] {}}}
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL uplevel-4.16"}
+# case: uplevel-4.17 cmd=apply
+set __judge_c [catch {
+    apply {{} {uplevel -0xffffffff {}}}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {bad level "-0xffffffff"}} {puts PASS} else {puts "FAIL uplevel-4.17"}
+# case: uplevel-4.18 cmd=apply
+set __judge_c [catch {
+    apply {{} {uplevel #-0xffffffff {}}}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {bad level "#-0xffffffff"}} {puts PASS} else {puts "FAIL uplevel-4.18"}
+# case: uplevel-4.19 cmd=apply
+set __judge_c [catch {
+    apply {{} {uplevel [expr -0xffffffff] {}}}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {bad level "-4294967295"}} {puts PASS} else {puts "FAIL uplevel-4.19"}
+# case: uplevel-4.20 cmd=apply
+set __judge_c [catch {
+    apply {{} {uplevel #[expr -0xffffffff] {}}}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {bad level "#-4294967295"}} {puts PASS} else {puts "FAIL uplevel-4.20"}
+# case: uplevel-4.21 cmd=apply
+set __judge_c [catch {
+    apply {{} {uplevel -1 {}}}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {bad level "-1"}} {puts PASS} else {puts "FAIL uplevel-4.21"}
 # case: uplevel-4.22 cmd=apply
 set __judge_c [catch {
     apply {{} {uplevel #-1 {}}}
 } __judge_r]
 if {$__judge_c == 1 && $__judge_r eq {bad level "#-1"}} {puts PASS} else {puts "FAIL uplevel-4.22"}
+# case: uplevel-4.23 cmd=apply
+set __judge_c [catch {
+    apply {{} {uplevel [expr -1] {}}}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {bad level "-1"}} {puts PASS} else {puts "FAIL uplevel-4.23"}
 # case: uplevel-4.24 cmd=apply
 set __judge_c [catch {
     apply {{} {uplevel #[expr -1] {}}}
@@ -147,11 +177,21 @@ set __judge_c [catch {
     apply {{} {uplevel #[expr 0xffffffff] {}}}
 } __judge_r]
 if {$__judge_c == 1 && $__judge_r eq {bad level "#4294967295"}} {puts PASS} else {puts "FAIL uplevel-4.28"}
+# case: uplevel-4.29 cmd=apply
+set __judge_c [catch {
+    apply {{} {uplevel 0.2 {}}}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {invalid command name "0.2"}} {puts PASS} else {puts "FAIL uplevel-4.29"}
 # case: uplevel-4.30 cmd=apply
 set __judge_c [catch {
     apply {{} {uplevel #0.2 {}}}
 } __judge_r]
 if {$__judge_c == 1 && $__judge_r eq {bad level "#0.2"}} {puts PASS} else {puts "FAIL uplevel-4.30"}
+# case: uplevel-4.31 cmd=apply
+set __judge_c [catch {
+    apply {{} {uplevel [expr 0.2] {}}}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {invalid command name "0.2"}} {puts PASS} else {puts "FAIL uplevel-4.31"}
 # case: uplevel-4.32 cmd=apply
 set __judge_c [catch {
     apply {{} {uplevel #[expr 0.2] {}}}
@@ -167,6 +207,11 @@ set __judge_c [catch {
     apply {{} {uplevel #.2 {}}}
 } __judge_r]
 if {$__judge_c == 1 && $__judge_r eq {bad level "#.2"}} {puts PASS} else {puts "FAIL uplevel-4.34"}
+# case: uplevel-4.35 cmd=apply
+set __judge_c [catch {
+    apply {{} {uplevel [expr .2] {}}}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {invalid command name "0.2"}} {puts PASS} else {puts "FAIL uplevel-4.35"}
 # case: uplevel-4.36 cmd=apply
 set __judge_c [catch {
     apply {{} {uplevel #[expr .2] {}}}

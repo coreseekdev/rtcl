@@ -287,8 +287,379 @@ set __judge_c [catch {
     }} {a b c}
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {a b A c}} {puts PASS} else {puts "FAIL lreplace-5.2"}
+# case: ledit-1.1 cmd=set
+set __judge_c [catch {
+    set l {1 2 3 4 5}
+    list [ledit l 0 0 a] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{a 2 3 4 5} {a 2 3 4 5}}} {puts PASS} else {puts "FAIL ledit-1.1"}
+# case: ledit-1.2 cmd=set
+set __judge_c [catch {
+    set l {1 2 3 4 5}
+    list [ledit l 1 1 a] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{1 a 3 4 5} {1 a 3 4 5}}} {puts PASS} else {puts "FAIL ledit-1.2"}
+# case: ledit-1.3 cmd=set
+set __judge_c [catch {
+    set l {1 2 3 4 5}
+    list [ledit l 2 2 a] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{1 2 a 4 5} {1 2 a 4 5}}} {puts PASS} else {puts "FAIL ledit-1.3"}
+# case: ledit-1.4 cmd=set
+set __judge_c [catch {
+    set l {1 2 3 4 5}
+    list [ledit l 3 3 a] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{1 2 3 a 5} {1 2 3 a 5}}} {puts PASS} else {puts "FAIL ledit-1.4"}
+# case: ledit-1.5 cmd=set
+set __judge_c [catch {
+    set l {1 2 3 4 5}
+    list [ledit l 4 4 a] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{1 2 3 4 a} {1 2 3 4 a}}} {puts PASS} else {puts "FAIL ledit-1.5"}
+# case: ledit-1.6 cmd=set
+set __judge_c [catch {
+    set l {1 2 3 4 5}
+    list [ledit l 4 5 a] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{1 2 3 4 a} {1 2 3 4 a}}} {puts PASS} else {puts "FAIL ledit-1.6"}
+# case: ledit-1.7 cmd=set
+set __judge_c [catch {
+    set l {1 2 3 4 5}
+    list [ledit l -1 -1 a] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{a 1 2 3 4 5} {a 1 2 3 4 5}}} {puts PASS} else {puts "FAIL ledit-1.7"}
+# case: ledit-1.8 cmd=set
+set __judge_c [catch {
+    set l {1 2 3 4 5}
+    list [ledit l 2 end a b c d] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{1 2 a b c d} {1 2 a b c d}}} {puts PASS} else {puts "FAIL ledit-1.8"}
+# case: ledit-1.9 cmd=set
+set __judge_c [catch {
+    set l {1 2 3 4 5}
+    list [ledit l 0 3] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {5 5}} {puts PASS} else {puts "FAIL ledit-1.9"}
+# case: ledit-1.10 cmd=set
+set __judge_c [catch {
+    set l {1 2 3 4 5}
+    list [ledit l 0 4] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{} {}}} {puts PASS} else {puts "FAIL ledit-1.10"}
+# case: ledit-1.11 cmd=set
+set __judge_c [catch {
+    set l {1 2 3 4 5}
+    list [ledit l 0 1] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{3 4 5} {3 4 5}}} {puts PASS} else {puts "FAIL ledit-1.11"}
+# case: ledit-1.12 cmd=set
+set __judge_c [catch {
+    set l {1 2 3 4 5}
+    list [ledit l 2 3] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{1 2 5} {1 2 5}}} {puts PASS} else {puts "FAIL ledit-1.12"}
+# case: ledit-1.13 cmd=set
+set __judge_c [catch {
+    set l {1 2 3 4 5}
+    list [ledit l 3 end] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{1 2 3} {1 2 3}}} {puts PASS} else {puts "FAIL ledit-1.13"}
+# case: ledit-1.14 cmd=set
+set __judge_c [catch {
+    set l {1 2 3 4 5}
+    list [ledit l -1 4 a b c] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{a b c} {a b c}}} {puts PASS} else {puts "FAIL ledit-1.14"}
+# case: ledit-1.15 cmd=set
+set __judge_c [catch {
+    set l {a b "c c" d e f}
+    list [ledit l 3 3] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{a b {c c} e f} {a b {c c} e f}}} {puts PASS} else {puts "FAIL ledit-1.15"}
+# case: ledit-1.16 cmd=set
+set __judge_c [catch {
+    set l { 1 2 3 4 5}
+    list [ledit l 0 0 a] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{a 2 3 4 5} {a 2 3 4 5}}} {puts PASS} else {puts "FAIL ledit-1.16"}
+# case: ledit-1.17 cmd=set
+set __judge_c [catch {
+    set l {1 2 3 4 "5 6"}
+    list [ledit l 4 4 a] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{1 2 3 4 a} {1 2 3 4 a}}} {puts PASS} else {puts "FAIL ledit-1.17"}
+# case: ledit-1.18 cmd=set
+set __judge_c [catch {
+    set l {1 2 3 4 {5 6}}
+    list [ledit l 4 4 a] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{1 2 3 4 a} {1 2 3 4 a}}} {puts PASS} else {puts "FAIL ledit-1.18"}
+# case: ledit-1.19 cmd=set
+set __judge_c [catch {
+    set l {1 2 3 4}
+    list [ledit l 2 end x y z] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{1 2 x y z} {1 2 x y z}}} {puts PASS} else {puts "FAIL ledit-1.19"}
+# case: ledit-1.20 cmd=set
+set __judge_c [catch {
+    set l {1 2 3 4}
+    list [ledit l end end a] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{1 2 3 a} {1 2 3 a}}} {puts PASS} else {puts "FAIL ledit-1.20"}
+# case: ledit-1.21 cmd=set
+set __judge_c [catch {
+    set l {1 2 3 4}
+    list [ledit l end 3 a] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{1 2 3 a} {1 2 3 a}}} {puts PASS} else {puts "FAIL ledit-1.21"}
+# case: ledit-1.22 cmd=set
+set __judge_c [catch {
+    set l {1 2 3 4}
+    list [ledit l end end] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{1 2 3} {1 2 3}}} {puts PASS} else {puts "FAIL ledit-1.22"}
+# case: ledit-1.23 cmd=set
+set __judge_c [catch {
+    set l {1 2 3 4}
+    list [ledit l 2 -1 xy] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{1 2 xy 3 4} {1 2 xy 3 4}}} {puts PASS} else {puts "FAIL ledit-1.23"}
+# case: ledit-1.24 cmd=set
+set __judge_c [catch {
+    set l {1 2 3 4}
+    list [ledit l end -1 z] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{1 2 3 z 4} {1 2 3 z 4}}} {puts PASS} else {puts "FAIL ledit-1.24"}
+# case: ledit-1.25 cmd=set
+set __judge_c [catch {
+    set l {\}\     hello}
+    concat \"[ledit l end end]\" $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {"\}\ " \}\ }} {puts PASS} else {puts "FAIL ledit-1.25"}
+# case: ledit-1.26 cmd=catch
+set __judge_c [catch {
+    catch {unset foo}
+    set foo {a b}
+    list [ledit foo end end] $foo \
+	[ledit foo end end] $foo \
+	[ledit foo end end] $foo
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {a a {} {} {} {}}} {puts PASS} else {puts "FAIL ledit-1.26"}
+# case: ledit-1.27 cmd=set
+set __judge_c [catch {
+    set l x
+    list [ledit l 1 1] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {x x}} {puts PASS} else {puts "FAIL ledit-1.27"}
+# case: ledit-1.28 cmd=set
+set __judge_c [catch {
+    set l x
+    list [ledit l 1 1 y] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{x y} {x y}}} {puts PASS} else {puts "FAIL ledit-1.28"}
+# case: ledit-1.31 cmd=unset
+set __judge_c [catch {
+    unset -nocomplain arr
+    set arr(x) {a b}
+    list [ledit arr(x) 0 0 c] $arr(x)
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{c b} {c b}}} {puts PASS} else {puts "FAIL ledit-1.31"}
+# case: ledit-2.1 cmd=list
+set __judge_c [catch {
+    list [catch ledit msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {wrong # args: should be "ledit listVar first last ?element ...?"}}} {puts PASS} else {puts "FAIL ledit-2.1"}
+# case: ledit-2.2 cmd=unset
+set __judge_c [catch {
+    unset -nocomplain x
+    list [catch {ledit l b} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {wrong # args: should be "ledit listVar first last ?element ...?"}}} {puts PASS} else {puts "FAIL ledit-2.2"}
+# case: ledit-2.3 cmd=set
+set __judge_c [catch {
+    set x {}
+    list [catch {ledit x a 10} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {bad index "a": must be integer?[+-]integer? or end?[+-]integer?}}} {puts PASS} else {puts "FAIL ledit-2.3"}
+# case: ledit-2.4 cmd=set
+set __judge_c [catch {
+    set l {}
+    list [catch {ledit l 10 x} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {bad index "x": must be integer?[+-]integer? or end?[+-]integer?}}} {puts PASS} else {puts "FAIL ledit-2.4"}
+# case: ledit-2.5 cmd=set
+set __judge_c [catch {
+    set l {}
+    list [catch {ledit l 10 1x} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {bad index "1x": must be integer?[+-]integer? or end?[+-]integer?}}} {puts PASS} else {puts "FAIL ledit-2.5"}
+# case: ledit-2.6 cmd=set
+set __judge_c [catch {
+    set l x
+    list [catch {ledit l 3 2} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0 x}} {puts PASS} else {puts "FAIL ledit-2.6"}
+# case: ledit-2.7 cmd=set
+set __judge_c [catch {
+    set l x
+    list [catch {ledit l 2 2} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0 x}} {puts PASS} else {puts "FAIL ledit-2.7"}
+# case: ledit-2.8 cmd=unset
+set __judge_c [catch {
+    unset -nocomplain l
+    ledit l 0 0 x
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't read "l": no such variable}} {puts PASS} else {puts "FAIL ledit-2.8"}
+# case: ledit-2.9 cmd=unset
+set __judge_c [catch {
+    unset -nocomplain arr
+    ledit arr(x) 0 0 x
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't read "arr(x)": no such variable}} {puts PASS} else {puts "FAIL ledit-2.9"}
+# case: ledit-2.10 cmd=unset
+set __judge_c [catch {
+    unset -nocomplain arr
+    set arr(y) y
+    ledit arr(x) 0 0 x
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {can't read "arr(x)": no such element in array}} {puts PASS} else {puts "FAIL ledit-2.10"}
+# case: ledit-3.1 cmd=proc
+set __judge_c [catch {
+    proc p {} {
+	set l "a b c"
+	ledit l 1 1 "x y"
+	# The literal in locals table should be unmodified
+	return [list "a b c" $l]
+    }
+    p
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{a b c} {a {x y} c}}} {puts PASS} else {puts "FAIL ledit-3.1"}
+# case: ledit-4.1 cmd=set
+set __judge_c [catch {
+    set l {}
+    list [ledit l 1 1] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{} {}}} {puts PASS} else {puts "FAIL ledit-4.1"}
+# case: ledit-4.2 cmd=set
+set __judge_c [catch {
+    set l { }
+    list [ledit l 1 1] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{} {}}} {puts PASS} else {puts "FAIL ledit-4.2"}
+# case: ledit-4.3 cmd=set
+set __judge_c [catch {
+    set l {1 2 3}
+    ledit l 2 0
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 2 3}} {puts PASS} else {puts "FAIL ledit-4.3"}
+# case: ledit-4.4 cmd=set
+set __judge_c [catch {
+    set l {1 2 3 4 5}
+    list [ledit l 3 1] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{1 2 3 4 5} {1 2 3 4 5}}} {puts PASS} else {puts "FAIL ledit-4.4"}
 # case: ledit-4.5 cmd=lreplace
 set __judge_c [catch {
     lreplace {1 2 3 4 5} 3 0 _
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {1 2 3 _ 4 5}} {puts PASS} else {puts "FAIL ledit-4.5"}
+# case: ledit-4.6 cmd=set
+set __judge_c [catch {
+    set l {0 1 2 3 4}
+    list [ledit l 0 end-2] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{3 4} {3 4}}} {puts PASS} else {puts "FAIL ledit-4.6"}
+# case: ledit-4.6.1 cmd=set
+set __judge_c [catch {
+    set l {0 1 2 3 4}
+    list [ledit l 0 end-2 a b c] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{a b c 3 4} {a b c 3 4}}} {puts PASS} else {puts "FAIL ledit-4.6.1"}
+# case: ledit-4.7 cmd=set
+set __judge_c [catch {
+    set l {0 1 2 3 4}
+    list [ledit l end-2 end-1] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{0 1 4} {0 1 4}}} {puts PASS} else {puts "FAIL ledit-4.7"}
+# case: ledit-4.7.1 cmd=set
+set __judge_c [catch {
+    set l {0 1 2 3 4}
+    list [ledit l end-2 end-1 a b c] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{0 1 a b c 4} {0 1 a b c 4}}} {puts PASS} else {puts "FAIL ledit-4.7.1"}
+# case: ledit-4.8 cmd=set
+set __judge_c [catch {
+    set l {0 1 2 3 4}
+    list [ledit l end-2 end-2] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{0 1 3 4} {0 1 3 4}}} {puts PASS} else {puts "FAIL ledit-4.8"}
+# case: ledit-4.8.1 cmd=set
+set __judge_c [catch {
+    set l {0 1 2 3 4}
+    list [ledit l end-2 end-2 a b c] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{0 1 a b c 3 4} {0 1 a b c 3 4}}} {puts PASS} else {puts "FAIL ledit-4.8.1"}
+# case: ledit-4.9 cmd=set
+set __judge_c [catch {
+    set l {0 1 2 3 4}
+    list [ledit l end-2 end-3] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{0 1 2 3 4} {0 1 2 3 4}}} {puts PASS} else {puts "FAIL ledit-4.9"}
+# case: ledit-4.9.1 cmd=set
+set __judge_c [catch {
+    set l {0 1 2 3 4}
+    list [ledit l end-2 end-3 a b c] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{0 1 a b c 2 3 4} {0 1 a b c 2 3 4}}} {puts PASS} else {puts "FAIL ledit-4.9.1"}
+# case: ledit-4.10 cmd=set
+set __judge_c [catch {
+    set l {0 1 2 3 4}
+    list [ledit l 2 2] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{0 1 3 4} {0 1 3 4}}} {puts PASS} else {puts "FAIL ledit-4.10"}
+# case: ledit-4.10.1 cmd=set
+set __judge_c [catch {
+    set l {0 1 2 3 4}
+    list [ledit l 2 2 a b c] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{0 1 a b c 3 4} {0 1 a b c 3 4}}} {puts PASS} else {puts "FAIL ledit-4.10.1"}
+# case: ledit-4.11 cmd=set
+set __judge_c [catch {
+    set l {0 1 2 3 4}
+    list [ledit l end-2 1 a b c] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{0 1 a b c 2 3 4} {0 1 a b c 2 3 4}}} {puts PASS} else {puts "FAIL ledit-4.11"}
+# case: ledit-4.12 cmd=set
+set __judge_c [catch {
+    set l {0 1 2 3 4}
+    list [ledit l end-2 2 a b c] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {{0 1 a b c 3 4} {0 1 a b c 3 4}}} {puts PASS} else {puts "FAIL ledit-4.12"}
+# case: ledit-4.13 cmd=set
+set __judge_c [catch {
+    set l {}
+    list [ledit l 1 1 1] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 1}} {puts PASS} else {puts "FAIL ledit-4.13"}
+# case: ledit-4.14 cmd=set
+set __judge_c [catch {
+    set l {}
+    list [ledit l 2 2 2] $l
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {2 2}} {puts PASS} else {puts "FAIL ledit-4.14"}
+# case: ledit-5.1 cmd=apply
+set __judge_c [catch {
+    apply {x {
+	ledit x end 0
+    }} {a b c}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {a b c}} {puts PASS} else {puts "FAIL ledit-5.1"}
+# case: ledit-5.2 cmd=apply
+set __judge_c [catch {
+    apply {x {
+	ledit x end 0 A
+    }} {a b c}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {a b A c}} {puts PASS} else {puts "FAIL ledit-5.2"}

@@ -338,6 +338,13 @@ set __judge_c [catch {
     foo
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {1 {"x" isn't an array}}} {puts PASS} else {puts "FAIL set-old-8.5"}
+# case: set-old-8.6 cmd=catch
+set __judge_c [catch {
+    catch {unset a}
+    set a(22) 3
+    list [catch {array gorp a} msg] $msg
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 {unknown or ambiguous subcommand "gorp": must be anymore, default, donesearch, exists, for, get, names, nextelement, set, size, startsearch, statistics, or unset}}} {puts PASS} else {puts "FAIL set-old-8.6"}
 # case: set-old-8.7 cmd=catch
 set __judge_c [catch {
     catch {unset a}

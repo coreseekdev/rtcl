@@ -8,3 +8,15 @@ set __judge_c [catch {
     unset x
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL obj-32.1"}
+# case: obj-33.3 cmd=set
+set __judge_c [catch {
+    set x 0x10000; append x 0000
+    list [string is integer $x] [expr { wide($x) }]
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 4294967296}} {puts PASS} else {puts "FAIL obj-33.3"}
+# case: obj-33.7 cmd=set
+set __judge_c [catch {
+    set x -0x10000; append x 0000
+    list [string is integer $x] [expr { wide($x) }]
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {1 -4294967296}} {puts PASS} else {puts "FAIL obj-33.7"}

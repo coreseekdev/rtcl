@@ -19,3 +19,24 @@ set __judge_c [catch {
     format %g .000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {0}} {puts PASS} else {puts "FAIL get-2.4"}
+# case: get-3.1 cmd=?
+set __judge_c [catch {
+    # SF bug #634856
+    set result ""
+    set numbers [list 1 +1 ++1 +-1 -+1 -1 --1 "- +1" "+12345678987654321" "++12345678987654321"]
+    foreach num $numbers {
+	lappend result [catch {format %ld $num} msg] $msg
+    }
+    set result
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0 1 0 1 1 {expected integer but got "++1"} 1 {expected integer but got "+-1"} 1 {expected integer but got "-+1"} 0 -1 1 {expected integer but got "--1"} 1 {expected integer but got a list} 0 12345678987654321 1 {expected integer but got "++12345678987654321"}}} {puts PASS} else {puts "FAIL get-3.1"}
+# case: get-3.2 cmd=set
+set __judge_c [catch {
+    set result ""
+    set numbers [list 1.0 +1.0 ++1.0 +-1.0 -+1.0 -1.0 --1.0 "- +1.0"]
+    foreach num $numbers {
+	lappend result [catch {format %g $num} msg] $msg
+    }
+    set result
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {0 1 0 1 1 {expected floating-point number but got "++1.0"} 1 {expected floating-point number but got "+-1.0"} 1 {expected floating-point number but got "-+1.0"} 0 -1 1 {expected floating-point number but got "--1.0"} 1 {expected floating-point number but got a list}}} {puts PASS} else {puts "FAIL get-3.2"}

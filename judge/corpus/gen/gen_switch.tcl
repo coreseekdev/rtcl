@@ -114,6 +114,11 @@ set __judge_c [catch {
     }
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {exact}} {puts PASS} else {puts "FAIL switch-3.5"}
+# case: switch-3.6 cmd=switch
+set __judge_c [catch {
+    switch -foo a b c
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {bad option "-foo": must be -exact, -glob, -indexvar, -integer, -matchvar, -nocase, -regexp, or --}} {puts PASS} else {puts "FAIL switch-3.6"}
 # case: switch-3.7 cmd=switch
 set __judge_c [catch {
     switch -exact -nocase aaaab {
@@ -195,6 +200,21 @@ set __judge_c [catch {
     switch -regexp -glob Foo Foo {set result OK}
 } __judge_r]
 if {$__judge_c == 1 && $__judge_r eq {bad option "-glob": -regexp option already found}} {puts PASS} else {puts "FAIL switch-3.18"}
+# case: switch-3.19 cmd=switch
+set __judge_c [catch {
+    switch -glob -integer Foo Foo {set result OK}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {bad option "-integer": -glob option already found}} {puts PASS} else {puts "FAIL switch-3.19"}
+# case: switch-3.20 cmd=switch
+set __judge_c [catch {
+    switch -integer -glob Foo Foo {set result OK}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {bad option "-glob": -integer option already found}} {puts PASS} else {puts "FAIL switch-3.20"}
+# case: switch-3.21 cmd=switch
+set __judge_c [catch {
+    switch -integer -nocase Foo Foo {set result OK}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {-nocase option cannot be used with -integer option}} {puts PASS} else {puts "FAIL switch-3.21"}
 # case: switch-4.1 cmd=list
 set __judge_c [catch {
     list [catch {switch a a {error "Just a test"} default {subst 1}} msg] \
@@ -232,6 +252,15 @@ if {$__judge_c == 0 && $__judge_r eq {1 switch2 {switch2
     ("default" arm line 1)
     invoked from within
 "switch foo a {error switch1} b {error switch 3}  default {error switch2}"}}} {puts PASS} else {puts "FAIL switch-4.5"}
+# case: switch-5.1 cmd=switch
+set __judge_c [catch {
+    switch -regexp aaaab {
+	*b	{subst glob}
+	aaaab	{subst exact}
+	default	{subst none}
+    }
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {cannot compile regular expression pattern: invalid quantifier operand}} {puts PASS} else {puts "FAIL switch-5.1"}
 # case: switch-6.1 cmd=switch
 set __judge_c [catch {
     switch -exact {\a\$\.\[} {
@@ -714,3 +743,143 @@ set __judge_c [catch {
     set result
 } __judge_r]
 if {$__judge_c == 0 && $__judge_r eq {ac a {} c}} {puts PASS} else {puts "FAIL switch-14.17"}
+# case: switch-16.1 cmd=switch
+set __judge_c [catch {
+    switch -integer 0x1 01 {string cat ok}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {ok}} {puts PASS} else {puts "FAIL switch-16.1"}
+# case: switch-16.2 cmd=switch
+set __judge_c [catch {
+    switch -integer 0x1 0 {error early} 01 {string cat ok}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {ok}} {puts PASS} else {puts "FAIL switch-16.2"}
+# case: switch-16.3 cmd=switch
+set __judge_c [catch {
+    switch -integer 0x1 0 {error early} 01 {string cat ok} default {error late}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {ok}} {puts PASS} else {puts "FAIL switch-16.3"}
+# case: switch-16.4 cmd=switch
+set __judge_c [catch {
+    switch -integer 0x1 0 {error early} default {string cat ok}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {ok}} {puts PASS} else {puts "FAIL switch-16.4"}
+# case: switch-16.5 cmd=switch
+set __judge_c [catch {
+    switch -integer 0x1 0 {error body}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL switch-16.5"}
+# case: switch-16.6 cmd=switch
+set __judge_c [catch {
+    switch -integer 0x1 gorp {error body}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {expected integer but got "gorp"}} {puts PASS} else {puts "FAIL switch-16.6"}
+# case: switch-16.7 cmd=switch
+set __judge_c [catch {
+    switch -integer gorp 0 {error body}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {expected integer but got "gorp"}} {puts PASS} else {puts "FAIL switch-16.7"}
+# case: switch-17.1 cmd=switch
+set __judge_c [catch {
+    switch -integer 0x1 {01 {string cat ok}}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {ok}} {puts PASS} else {puts "FAIL switch-17.1"}
+# case: switch-17.2 cmd=switch
+set __judge_c [catch {
+    switch -integer 0x1 {0 {error early} 01 {string cat ok}}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {ok}} {puts PASS} else {puts "FAIL switch-17.2"}
+# case: switch-17.3 cmd=switch
+set __judge_c [catch {
+    switch -integer 0x1 {0 {error early} 01 {string cat ok} default {error late}}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {ok}} {puts PASS} else {puts "FAIL switch-17.3"}
+# case: switch-17.4 cmd=switch
+set __judge_c [catch {
+    switch -integer 0x1 {0 {error early} default {string cat ok}}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {ok}} {puts PASS} else {puts "FAIL switch-17.4"}
+# case: switch-17.5 cmd=switch
+set __judge_c [catch {
+    switch -integer 0x1 {0 {error body}}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL switch-17.5"}
+# case: switch-17.6 cmd=switch
+set __judge_c [catch {
+    switch -integer 0x1 {gorp {error body}}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {expected integer but got "gorp"}} {puts PASS} else {puts "FAIL switch-17.6"}
+# case: switch-17.7 cmd=switch
+set __judge_c [catch {
+    switch -integer gorp {0 {error body}}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {expected integer but got "gorp"}} {puts PASS} else {puts "FAIL switch-17.7"}
+# case: switch-18.1 cmd=switch
+set __judge_c [catch {
+    switch -integer -- 0x1 01 {string cat ok}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {ok}} {puts PASS} else {puts "FAIL switch-18.1"}
+# case: switch-18.2 cmd=switch
+set __judge_c [catch {
+    switch -integer -- 0x1 0 {error early} 01 {string cat ok}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {ok}} {puts PASS} else {puts "FAIL switch-18.2"}
+# case: switch-18.3 cmd=switch
+set __judge_c [catch {
+    switch -integer -- 0x1 0 {error early} 01 {string cat ok} default {error late}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {ok}} {puts PASS} else {puts "FAIL switch-18.3"}
+# case: switch-18.4 cmd=switch
+set __judge_c [catch {
+    switch -integer -- 0x1 0 {error early} default {string cat ok}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {ok}} {puts PASS} else {puts "FAIL switch-18.4"}
+# case: switch-18.5 cmd=switch
+set __judge_c [catch {
+    switch -integer -- 0x1 0 {error body}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL switch-18.5"}
+# case: switch-18.6 cmd=switch
+set __judge_c [catch {
+    switch -integer -- 0x1 gorp {error body}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {expected integer but got "gorp"}} {puts PASS} else {puts "FAIL switch-18.6"}
+# case: switch-18.7 cmd=switch
+set __judge_c [catch {
+    switch -integer -- gorp 0 {error body}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {expected integer but got "gorp"}} {puts PASS} else {puts "FAIL switch-18.7"}
+# case: switch-19.1 cmd=switch
+set __judge_c [catch {
+    switch -integer -- 0x1 {01 {string cat ok}}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {ok}} {puts PASS} else {puts "FAIL switch-19.1"}
+# case: switch-19.2 cmd=switch
+set __judge_c [catch {
+    switch -integer -- 0x1 {0 {error early} 01 {string cat ok}}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {ok}} {puts PASS} else {puts "FAIL switch-19.2"}
+# case: switch-19.3 cmd=switch
+set __judge_c [catch {
+    switch -integer -- 0x1 {0 {error early} 01 {string cat ok} default {error late}}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {ok}} {puts PASS} else {puts "FAIL switch-19.3"}
+# case: switch-19.4 cmd=switch
+set __judge_c [catch {
+    switch -integer -- 0x1 {0 {error early} default {string cat ok}}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {ok}} {puts PASS} else {puts "FAIL switch-19.4"}
+# case: switch-19.5 cmd=switch
+set __judge_c [catch {
+    switch -integer -- 0x1 {0 {error body}}
+} __judge_r]
+if {$__judge_c == 0 && $__judge_r eq {}} {puts PASS} else {puts "FAIL switch-19.5"}
+# case: switch-19.6 cmd=switch
+set __judge_c [catch {
+    switch -integer -- 0x1 {gorp {error body}}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {expected integer but got "gorp"}} {puts PASS} else {puts "FAIL switch-19.6"}
+# case: switch-19.7 cmd=switch
+set __judge_c [catch {
+    switch -integer -- gorp {0 {error body}}
+} __judge_r]
+if {$__judge_c == 1 && $__judge_r eq {expected integer but got "gorp"}} {puts PASS} else {puts "FAIL switch-19.7"}

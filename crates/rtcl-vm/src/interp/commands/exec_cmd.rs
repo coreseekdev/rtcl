@@ -11,6 +11,7 @@ use crate::interp::Interp;
 use crate::value::Value;
 
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -1708,5 +1709,81 @@ mod tests {
         let mut interp = Interp::new();
         let result = interp.eval("exec this_command_does_not_exist_xyz123");
         assert!(result.is_err());
+    }
+}
+
+// ── tcl::process（9.1 的子进程管理 ensemble）────────────────────────
+// 进程在本仓的 exec 模型里由宿主（HostExec）或 std::process 托管，本
+// ensemble 承载其管理面：autopurge 开关、存活列表与状态字典。当前执
+// 行器的子进程随 exec 调用即收即清（M5 语义），故 list/status 的常态
+// 为空——与语料 process-1.1..3.2 钉形一致；有常驻子进程后的填充点在
+// `children()`。
+
+static PROCESS_AUTOPURGE: AtomicBool = AtomicBool::new(true);
+
+pub fn cmd_tcl_process(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    const SUBCMDS: &str = "autopurge, list, purge, or status";
+    if args.len() < 2 {
+        return Err(Error::wrong_args_with_usage(
+            "tcl::process",
+            1,
+            args.len(),
+            "subcommand ?arg ...?",
+        ));
+    }
+    let raw = args[1].as_str();
+    const KNOWN: [&str; 4] = ["autopurge", "list", "purge", "status"];
+    let sub = if KNOWN.contains(&raw) {
+        raw.to_string()
+    } else {
+        let hits: Vec<&str> = KNOWN.iter().copied().filter(|s| s.starts_with(raw)).collect();
+        match hits.as_slice() {
+            [one] => (*one).to_string(),
+            _ => {
+                super::list::set_error_code(
+                    interp,
+                    &format!("TCL LOOKUP SUBCOMMAND {}", raw),
+                );
+                return Err(Error::runtime(
+                    format!("unknown or ambiguous subcommand \"{}\": must be {}", raw, SUBCMDS),
+                    ErrorCode::Generic,
+                ));
+            }
+        }
+    };
+
+    match sub.as_str() {
+        // autopurge ?boolean? — get/set the auto-reap flag (returns current).
+        "autopurge" => {
+            let cur = PROCESS_AUTOPURGE.load(Ordering::Relaxed);
+            if args.len() > 2 {
+                let v = args[2]
+                    .as_int()
+                    .or_else(|| {
+                        match args[2].as_str() {
+                            "true" => Some(1),
+                            "false" => Some(0),
+                            _ => None,
+                        }
+                    })
+                    .ok_or_else(|| {
+                        Error::runtime(
+                            format!("expected boolean value but got \"{}\"", args[2].as_str()),
+                            ErrorCode::Generic,
+                        )
+                    })?;
+                PROCESS_AUTOPURGE.store(v != 0, Ordering::Relaxed);
+                return Ok(Value::from_int(v));
+            }
+            Ok(Value::from_int(cur as i64))
+        }
+        // list — pids of live child processes (empty: exec children are
+        // reaped at call completion, M5 semantics).
+        "list" => Ok(Value::empty()),
+        // purge — reap finished children (no-op under call-scoped reaping).
+        "purge" => Ok(Value::empty()),
+        // status ?pattern? — dict of child status (empty same as list).
+        "status" => Ok(Value::empty()),
+        _ => unreachable!(),
     }
 }

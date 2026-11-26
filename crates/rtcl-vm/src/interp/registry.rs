@@ -277,6 +277,8 @@ static CMD_TABLE_IO: &[CmdEntry] = &[
 static CMD_TABLE_EXEC: &[CmdEntry] = &[
     CmdEntry { name: "exec",  func: exec_cmd::cmd_exec, cat: Extension, cmd_id: Some(CmdId::Exec as u16), usage: "?-option ...? arg ?arg ...?", help: "Execute a system command with I/O redirections" },
     CmdEntry { name: "job",   func: exec_cmd::cmd_job,  cat: Extension, cmd_id: None,                     usage: "list|stop|resume|fg|bg|kill|wait ?job-id?", help: "Manage background jobs" },
+    // tcl::process（9.1 子进程管理 ensemble；子进程面属 exec 特性域）
+    CmdEntry { name: "tcl::process", func: exec_cmd::cmd_tcl_process, cat: Standard, cmd_id: None, usage: "subcommand ?arg ...?", help: "Manage child processes (autopurge/list/purge/status)" },
     CmdEntry { name: "wait",  func: os::cmd_wait,       cat: Extension, cmd_id: None,                     usage: "?-nohang? ?pid?",  help: "Wait for a process" },
 ];
 

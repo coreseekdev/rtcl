@@ -366,16 +366,116 @@ impl<'a> Iterator for DictValues<'a> {
     }
 }
 
+// ── D4：字符串 rep = 字节 + 惰性 char_len ─────────────────────
+
+/// Sentinel of [`StringRep::char_len`]: "not computed yet"（字符数达到
+/// usize::MAX 需要 2^63 字节的串，物理不可达）。
+const CHAR_LEN_UNKNOWN: usize = usize::MAX;
+
+/// The string representation of a heap box: the lazily materialized bytes
+/// and the lazily computed UTF-8 char length, bound into ONE unit (D4).
+///
+/// 绑定的理由（审计 §3.4 / HANDOFF §3.4「每个改写入口都要把计数作废」
+/// 的结构性解法）：改写入口清点的结论是——字节的**原地**写全仓只有
+/// `append_str_in_place` 一处（增量维护），其余三处让字节整体失效的
+/// 站点（`as_list_mut`/`as_dict_mut`/`set_int_rep`）写的都是
+/// `string = StringRep::new()` 整体换新。字节与计数捆绑后，「换了字节
+/// 忘了作废计数」在结构上不可能发生：计数要么随新字节归 UNKNOWN，要么
+/// 在 append 里跟字节一起长。此外全部其余改写入口（str_replace/map/
+/// trim 族/case 族/reverse/range 截断/format/binary/concat/…）产出的
+/// 都是新箱（`from_str`/`from_string`），缓存天然从 UNKNOWN 起步。
+///
+/// 共享箱（rc > 1）写 `char_len`（`Cell`，&self 可写）是安全的：字节
+/// 受 COW 保护不变（`heap_make_mut` 先深拷），缓存是字节的纯函数，
+/// 各共享者读到的字节相同，计数亦同。
+///
+/// 代价：`ValueInner` 每箱 +8 字节（box 池上限 8192 箱 → 最坏 +64KB，
+/// 热集后实际驻留远小于此）。`Value` 本体的 8 字节标记字不动（红线：
+/// 审计 §3.4 与 Agent.md——标记字余量不进位，指针掩码会污染全部热径）。
+#[derive(Debug, Clone)]
+struct StringRep {
+    /// Bytes — lazily materialized via `OnceCell`.  Empty cell means it
+    /// will be generated on first `as_str()` access from `rep` (like
+    /// jimtcl's `bytes == NULL`).
+    bytes: OnceCell<SmallVec<[u8; INLINE_SIZE]>>,
+    /// UTF-8 码点数（D4）：CHAR_LEN_UNKNOWN = 未算。语义按 rtcl 既有
+    /// 口径 = `chars().count()`（T7 的 SWAR 连续字节计数：合法 UTF-8
+    /// 中字符数 ≡ 非连续字节数，两者逐位同值）。
+    char_len: Cell<usize>,
+}
+
+impl StringRep {
+    /// Fresh cell with no bytes and no count（改写失效与惰性构造共用）。
+    #[inline]
+    fn new() -> Self {
+        StringRep { bytes: OnceCell::new(), char_len: Cell::new(CHAR_LEN_UNKNOWN) }
+    }
+
+    /// Fresh cell with known bytes; the count stays lazy (a big literal
+    /// nobody length-queries pays no eager scan).
+    #[inline]
+    fn with_bytes(b: SmallVec<[u8; INLINE_SIZE]>) -> Self {
+        StringRep { bytes: OnceCell::from(b), char_len: Cell::new(CHAR_LEN_UNKNOWN) }
+    }
+}
+
+/// The number of UTF-8 characters in `s` — its byte length where all its
+/// bytes are characters（ASCII 一步到位），otherwise T7's SWAR
+/// continuation count subtracted from the byte length（24KB 两字节文本
+/// 3.1µs 一档，重算地板）。
+#[inline]
+pub(crate) fn char_len_of(s: &str) -> usize {
+    if s.is_ascii() {
+        s.len()
+    } else {
+        s.len() - count_continuations(s.as_bytes())
+    }
+}
+
+/// UTF-8 continuation bytes (0x80..0xBF) in `bytes`, eight at a time:
+/// per u64 word, `(b ^ 0x80) & 0xC0 == 0` marks a continuation byte,
+/// and the strlen-style zero-byte mask `(w - 0x0101..) & !w & 0x8080..`
+/// marks exactly those (a borrow entering a non-zero byte keeps the
+/// marker clear: `y - 1 ≥ 0x80 ∧ y ≤ 0x7F` is impossible).  T7 实证
+/// 形（bench/BASELINE「P15 string last 三处」）。
+pub(crate) fn count_continuations(bytes: &[u8]) -> usize {
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const TOP2: u64 = 0xC0C0_C0C0_C0C0_C0C0;
+    let (chunks, rem) = bytes.as_chunks::<8>();
+    let mut cont = 0usize;
+    for &c in chunks {
+        let word = u64::from_le_bytes(c);
+        let w = (word ^ HI) & TOP2;
+        cont += ((w.wrapping_sub(LO)) & !w & HI).count_ones() as usize;
+    }
+    for &b in rem {
+        cont += ((b & 0xC0) == 0x80) as usize;
+    }
+    cont
+}
+
+/// D4 等价红线自检（release 构建零成本——`cfg!` 常量假，整体消去）：
+/// debug 构建里每次 `char_len` 读取都与当场重算对拍，缓存失效漏网
+/// （改写入口置无效不全）当场断言，而不是等输出漂移。debug 测试套件
+/// （workspace 1481 项）因此全程带验。
+#[inline]
+fn d4_selfcheck(v: &Value, cached: usize) {
+    if cfg!(debug_assertions) {
+        let fresh = char_len_of(v.as_str());
+        assert_eq!(fresh, cached, "D4 char_len 缓存与重算不一致（缓存失效漏网）");
+    }
+}
+
 /// Inner data shared via `Rc`.
 ///
 /// Corresponds to jimtcl's `Jim_Obj` minus the free-list pointers —
 /// Rust's allocator handles recycling.
 #[derive(Debug)]
 struct ValueInner {
-    /// String representation — lazily materialized via `OnceCell`.
-    /// Empty cell means it will be generated on first `as_str()` access
-    /// from `rep` (like jimtcl's `bytes == NULL`).
-    string: OnceCell<SmallVec<[u8; INLINE_SIZE]>>,
+    /// String representation (bytes + lazy char length, D4) — bytes are
+    /// lazily materialized via `OnceCell`.
+    string: StringRep,
     /// Cached typed representation.
     rep: InternalRep,
     /// Reference count (jimtcl's `refCount`).  Owned by [`VPtr`]; a
@@ -787,19 +887,19 @@ impl fmt::Debug for Value {
 
 thread_local! {
     static CACHED_EMPTY: VPtr = VPtr::new(ValueInner {
-        string: OnceCell::from(SmallVec::new()),
+        string: StringRep::with_bytes(SmallVec::new()),
         rep: InternalRep::None,
         rc: Cell::new(1),
     });
 
     static CACHED_BOOL_TRUE: VPtr = VPtr::new(ValueInner {
-        string: OnceCell::from(SmallVec::from_slice(b"1")),
+        string: StringRep::with_bytes(SmallVec::from_slice(b"1")),
         rep: InternalRep::Bool(true),
         rc: Cell::new(1),
     });
 
     static CACHED_BOOL_FALSE: VPtr = VPtr::new(ValueInner {
-        string: OnceCell::from(SmallVec::from_slice(b"0")),
+        string: StringRep::with_bytes(SmallVec::from_slice(b"0")),
         rep: InternalRep::Bool(false),
         rc: Cell::new(1),
     });
@@ -821,7 +921,7 @@ impl Value {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         Value::from_vptr(VPtr::new(ValueInner {
-                string: OnceCell::from(SmallVec::from_slice(s.as_bytes())),
+                string: StringRep::with_bytes(SmallVec::from_slice(s.as_bytes())),
                 rep: InternalRep::None,
                 rc: Cell::new(1),
             }))
@@ -832,7 +932,7 @@ impl Value {
     #[allow(clippy::should_implement_trait)]
     pub fn from_string(s: String) -> Self {
         Value::from_vptr(VPtr::new(ValueInner {
-                string: OnceCell::from(SmallVec::from_vec(s.into_bytes())),
+                string: StringRep::with_bytes(SmallVec::from_vec(s.into_bytes())),
                 rep: InternalRep::None,
                 rc: Cell::new(1),
             }))
@@ -848,7 +948,7 @@ impl Value {
             return Value::from_imm(n);
         }
         Value::from_vptr(VPtr::new(ValueInner {
-            string: OnceCell::new(),
+            string: StringRep::new(),
             rep: InternalRep::Int(n),
             rc: Cell::new(1),
         }))
@@ -864,7 +964,7 @@ impl Value {
             return Value::from_int(n);
         }
         Value::from_vptr(VPtr::new(ValueInner {
-            string: OnceCell::new(),
+            string: StringRep::new(),
             rep: InternalRep::Big(Rc::new(b)),
             rc: Cell::new(1),
         }))
@@ -887,7 +987,7 @@ impl Value {
     /// Create a value from a float
     pub fn from_float(n: f64) -> Self {
         Value::from_vptr(VPtr::new(ValueInner {
-                string: OnceCell::new(),
+                string: StringRep::new(),
                 rep: InternalRep::Float(n),
                 rc: Cell::new(1),
             }))
@@ -909,7 +1009,7 @@ impl Value {
     /// accessed structurally (e.g. `lindex`, `lappend`).
     pub fn from_list_cached(items: Vec<Value>) -> Self {
         Value::from_vptr(VPtr::new(ValueInner {
-            string: OnceCell::new(), // lazy — generated on first as_str()
+            string: StringRep::new(), // lazy — generated on first as_str()
             rep: InternalRep::List(items),
             rc: Cell::new(1),
         }))
@@ -920,7 +1020,7 @@ impl Value {
     /// The string representation is lazily generated on first `as_str()`.
     pub fn from_dict_cached(entries: DictMap) -> Self {
         Value::from_vptr(VPtr::new(ValueInner {
-                string: OnceCell::new(),
+                string: StringRep::new(),
                 rep: InternalRep::Dict(entries),
                 rc: Cell::new(1),
             }))
@@ -933,7 +1033,7 @@ impl Value {
             map.insert(k.as_str().to_string(), v.clone());
         }
         Value::from_vptr(VPtr::new(ValueInner {
-                string: OnceCell::new(),
+                string: StringRep::new(),
                 rep: InternalRep::Dict(DictMap::Ordered(map)),
                 rc: Cell::new(1),
             }))
@@ -960,7 +1060,7 @@ impl Value {
     /// 引用起算。无背板注册时宿主侧根本拿不到 idx，此构造器不会被触达。
     pub fn from_host_str(idx: u32) -> Self {
         Value::from_vptr(VPtr::new(ValueInner {
-            string: OnceCell::new(), // JsOnly：字节未物化
+            string: StringRep::new(), // JsOnly：字节未物化
             rep: InternalRep::HostStr(idx),
             rc: Cell::new(1),
         }))
@@ -1016,7 +1116,7 @@ impl Value {
             // whose box now holds the rendering.
             let n = self.imm();
             let fresh = VPtr::new(ValueInner {
-                string: OnceCell::from(SmallVec::from_slice(format_int(n).as_bytes())),
+                string: StringRep::with_bytes(SmallVec::from_slice(format_int(n).as_bytes())),
                 rep: InternalRep::Int(n),
                 rc: Cell::new(1),
             });
@@ -1024,7 +1124,7 @@ impl Value {
             std::mem::forget(fresh); // rc 1 transfers into `bits`
         }
         let inner = unsafe { self.heap_inner() };
-        let bytes = inner.string.get_or_init(|| {
+        let bytes = inner.string.bytes.get_or_init(|| {
             match &inner.rep {
                 InternalRep::List(items) => {
                     materialize_below(items.iter());
@@ -1059,6 +1159,37 @@ impl Value {
         unsafe { core::str::from_utf8_unchecked(bytes) }
     }
 
+    /// The string's length in characters (UTF-8 scalar values) — the D4
+    /// cached read.
+    ///
+    /// 命中 O(1)；未命中按 [`char_len_of`]（T7 SWAR）重算一次并缓存，
+    /// 计数落在本箱 `StringRep`（与字节同生命周期）。语义与既有口径
+    /// 逐位同值（`chars().count()` ≡ 字节数 − SWAR 连续字节数，合法
+    /// UTF-8 双射）；等价红线由 debug 构建的逐调用自检兜底（见
+    /// `d4_selfcheck`），探针与 fuzz 对 oracle 再对一层。
+    ///
+    /// 共享箱写缓存（`Cell`）的安全性：字节受 COW 保护，缓存是字节的
+    /// 纯函数——见 [`StringRep`] 文档。
+    pub fn char_len(&self) -> usize {
+        if self.is_imm() {
+            // 立即数渲染恒为 ASCII 十进制——字节长即字符长（顺带完成
+            // imm → 堆箱的一次性升级，与 as_str 同一状态机）。
+            return self.as_str().len();
+        }
+        if self.is_unset() {
+            return 0;
+        }
+        let cached = unsafe { self.heap_inner() }.string.char_len.get();
+        if cached != CHAR_LEN_UNKNOWN {
+            d4_selfcheck(self, cached);
+            return cached;
+        }
+        let n = char_len_of(self.as_str());
+        unsafe { self.heap_inner() }.string.char_len.set(n);
+        d4_selfcheck(self, n);
+        n
+    }
+
     /// Append `text` to this value's string in place, and drop nothing
     /// else: `false` when the value is anything but a plain string (an
     /// integer, a list, …) or an immediate, and the caller must build the
@@ -1068,6 +1199,10 @@ impl Value {
     /// it is shared).  Appending in place is what keeps a loop of appends
     /// linear: the variable's buffer grows instead of being rebuilt from
     /// both halves on every call.
+    ///
+    /// D4：这是全仓唯一的**原地**字节改写入口（改写入口清点，见
+    /// StringRep 文档）——char_len 已知时增量维护（O(len(text))，与
+    /// extend 同阶；追加文本本就要过一遍），未知则保持惰性，不强算。
     pub(crate) fn append_str_in_place(&mut self, text: &str) -> bool {
         if self.is_imm() {
             return false;
@@ -1078,9 +1213,13 @@ impl Value {
         }
         // Materialised first: an empty string nobody has asked the bytes
         // of has no buffer yet.
-        let _ = inner.string.get_or_init(SmallVec::new);
-        if let Some(bytes) = inner.string.get_mut() {
+        let _ = inner.string.bytes.get_or_init(SmallVec::new);
+        if let Some(bytes) = inner.string.bytes.get_mut() {
             bytes.extend_from_slice(text.as_bytes());
+            let cl = inner.string.char_len.get();
+            if cl != CHAR_LEN_UNKNOWN {
+                inner.string.char_len.set(cl + char_len_of(text));
+            }
         }
         true
     }
@@ -1293,7 +1432,7 @@ impl Value {
             return None;
         }
         let inner = self.heap_make_mut();
-        inner.string = OnceCell::new(); // invalidate string
+        inner.string = StringRep::new(); // invalidate string（D4：计数随字节一起作废）
         match &mut inner.rep {
             InternalRep::Dict(map) => Some(map),
             _ => None,
@@ -1313,7 +1452,7 @@ impl Value {
             return None;
         }
         let inner = self.heap_make_mut();
-        inner.string = OnceCell::new(); // invalidate string
+        inner.string = StringRep::new(); // invalidate string（D4：计数随字节一起作废）
         match &mut inner.rep {
             InternalRep::List(items) => Some(items),
             _ => None,
@@ -1339,7 +1478,7 @@ impl Value {
         }
         let inner = self.heap_make_mut();
         inner.rep = InternalRep::Int(n);
-        inner.string = OnceCell::new(); // invalidate string
+        inner.string = StringRep::new(); // invalidate string（D4：计数随字节一起作废）
     }
 
     /// Do both handles point at the same `ValueInner` allocation?
@@ -1427,7 +1566,7 @@ impl Value {
             return false;
         }
         let inner = unsafe { self.heap_inner() };
-        if let Some(bytes) = inner.string.get() {
+        if let Some(bytes) = inner.string.bytes.get() {
             bytes.is_empty()
         } else {
             match &inner.rep {
@@ -1643,7 +1782,7 @@ fn pending_frame(v: &Value) -> Option<Frame<'_>> {
         return None;
     }
     let inner = unsafe { v.heap_inner() };
-    if inner.string.get().is_some() {
+    if inner.string.bytes.get().is_some() {
         return None;
     }
     match &inner.rep {

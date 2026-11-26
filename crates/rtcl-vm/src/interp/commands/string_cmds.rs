@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use crate::interp::commands::list::{bad_index, parse_tcl_index, tcl_get_int};
 use crate::interp::unicode;
 use crate::interp::{glob_match, Interp};
-use crate::value::Value;
+use crate::value::{char_len_of, count_continuations, Value};
 
 /// tclsh's `string` ensemble in canonical order (used verbatim in the
 /// unknown-subcommand message). `byterange` is an rtcl extension and is
@@ -392,7 +392,9 @@ pub fn cmd_string(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     };
 
     match subcmd.as_str() {
-        "length" => Ok(Value::from_int(char_count(str_val) as i64)),
+        // D4：字符长度走 Value 的惰性缓存——命中 O(1)，未命中 SWAR 一次
+        // 后落箱；str_val 已在上面 as_str 物化，这里只读计数。
+        "length" => Ok(Value::from_int(args[2].char_len() as i64)),
         "bytelength" => Ok(Value::from_int(str_val.len() as i64)),
         "tolower" => string_case_range(interp, str_val, args, CaseMode::Lower),
         "toupper" => string_case_range(interp, str_val, args, CaseMode::Upper),
@@ -413,7 +415,8 @@ pub fn cmd_string(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() != 5 {
                 return Err(Error::wrong_args("string range", 5, args.len()));
             }
-            let len = char_count(str_val);
+            // D4：字符长度缓存（命中 O(1)）；两端的字节偏移从近的一端数。
+            let len = args[2].char_len();
             let start_raw = match parse_tcl_index(args[3].as_str(), len) {
                 Some(v) => v,
                 None => return Err(bad_index(interp, args[3].as_str())),
@@ -431,6 +434,7 @@ pub fn cmd_string(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     str_val,
                     start as usize,
                     end as usize + 1,
+                    len,
                 )))
             } else {
                 Ok(Value::empty())
@@ -440,17 +444,25 @@ pub fn cmd_string(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() != 4 {
                 return Err(Error::wrong_args("string index", 4, args.len()));
             }
-            // Only `end` needs the length; a number goes straight to its
-            // character.  (The whole string was collected first: every
-            // `string index` on a 24KB string cost 8µs.)
+            // D4：字符长度缓存后 total 命中 O(1)——end 口径的解析与
+            // 非 ASCII 定位（char_byte_offset 从近的一端走）都拿它当
+            // 全长基准；ASCII 仍一步到位。
             let index = args[3].as_str();
-            let len = || char_count(str_val);
-            match parse_tcl_index(index, if super::list::index_is_from_end(index) { len() } else { 0 }) {
+            let total = args[2].char_len();
+            match parse_tcl_index(index, if super::list::index_is_from_end(index) { total } else { 0 }) {
                 Some(idx) if idx >= 0 => {
                     let found = if str_val.is_ascii() {
                         str_val.as_bytes().get(idx as usize).map(|b| *b as char)
-                    } else {
+                    } else if (idx as usize) * 2 <= total {
+                        // 前半（含正中）：chars().nth 正向（实测
+                        // 0.12ns/字符——与 D4 前同径；手写/char_indices
+                        // 边界走慢数倍）。
                         str_val.chars().nth(idx as usize)
+                    } else {
+                        // 尾端近：从尾倒走定位字符边界再取一个字符
+                        // （D4：total 缓存命中，倒走 O(end−idx)）。
+                        let off = char_byte_offset(str_val, idx as usize, total);
+                        str_val[off..].chars().next()
                     };
                     Ok(found.map_or_else(Value::empty, |c| Value::from_str(&c.to_string())))
                 }
@@ -553,7 +565,8 @@ pub fn cmd_string(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // string first needleString haystackString ?startIndex?
             let needle = args[2].as_str();
             let haystack = args[3].as_str();
-            let len = char_count(haystack);
+            // D4：缓存命中 O(1)（未命中 SWAR 重算一次落箱）。
+            let len = args[3].char_len();
             let start = if args.len() > 4 {
                 match parse_tcl_index(args[4].as_str(), len) {
                     Some(v) => v.max(0) as usize,
@@ -563,19 +576,20 @@ pub fn cmd_string(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 0
             };
             // The library's search, over bytes: a match of a valid UTF-8
-            // needle lies on a character boundary, so the offset counts
-            // back to characters in one pass.  (The search compared a
-            // slice at every position, after collecting the text.)
+            // needle lies on a character boundary, so the offset converts
+            // back to characters with the D4 two-sided count (a late hit
+            // counts the tiny suffix against the cached total instead of
+            // re-walking the whole prefix).
             let pos = if needle.is_empty()
                 || needle.len() > haystack.len()
                 || start > haystack.len() - needle.len()
             {
                 None
             } else {
-                let from = char_byte_offset(haystack, start);
+                let from = char_byte_offset(haystack, start, len);
                 haystack[from..]
                     .find(needle)
-                    .map(|at| start + haystack[from..from + at].chars().count())
+                    .map(|at| char_index_of_byte(haystack, from + at, len))
             };
             Ok(Value::from_int(pos.map_or(-1, |i| i as i64)))
         }
@@ -588,22 +602,22 @@ pub fn cmd_string(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let haystack = args[3].as_str();
             // A match must end at or before lastIndex (default: end of
             // string).  The char count is only needed for an explicit
-            // index (P15: char_count/char_byte_offset each re-scanned
-            // the string per call; the default path now scans nothing
-            // but the search itself).  For ASCII the char count IS the
-            // byte length and char indexes are byte offsets.
+            // index — D4 缓存后命中 O(1)，非 ASCII 的字节→字符回数也从
+            // 近的一端走（T7 的 SWAR 地板 3.1µs → 缓存后只在改写后的
+            // 首次查询出现）。For ASCII the char count IS the byte
+            // length and char indexes are byte offsets.
+            let total = args[3].char_len();
             let upto = if args.len() > 4 {
                 let ascii = haystack.is_ascii();
-                let len = if ascii { haystack.len() } else { haystack.chars().count() };
-                match parse_tcl_index(args[4].as_str(), len) {
+                match parse_tcl_index(args[4].as_str(), total) {
                     // Negative index: no character is at or before it.
                     Some(i) if i < 0 => return Ok(Value::from_int(-1)),
                     Some(i) => {
-                        let last = (i as usize).min(len.saturating_sub(1));
+                        let last = (i as usize).min(total.saturating_sub(1));
                         if ascii {
-                            (last + 1).min(len)
+                            (last + 1).min(total)
                         } else {
-                            char_byte_offset(haystack, last + 1)
+                            char_byte_offset(haystack, last + 1, total)
                         }
                     }
                     None => return Err(bad_index(interp, args[4].as_str())),
@@ -615,7 +629,7 @@ pub fn cmd_string(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let pos = if needle.is_empty() || needle.len() > haystack.len() {
                 None
             } else {
-                str_rfind(haystack, needle, upto).map(|at| char_index_of_byte(haystack, at))
+                str_rfind(haystack, needle, upto).map(|at| char_index_of_byte(haystack, at, total))
             };
             Ok(Value::from_int(pos.map_or(-1, |i| i as i64)))
         }
@@ -1019,51 +1033,21 @@ fn truncate_chars(s: &str, length: Option<usize>) -> String {
     }
 }
 
-/// The length of `s` in characters — its byte length where all its
-/// bytes are characters.
-fn char_count(s: &str) -> usize {
-    if s.is_ascii() {
-        s.len()
-    } else {
-        s.chars().count()
-    }
-}
-
-/// UTF-8 continuation bytes (0x80..0xBF) in `bytes`, eight at a time:
-/// per u64 word, `(b ^ 0x80) & 0xC0 == 0` marks a continuation byte,
-/// and the strlen-style zero-byte mask `(w - 0x0101..) & !w & 0x8080..`
-/// marks exactly those (a borrow entering a non-zero byte keeps the
-/// marker clear: `y - 1 ≥ 0x80 ∧ y ≤ 0x7F` is impossible).
-fn count_continuations(bytes: &[u8]) -> usize {
-    const HI: u64 = 0x8080_8080_8080_8080;
-    const LO: u64 = 0x0101_0101_0101_0101;
-    const TOP2: u64 = 0xC0C0_C0C0_C0C0_C0C0;
-    let (chunks, rem) = bytes.as_chunks::<8>();
-    let mut cont = 0usize;
-    for &c in chunks {
-        let word = u64::from_le_bytes(c);
-        let w = (word ^ HI) & TOP2;
-        cont += ((w.wrapping_sub(LO)) & !w & HI).count_ones() as usize;
-    }
-    for &b in rem {
-        cont += ((b & 0xC0) == 0x80) as usize;
-    }
-    cont
-}
-
 /// The character index of byte offset `at` (a char boundary) in `s`:
-/// the offset minus its UTF-8 continuation bytes.  An ASCII prefix has
-/// none — `is_ascii`'s word-at-a-time scan answers it outright — and a
-/// non-ASCII prefix takes the SWAR masked count; the old
-/// `chars().count()` decoded every character, so a late hit on a
-/// non-ASCII string re-walked the whole prefix per call (P15: `string
-/// last` 14µs vs tclsh 0.2 on 24KB).
-fn char_index_of_byte(s: &str, at: usize) -> usize {
-    let bytes = &s.as_bytes()[..at];
-    if bytes.is_ascii() {
-        return at;
+/// the offset minus its UTF-8 continuation bytes, counted from the
+/// nearer end (D4: `total` is the cached whole-string char length, so a
+/// late offset counts the tiny suffix instead of re-walking the whole
+/// prefix — T7's SWAR floor 3.1µs/24KB drops to O(min(at, len−at))
+/// bytes on either side).  The two answers are the same number: chars
+/// ≡ bytes − continuations over any char-boundary slice of valid
+/// UTF-8.
+fn char_index_of_byte(s: &str, at: usize, total: usize) -> usize {
+    let suffix = s.len() - at;
+    if suffix < at {
+        total - char_len_of(&s[at..])
+    } else {
+        at - count_continuations(&s.as_bytes()[..at])
     }
-    at - count_continuations(bytes)
 }
 
 /// Reverse substring search over `hay[..end]` (`end` a char boundary):
@@ -1135,18 +1119,54 @@ fn rmemchr_byte(bytes: &[u8], b: u8) -> Option<usize> {
     None
 }
 
-/// The byte offset of character `ci` (`s.len()` past the end).
-fn char_byte_offset(s: &str, ci: usize) -> usize {
+/// The byte offset where character `ci` starts (`s.len()` past the
+/// end), counted from the nearer end: `total` is the cached whole-string
+/// char length (D4), so `end-10`-shaped offsets take ~10 backward steps
+/// instead of a whole-string boundary walk (rng-uni was 15µs/op on
+/// 24KB).  ASCII stays the byte offset.  The walk is value-free — skip
+/// continuation bytes, no decode — and lands on the same boundary the
+/// forward `char_indices` walk named (both answers are THE char
+/// boundary of the same ordinal).
+fn char_byte_offset(s: &str, ci: usize, total: usize) -> usize {
     if s.is_ascii() {
-        (ci).min(s.len())
+        return ci.min(s.len());
+    }
+    let ci = ci.min(total);
+    let from_end = total - ci;
+    let bytes = s.as_bytes();
+    // 尾端明显更近才倒走（2:1 偏向头端）：倒走每字符要退着找前导字节
+    // （内层连续字节循环 + is_char_boundary 检查），每步比头端的
+    // 「一次 utf8_char_len 跳过」贵约一倍——正中（end-6000/6000 形）
+    // 倒走反而 3 倍慢，实测钉形。
+    if from_end * 2 < ci {
+        // 尾端近：从串尾向前找第 from_end 个字符边界（s.len() 是"其后
+        // 0 个字符"的边界，退一步即末字符起点）。
+        let mut i = bytes.len();
+        let mut left = from_end;
+        while left > 0 {
+            i -= 1;
+            while !s.is_char_boundary(i) {
+                i -= 1;
+            }
+            left -= 1;
+        }
+        i
     } else {
-        s.char_indices().map(|(b, _)| b).nth(ci).unwrap_or(s.len())
+        // 头端近：值无关的边界走（每字符一次 utf8_char_len 跳过，不解
+        // 码；实测 ~0.4ns/字符，比 char_indices().nth 快约一倍）。
+        let mut i = 0usize;
+        let mut left = ci;
+        while left > 0 {
+            i += utf8_char_len(bytes[i]);
+            left -= 1;
+        }
+        i.min(bytes.len())
     }
 }
 
 /// `s` from character `start` up to (not including) character `end`.
-fn char_slice(s: &str, start: usize, end: usize) -> &str {
-    &s[char_byte_offset(s, start)..char_byte_offset(s, end)]
+fn char_slice(s: &str, start: usize, end: usize, total: usize) -> &str {
+    &s[char_byte_offset(s, start, total)..char_byte_offset(s, end, total)]
 }
 
 /// A word character: alphanumeric or underscore (jimtcl convention).

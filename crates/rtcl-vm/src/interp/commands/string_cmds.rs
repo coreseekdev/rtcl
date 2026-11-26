@@ -711,46 +711,75 @@ pub fn cmd_string(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if args.len() != 4 {
                 return Err(Error::wrong_args("string repeat", 4, args.len()));
             }
-            // Tcl_GetInt semantics — a single (trimmed) integer literal,
-            // no `int+int` chains: `string repeat ab 1+2` errors with
-            // `expected integer but got "1+2"` (probed).
-            let count = match tcl_get_int(args[3].as_str()) {
-                Some(n) => n,
+            // 9.1 的 count 是 Tcl_Size（64 位）：有效整数超 i64（bignum）
+            // 报 `integer value too large to represent` + ARITH IOVERFLOW，
+            // 不是数字报 `expected integer but got "…"` + TCL VALUE
+            // NUMBER（`string repeat ab 1+2` 仍是后者，实测钉形）——都在
+            // 分配之前。
+            let count = match crate::types::bignum::parse_int(args[3].as_str().trim()) {
+                Some(crate::types::bignum::IntRep::I64(n)) => n,
+                Some(_) => {
+                    super::list::set_error_code(
+                        interp,
+                        "ARITH IOVERFLOW {integer value too large to represent}",
+                    );
+                    return Err(Error::runtime(
+                        "integer value too large to represent".to_string(),
+                        crate::error::ErrorCode::Generic,
+                    ));
+                }
                 None => {
+                    super::list::set_error_code(interp, "TCL VALUE NUMBER");
                     return Err(Error::runtime(
                         format!("expected integer but got \"{}\"", args[3].as_str()),
-                        crate::error::ErrorCode::InvalidOp,
-                    ))
-                }
-            };
-            if count > i32::MAX as i64 || count < i32::MIN as i64 {
-                // tclsh parses the count as a C `int`.
-                super::list::set_error_code(
-                    interp,
-                    "ARITH IOVERFLOW {integer value too large to represent}",
-                );
-                return Err(Error::runtime(
-                    "integer value too large to represent".to_string(),
-                    crate::error::ErrorCode::Generic,
-                ));
-            }
-            if count < 0 {
-                return Ok(Value::empty());
-            }
-            // Result length is checked up front (tclsh: `result exceeds max
-            // size for a Tcl value (2147483647 bytes)`) and the allocation
-            // is fallible: the unchecked `repeat` was a capacity panic or
-            // an aborting allocation on `string repeat x 4294967296`.
-            let total = match (count as usize).checked_mul(str_val.len()) {
-                Some(n) if n <= super::list::MAX_VALUE_BYTES => n,
-                _ => {
-                    super::list::set_error_code(interp, "TCL MEMORY");
-                    return Err(Error::runtime(
-                        "result exceeds max size for a Tcl value (2147483647 bytes)".to_string(),
                         crate::error::ErrorCode::Generic,
                     ));
                 }
             };
+            if count < 0 {
+                return Ok(Value::empty());
+            }
+            // 空串的任意次重复是空串（TclStringRepeat 的 length == 0
+            // 早退；也免去 4G 次空 push 的空转）。
+            if str_val.is_empty() {
+                return Ok(Value::empty());
+            }
+            // tclsh 9.1（TclStringRepeat）：count 超过 `TCL_SIZE_MAX-1`
+            // 在分配前报 `max size for a Tcl value (9223372036854775807
+            // bytes) exceeded` + TCL MEMORY；其后真去 alloc，失败报
+            // `string size overflow: unable to alloc N bytes` + TCL
+            // MEMORY。rtcl 急切物化，2 GiB 的预算之下按后者的形状拒绝
+            // （预算内的分配仍可失败——fallible reserve，绝不中止进程）。
+            let total = match (count as u128).checked_mul(str_val.len() as u128) {
+                Some(t) if t > (i64::MAX - 1) as u128 => {
+                    super::list::set_error_code(interp, "TCL MEMORY");
+                    return Err(Error::runtime(
+                        format!(
+                            "max size for a Tcl value ({} bytes) exceeded",
+                            i64::MAX
+                        ),
+                        crate::error::ErrorCode::Generic,
+                    ));
+                }
+                Some(t) => t as usize,
+                None => {
+                    super::list::set_error_code(interp, "TCL MEMORY");
+                    return Err(Error::runtime(
+                        format!(
+                            "max size for a Tcl value ({} bytes) exceeded",
+                            i64::MAX
+                        ),
+                        crate::error::ErrorCode::Generic,
+                    ));
+                }
+            };
+            if total > super::list::MAX_VALUE_BYTES {
+                super::list::set_error_code(interp, "TCL MEMORY");
+                return Err(Error::runtime(
+                    format!("string size overflow: unable to alloc {total} bytes"),
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
             let mut out = String::new();
             out.try_reserve(total)
                 .map_err(|_| super::list::out_of_memory(interp, total))?;

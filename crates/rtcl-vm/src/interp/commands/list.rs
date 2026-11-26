@@ -129,28 +129,44 @@ pub(crate) fn tcl_get_int(s: &str) -> Option<i64> {
 /// a string value is at most INT_MAX bytes, a list at most 536870909
 /// elements. `string repeat` and `lrepeat` report an exceedance as a
 /// `TCL MEMORY` error instead of attempting the allocation.
+///
+/// 9.1 迁移注记：9.x 的长度是 64 位（Tcl_Size），这两个常数不再是
+/// tclsh 的上限——lrepeat 的真上限是 `TCL91_LIST_MAX`（见下），string
+/// repeat 的真上限是 `TCL_SIZE_MAX` 字节。它们降格为 **rtcl 的物化
+/// 预算**：tclsh 9 对大 lrepeat 走惰性 lrepeatType 表示（不逐元素
+/// 分配）、对巨 string repeat 真去 alloc；rtcl 一律急切物化，超过预算
+/// 的按 9.1 的错误形状拒绝（形状逐字节可比，数字是预算本身），绝不
+/// 进入不可捕获的分配中止。
 pub(crate) const MAX_VALUE_BYTES: usize = i32::MAX as usize;
 pub(crate) const MAX_LIST_ELEMENTS: usize = 536870909;
 
-/// A repeat/element count argument in tclsh's range (C `int`, either
-/// sign): outside it tclsh raises `integer value too large to represent`
-/// (`ARITH IOVERFLOW`) before anything is allocated. The unchecked
-/// product of such a count was a capacity panic or an aborting
-/// allocation here.
+/// tclsh 9.1.0（x86-64）的 `LIST_MAX`：tclInt.h 的
+/// `(TCL_SIZE_MAX - offsetof(ListStore, slots)) / sizeof(Tcl_Obj *)`，
+/// 实测 `lrepeat 9223372036854775807 x` 报
+/// `max length (1152921504606846970) of a Tcl list exceeded`。
+pub(crate) const TCL91_LIST_MAX: u64 = 1152921504606846970;
+
+/// A repeat/element count in Tcl 9's range（`Tcl_Size`，64 位有符号——
+/// 8.6 的 C `int` 上限已随 TIP 626 移除，`4294967296` 是合法 count）：
+/// 有效整数但超出 i64（bignum）报 `integer value too large to
+/// represent`（ARITH IOVERFLOW），不是数字报 `expected integer but
+/// got "…"`（TCL VALUE NUMBER）——都在分配之前（实测钉形）。
 pub(crate) fn tcl_count(interp: &mut Interp, v: &Value) -> Result<i64> {
     match v.as_int() {
-        Some(n) if n >= i32::MIN as i64 && n <= i32::MAX as i64 => Ok(n),
-        Some(_) => {
-            set_error_code(
-                interp,
-                "ARITH IOVERFLOW {integer value too large to represent}",
-            );
-            Err(tcl_err("integer value too large to represent"))
-        }
-        None => Err(tcl_err(format!(
-            "expected integer but got \"{}\"",
-            v.as_str()
-        ))),
+        Some(n) => Ok(n),
+        None => match crate::types::bignum::parse_int(v.as_str().trim()) {
+            Some(_) => {
+                set_error_code(
+                    interp,
+                    "ARITH IOVERFLOW {integer value too large to represent}",
+                );
+                Err(tcl_err("integer value too large to represent"))
+            }
+            None => {
+                set_error_code(interp, "TCL VALUE NUMBER");
+                Err(tcl_err(format!("expected integer but got \"{}\"", v.as_str())))
+            }
+        },
     }
 }
 
@@ -417,15 +433,23 @@ pub fn cmd_lrepeat(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if elements.is_empty() {
         return Ok(Value::empty());
     }
-    // The result length is checked up front (tclsh: `max length of a Tcl
-    // list (536870909 elements) exceeded`), and the allocation is fallible.
-    let total = count
-        .checked_mul(elements.len())
-        .filter(|&n| n <= MAX_LIST_ELEMENTS)
-        .ok_or_else(|| {
-            set_error_code(interp, "TCL MEMORY");
-            tcl_err("max length of a Tcl list (536870909 elements) exceeded")
-        })?;
+    // tclsh 9.1 checks `objc > LIST_MAX/repeatCount` before building
+    // (Tcl_ListObjRepeat) and reports `max length (N) of a Tcl list
+    // exceeded` with TCL MEMORY.  rtcl materializes eagerly, so a second,
+    // smaller budget applies below LIST_MAX — the same message shape with
+    // the budget as the number (tclsh never errors inside its budget, so
+    // that band has no byte-comparable oracle).
+    let over = |interp: &mut Interp, max: u64| -> Error {
+        set_error_code(interp, "TCL MEMORY");
+        tcl_err(format!("max length ({max}) of a Tcl list exceeded"))
+    };
+    let total = match count.checked_mul(elements.len()) {
+        Some(t) if t as u64 <= TCL91_LIST_MAX => t,
+        _ => return Err(over(interp, TCL91_LIST_MAX)),
+    };
+    if total > MAX_LIST_ELEMENTS {
+        return Err(over(interp, MAX_LIST_ELEMENTS as u64));
+    }
     let mut result = Vec::new();
     result
         .try_reserve(total)

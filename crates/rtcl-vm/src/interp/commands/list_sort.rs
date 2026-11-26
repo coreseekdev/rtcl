@@ -628,16 +628,14 @@ fn parse_tcl_double(s: &str) -> Option<f64> {
         _ => (1.0f64, t),
     };
     let lower = body.to_ascii_lowercase();
-    if let Some(hex) = lower.strip_prefix("0x") {
-        let v = i64::from_str_radix(hex, 16).ok()?;
-        return Some(sign * v as f64);
-    }
     match lower.as_str() {
         "inf" | "infinity" => return Some(sign * f64::INFINITY),
         "nan" => return Some(f64::NAN),
         _ => {}
     }
-    body.parse::<f64>().ok()
+    // The shared 9.1 grammar: prefixed integers coerce, `_` separators
+    // are legal between digits (`lsort -real {1_5 2.5}` sorts 15.0).
+    crate::types::bignum::parse_float_str(t)
 }
 
 /// One parsed `-index` entry: plain integer, or `end` offset (negative
@@ -1643,19 +1641,23 @@ mod tests {
     // -- numeric key parsing mirrors TclGetWideIntFromObj/GetDouble (probes) --
 
     #[test]
-    fn test_lsort_integer_legacy_octal() {
+    fn test_lsort_integer_leading_zero_decimal() {
+        // 9.1 重钉（digits91 批，oracle 实测 `lsort -integer {010 8 10}`）：
+        // 0NNN 按十进制（010=10、09=9），legacy octal 已废除；字符串
+        // 表示原样保留（`8 09 017`、`8 010 10`）。
         let mut interp = Interp::new();
         assert_eq!(
             interp.eval("lsort -integer {010 8 10}").unwrap().as_str(),
-            "010 8 10"
+            "8 010 10"
         );
-    }
-
-    #[test]
-    fn test_lsort_integer_bad_octal_is_error() {
-        let mut interp = Interp::new();
-        let e = interp.eval("lsort -integer {09 8}").unwrap_err();
-        assert!(e.to_string().contains("expected integer but got \"09\""), "{}", e);
+        assert_eq!(
+            interp.eval("lsort -integer {09 8}").unwrap().as_str(),
+            "8 09"
+        );
+        assert_eq!(
+            interp.eval("lsort -integer {0o17 8}").unwrap().as_str(),
+            "8 0o17"
+        );
     }
 
     #[test]

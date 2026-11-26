@@ -140,13 +140,16 @@ fn string_is_eval(class: &str, s: &str, strict: bool) -> (bool, Option<usize>) {
             Some(true) => (true, None),
             _ => (false, Some(0)),
         },
+        // 9.1 重钉（digits91 批，oracle 实测）：`string is integer`
+        // 接受任意宽度整数（bignum 含——Tcl 9 的 integer 类不再是 8.6
+        // 的 32 位口径）；`wideinteger` 是带符号 64 位界
+        //（-2^63..2^63-1，-9223372036854775808 合法）；`entier` 无界。
         "integer" => match scan_tcl_integer(s) {
-            Ok((_, mag)) if mag <= u32::MAX as u128 => (true, None),
-            Ok(_) => (false, Some(usize::MAX)),
+            Ok(_) => (true, None),
             Err(pos) => (false, Some(pos)),
         },
         "wideinteger" => match scan_tcl_integer(s) {
-            Ok((_, mag)) if mag <= u64::MAX as u128 => (true, None),
+            Ok((_, neg, mag)) if signed_i64_fits(neg, mag) => (true, None),
             Ok(_) => (false, Some(usize::MAX)),
             Err(pos) => (false, Some(pos)),
         },
@@ -166,76 +169,65 @@ fn string_is_eval(class: &str, s: &str, strict: bool) -> (bool, Option<usize>) {
     }
 }
 
-/// Scan Tcl integer syntax. Returns (has_digits, magnitude) where overflow
-/// of the magnitude accumulator saturates (callers compare against their
-/// class bound). Err carries the `-failindex` character position.
-fn scan_tcl_integer(s: &str) -> std::result::Result<(bool, u128), usize> {
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = 0;
-    while i < chars.len() && chars[i].is_ascii_whitespace() {
-        i += 1;
+/// Signed i64 fit: -2^63 through 2^63-1 (`-9223372036854775808` is
+/// legal, `9223372036854775808` is not — oracle pins).
+fn signed_i64_fits(neg: bool, mag: u128) -> bool {
+    if neg {
+        mag <= (i64::MAX as u128) + 1
+    } else {
+        mag <= i64::MAX as u128
     }
-    let start = i;
-    if i < chars.len() && (chars[i] == '+' || chars[i] == '-') {
-        i += 1;
-        if i >= chars.len() {
-            return Err(start);
-        }
+}
+
+/// Scan Tcl integer syntax (9.1 grammar — decimal leading zeros, `0d`
+/// prefixes, `_` separators; legacy octal gone). Returns (has_digits,
+/// magnitude) where overflow of the magnitude accumulator saturates
+/// (callers compare against their class bound). Err carries the
+/// `-failindex` character position: the acceptPoint of the 9.1 scanner
+/// (`12_` blames the `2`, `42x` the `x`, `1_x`/`_1` fail at 0).
+fn scan_tcl_integer(s: &str) -> std::result::Result<(bool, bool, u128), usize> {
+    // Everything before a scan's stop point is ASCII, so byte and char
+    // positions agree. Returns (has_digits, negative, magnitude).
+    let char_at = |byte: usize| s[..byte].chars().count();
+    let Some(scan) = crate::types::bignum::scan_number(s, true) else {
+        return Err(0);
+    };
+    if !scan.full {
+        return Err(char_at(scan.stop));
     }
-    let mut base: u32 = 10;
-    let mut prefix_start = None;
-    if i < chars.len() && chars[i] == '0' {
-        if i + 1 < chars.len() {
-            match chars[i + 1] {
-                'x' | 'X' => { base = 16; prefix_start = Some(i); i += 2; }
-                'b' | 'B' => { base = 2; prefix_start = Some(i); i += 2; }
-                'o' | 'O' => { base = 8; prefix_start = Some(i); i += 2; }
-                _ => { base = 8; }
-            }
-        } else {
-            base = 8;
-        }
+    let crate::types::bignum::NumPayload::Int(neg, digits, radix) = scan.payload else {
+        return Err(char_at(scan.stop));
+    };
+    if digits.is_empty() {
+        // Prefix without digits (`0x`, `0d`): tclsh blames the prefix
+        // character.
+        return Err(char_at(scan.stop));
     }
-    let digits_start = i;
     let mut mag: u128 = 0;
     let mut overflow = false;
-    while i < chars.len() {
-        let d = match chars[i].to_digit(36) {
-            Some(d) if d < base => d,
-            _ => break,
-        };
-        match mag.checked_mul(base as u128).and_then(|m| m.checked_add(d as u128)) {
+    for c in digits.chars() {
+        let d = (c as u8 - b'0') as u128;
+        match mag.checked_mul(radix as u128).and_then(|m| m.checked_add(d)) {
             Some(v) => mag = v,
             None => overflow = true,
         }
-        i += 1;
-    }
-    if i == digits_start {
-        // 0x/0b/0o without digits: tclsh blames the prefix character.
-        return Err(prefix_start.unwrap_or(start) + if prefix_start.is_some() { 1 } else { 0 });
-    }
-    while i < chars.len() && chars[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i < chars.len() {
-        return Err(i);
     }
     if overflow {
         // Saturated: callers treat this as out of range (-1 failindex).
-        return Ok((true, u128::MAX));
+        return Ok((true, neg, u128::MAX));
     }
-    Ok((true, mag))
+    Ok((true, neg, mag))
 }
 
-/// Scan Tcl double syntax: Inf/NaN, any Tcl integer form, or decimal
-/// floating point with optional exponent. Range overflow is accepted.
+/// Scan Tcl double syntax (9.1 grammar): Inf/NaN, any Tcl integer form,
+/// or decimal floating point with optional exponent; `_` separators
+/// legal between digits. Range overflow is accepted.
 fn scan_tcl_double(s: &str) -> std::result::Result<(), usize> {
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
     while i < chars.len() && chars[i].is_ascii_whitespace() {
         i += 1;
     }
-    let body_start = i;
     let mut j = i;
     if j < chars.len() && (chars[j] == '+' || chars[j] == '-') {
         j += 1;
@@ -245,56 +237,11 @@ fn scan_tcl_double(s: &str) -> std::result::Result<(), usize> {
     if matches!(rest, "inf" | "infinity" | "nan") {
         return Ok(());
     }
-    if scan_tcl_integer(s).is_ok() {
-        return Ok(());
-    }
-    // Decimal float. A leading 0 followed by a digit is octal (handled by
-    // scan_tcl_integer), so failing that is a hard error, not a decimal.
-    if j + 1 < chars.len() && chars[j] == '0' && chars[j + 1].is_ascii_digit() {
-        return Err(scan_tcl_integer(s).err().unwrap_or(1));
-    }
-    let mut k = j;
-    let mut mantissa_digits = 0;
-    while k < chars.len() && chars[k].is_ascii_digit() {
-        mantissa_digits += 1;
-        k += 1;
-    }
-    let mut had_dot = false;
-    if k < chars.len() && chars[k] == '.' {
-        had_dot = true;
-        k += 1;
-        while k < chars.len() && chars[k].is_ascii_digit() {
-            mantissa_digits += 1;
-            k += 1;
-        }
-    }
-    if mantissa_digits == 0 {
-        return Err(body_start);
-    }
-    let exp_at = k;
-    if k < chars.len() && (chars[k] == 'e' || chars[k] == 'E') {
-        k += 1;
-        if k < chars.len() && (chars[k] == '+' || chars[k] == '-') {
-            k += 1;
-        }
-        let exp_digits = k;
-        while k < chars.len() && chars[k].is_ascii_digit() {
-            k += 1;
-        }
-        if k == exp_digits {
-            return Err(exp_at);
-        }
-    }
-    if !had_dot && exp_at == k {
-        // No decimal point and no exponent: not a double unless it was a
-        // valid integer (already handled above).
-        return Err(k);
-    }
-    while k < chars.len() && chars[k].is_ascii_whitespace() {
-        k += 1;
-    }
-    if k < chars.len() {
-        return Err(k);
+    let Some(scan) = crate::types::bignum::scan_number(s, false) else {
+        return Err(0);
+    };
+    if !scan.full {
+        return Err(s[..scan.stop].chars().count());
     }
     Ok(())
 }

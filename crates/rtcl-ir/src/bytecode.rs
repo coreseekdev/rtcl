@@ -70,8 +70,8 @@ pub struct CmdSite {
 /// resolve by name against the same storage.
 #[derive(Debug, Clone)]
 pub struct VarTarget {
-    pub slot: Option<u16>,
-    pub name_idx: u16,
+    pub slot: Option<u32>,
+    pub name_idx: u32,
 }
 
 /// Compile-time resolved shape of one `foreach`/`lmap`: the var-list
@@ -120,7 +120,7 @@ pub struct ByteCode {
     /// lines: ~90% of the whole run in the scan + memcmp). Insert order
     /// of `locals` (the slot numbering contract) is unchanged; the map
     /// only mirrors it.
-    local_index: std::collections::HashMap<Box<str>, u16>,
+    local_index: std::collections::HashMap<Box<str>, u32>,
     /// Source line corresponding to each instruction (parallel to `ops`).
     line_map: Vec<u32>,
     /// foreach/lmap loop shapes, referenced by the `Foreach*` ops.
@@ -222,6 +222,17 @@ impl Clone for ByteCode {
     }
 }
 
+/// D2 第二步宽门：融合产物保持 u16 操作数（16 字节枚举包络不涨）；
+/// 捕获自宽化 canonical op（LoadVar/LoadLocal/IncrVar/IncrLocal/
+/// IncrVarStack/IncrLocalStack/LappendVar/LappendLocal/DynCall/Call 的
+/// 操作数已 u32）的窗口，任一操作数超 u16 就拒绝融合、保留 canonical
+/// 宽窗——语义等价，只是不折成一个 op。可达代码的操作数恒 ≤
+/// u16::MAX，此门在现网代码上零触发（judge/sweep 金样不变验证）。
+#[inline]
+fn fits16(v: u32) -> bool {
+    v <= u16::MAX as u32
+}
+
 /// Comparison op → `cc` encoding shared by the superinstruction peepholes
 /// and the pair fusions (see the `AddSlotSlot` variant docs).
 fn cmp_cc_of(op: &OpCode) -> Option<u8> {
@@ -293,18 +304,11 @@ impl ByteCode {
     /// Add a string to the constant pool and return its index.
     /// If the string already exists, reuse the existing index.
     ///
-    /// The `u16` form is what the name-keyed opcodes carry: past
-    /// `u16::MAX` the unit is flagged ([`ByteCode::index_overflow`]) and
-    /// the truncated index is never used — the unit does not run. The
-    /// flag is raised here, at the consumer, not in the pool: a large
-    /// pool is fine as long as it is only pushed ([`Self::emit_push_const`]
-    /// has a wide form), which is the shape of a big literal table.
-    pub fn add_const(&mut self, s: &str) -> u16 {
-        let idx = self.add_const_wide(s);
-        if idx > u32::from(u16::MAX) {
-            self.index_overflow = true;
-        }
-        idx as u16
+    /// D2 第二步（消 C55/F1）：返回 `u32`——名字键 op 的操作数已宽化，
+    /// 65535+ 条名字引用照常编译，不再置 [`ByteCode::index_overflow`]
+    /// 回落（旧 u16 截断旗标随 F1 退役）。
+    pub fn add_const(&mut self, s: &str) -> u32 {
+        self.add_const_wide(s)
     }
 
     /// Add a string to the constant pool and return its wide (u32) index.
@@ -320,8 +324,9 @@ impl ByteCode {
     }
 
     /// An operand the instruction set cannot carry (see
-    /// [`ByteCode::index_overflow`]); set by the pool and the locals table
-    /// themselves, and by a compiler hand-rolling a count.
+    /// [`ByteCode::index_overflow`]).  D2 第二步后操作数全部宽化，三个
+    /// u16 来源（常量/局部/argc）已关——此旗标仅保留给未来的真上限
+    /// （资源上限语义不变），当前无发射点会置位。
     pub fn mark_index_overflow(&mut self) {
         self.index_overflow = true;
     }
@@ -342,8 +347,8 @@ impl ByteCode {
         }
     }
 
-    /// Look up a constant by index.
-    pub fn get_const(&self, idx: u16) -> Option<&str> {
+    /// Look up a constant by index (u32 — wide pool path, D2 第二步).
+    pub fn get_const(&self, idx: u32) -> Option<&str> {
         self.constants.get(idx as usize).map(|s| s.as_str())
     }
 
@@ -434,27 +439,21 @@ impl ByteCode {
 
     /// Register a local variable name and return its slot index.
     ///
-    /// Slot operands are `u16`: once the table holds every addressable
-    /// slot it stops growing, the unit is flagged
-    /// ([`ByteCode::index_overflow`]) and `u16::MAX` comes back — never a
-    /// valid slot, and the unit never runs. (`idx as u16` used to wrap a
-    /// 70,000th local onto slot 4464.)
-    pub fn add_local(&mut self, name: &str) -> u16 {
+    /// D2 第二步（消 C55/F1）：槽号 `u32`——65535+ 个局部名照常编译，
+    /// 不再封顶回落（`idx as u16` 曾把第 70,000 个局部绕回槽 4464；
+    /// 随后 F1 的 u16 上限旗标退役）。
+    pub fn add_local(&mut self, name: &str) -> u32 {
         if let Some(&idx) = self.local_index.get(name) {
             return idx;
         }
-        if self.locals.len() >= u32::from(u16::MAX) as usize {
-            self.index_overflow = true;
-            return u16::MAX;
-        }
-        let idx = self.locals.len() as u16;
+        let idx = self.locals.len() as u32;
         self.locals.push(name.to_string());
         self.local_index.insert(name.into(), idx);
         idx
     }
 
     /// Look up a local by name.
-    pub fn find_local(&self, name: &str) -> Option<u16> {
+    pub fn find_local(&self, name: &str) -> Option<u32> {
         self.local_index.get(name).copied()
     }
 
@@ -606,33 +605,47 @@ impl ByteCode {
                     Some((OpCode::CmpVarImmJumpFalse(*a, *k, *cc, *t), 2))
                 }
                 // ── name-keyed superinstructions ────────────────────────
-                (OpCode::LoadVar(a), OpCode::PushInt(k)) if tail_free(3) => {
+                (OpCode::LoadVar(a), OpCode::PushInt(k))
+                    if tail_free(3) && fits16(*a) =>
+                {
                     match self.ops[i + 2].clone() {
-                        OpCode::Add => Some((OpCode::AddVarImm(*a, *k), 3)),
-                        op => cmp_cc_of(&op).map(|cc| (OpCode::CmpVarImm(*a, *k, cc), 3)),
+                        OpCode::Add => Some((OpCode::AddVarImm(*a as u16, *k), 3)),
+                        op => cmp_cc_of(&op)
+                            .map(|cc| (OpCode::CmpVarImm(*a as u16, *k, cc), 3)),
                     }
                 }
-                (OpCode::PushInt(k), OpCode::LoadVar(b)) if tail_free(3) => {
+                (OpCode::PushInt(k), OpCode::LoadVar(b))
+                    if tail_free(3) && fits16(*b) =>
+                {
                     cmp_cc_of(&self.ops[i + 2])
-                        .map(|cc| (OpCode::CmpVarImm(*b, *k, cmp_cc_mirror(cc)), 3))
+                        .map(|cc| (OpCode::CmpVarImm(*b as u16, *k, cmp_cc_mirror(cc)), 3))
                 }
-                (OpCode::LoadVar(a), OpCode::LoadVar(b)) if tail_free(3) => {
+                (OpCode::LoadVar(a), OpCode::LoadVar(b))
+                    if tail_free(3) && fits16(*a) && fits16(*b) =>
+                {
                     match self.ops[i + 2].clone() {
-                        OpCode::Add => Some((OpCode::AddVarVar(*a, *b), 3)),
-                        op => cmp_cc_of(&op).map(|cc| (OpCode::CmpVarVar(*a, *b, cc), 3)),
+                        OpCode::Add => Some((OpCode::AddVarVar(*a as u16, *b as u16), 3)),
+                        op => cmp_cc_of(&op)
+                            .map(|cc| (OpCode::CmpVarVar(*a as u16, *b as u16, cc), 3)),
                     }
                 }
                 // ── name-keyed lappend statement ────────────────────────
-                (OpCode::LoadVar(s), OpCode::LappendVar(d)) if tail_free(3) => {
+                (OpCode::LoadVar(s), OpCode::LappendVar(d))
+                    if tail_free(3) && fits16(*s) && fits16(*d) =>
+                {
                     match self.ops[i + 2] {
-                        OpCode::Pop => Some((OpCode::LappendVarVar(*s, *d), 3)),
+                        OpCode::Pop => Some((OpCode::LappendVarVar(*s as u16, *d as u16), 3)),
                         _ => None,
                     }
                 }
                 // ── slot lappend statement ──────────────────────────────
-                (OpCode::LoadLocal(s), OpCode::LappendLocal(d)) if tail_free(3) => {
+                (OpCode::LoadLocal(s), OpCode::LappendLocal(d))
+                    if tail_free(3) && fits16(*s) && fits16(*d) =>
+                {
                     match self.ops[i + 2] {
-                        OpCode::Pop => Some((OpCode::LappendSlotSlot(*s, *d), 3)),
+                        OpCode::Pop => {
+                            Some((OpCode::LappendSlotSlot(*s as u16, *d as u16), 3))
+                        }
                         _ => None,
                     }
                 }
@@ -684,33 +697,45 @@ impl ByteCode {
                 {
                     Some((OpCode::ExprMarkBeginPushConst(*site, *idx), 2))
                 }
-                (OpCode::LoadLocal(a), OpCode::PushInt(k)) if tail_free(3) => {
+                (OpCode::LoadLocal(a), OpCode::PushInt(k))
+                    if tail_free(3) && fits16(*a) =>
+                {
                     match self.ops[i + 2] {
-                        OpCode::Sub => Some((OpCode::SubSlotImm(*a, *k), 3)),
+                        OpCode::Sub => Some((OpCode::SubSlotImm(*a as u16, *k), 3)),
                         _ => None,
                     }
                 }
-                (OpCode::LoadLocal(a), OpCode::LoadLocal(b)) if tail_free(3) => {
+                (OpCode::LoadLocal(a), OpCode::LoadLocal(b))
+                    if tail_free(3) && fits16(*a) && fits16(*b) =>
+                {
                     match self.ops[i + 2] {
-                        OpCode::Sub => Some((OpCode::SubSlotSlot(*a, *b), 3)),
+                        OpCode::Sub => Some((OpCode::SubSlotSlot(*a as u16, *b as u16), 3)),
                         _ => None,
                     }
                 }
-                (OpCode::SubEnd, OpCode::DynCall { argc }) if !targets[i + 1] => {
-                    Some((OpCode::SubEndDynCall(*argc), 2))
+                (OpCode::SubEnd, OpCode::DynCall { argc })
+                    if !targets[i + 1] && fits16(*argc) =>
+                {
+                    Some((OpCode::SubEndDynCall(*argc as u16), 2))
                 }
-                (OpCode::SubEnd, OpCode::Call { cmd_id, argc }) if !targets[i + 1] => {
-                    Some((OpCode::SubEndCall { cmd_id: *cmd_id, argc: *argc }, 2))
+                (OpCode::SubEnd, OpCode::Call { cmd_id, argc })
+                    if !targets[i + 1] && fits16(*argc) =>
+                {
+                    Some((OpCode::SubEndCall { cmd_id: *cmd_id, argc: *argc as u16 }, 2))
                 }
                 (OpCode::SubEnd, OpCode::Add) if !targets[i + 1] => {
                     Some((OpCode::SubEndAdd, 2))
                 }
                 // ── incr statement window (`incr var [script]`) ─────────
-                (OpCode::SubEnd, OpCode::IncrVarStack(idx)) if !targets[i + 1] => {
-                    Some((OpCode::SubEndIncrVarStack(*idx), 2))
+                (OpCode::SubEnd, OpCode::IncrVarStack(idx))
+                    if !targets[i + 1] && fits16(*idx) =>
+                {
+                    Some((OpCode::SubEndIncrVarStack(*idx as u16), 2))
                 }
-                (OpCode::SubEnd, OpCode::IncrLocalStack(slot)) if !targets[i + 1] => {
-                    Some((OpCode::SubEndIncrLocalStack(*slot), 2))
+                (OpCode::SubEnd, OpCode::IncrLocalStack(slot))
+                    if !targets[i + 1] && fits16(*slot) =>
+                {
+                    Some((OpCode::SubEndIncrLocalStack(*slot as u16), 2))
                 }
                 // ── statement windows (4-op) ────────────────────────────
                 (
@@ -801,14 +826,20 @@ impl ByteCode {
                     Some((OpCode::BeginCmdIncrVarPop(*site, *x, *k), 2))
                 }
                 // ── statement-result discards ───────────────────────────
-                (OpCode::IncrVar(x, k), OpCode::Pop) if !targets[i + 1] => {
-                    Some((OpCode::IncrVarPop(*x, *k), 2))
+                (OpCode::IncrVar(x, k), OpCode::Pop)
+                    if !targets[i + 1] && fits16(*x) =>
+                {
+                    Some((OpCode::IncrVarPop(*x as u16, *k), 2))
                 }
-                (OpCode::IncrLocal(x, k), OpCode::Pop) if !targets[i + 1] => {
-                    Some((OpCode::IncrLocalPop(*x, *k), 2))
+                (OpCode::IncrLocal(x, k), OpCode::Pop)
+                    if !targets[i + 1] && fits16(*x) =>
+                {
+                    Some((OpCode::IncrLocalPop(*x as u16, *k), 2))
                 }
-                (OpCode::StoreLocal(x), OpCode::Pop) if !targets[i + 1] => {
-                    Some((OpCode::StoreLocalPop(*x), 2))
+                (OpCode::StoreLocal(x), OpCode::Pop)
+                    if !targets[i + 1] && fits16(*x) =>
+                {
+                    Some((OpCode::StoreLocalPop(*x as u16), 2))
                 }
                 _ => None,
             };
@@ -1010,22 +1041,26 @@ impl ByteCode {
             while i + 2 < len {
                 let fused: Option<OpCode> =
                     match (&self.ops[i], &self.ops[i + 1], &self.ops[i + 2]) {
-                        (OpCode::LoadLocal(a), OpCode::LoadLocal(b), op) => {
+                        (OpCode::LoadLocal(a), OpCode::LoadLocal(b), op)
+                            if fits16(*a) && fits16(*b) =>
+                        {
                             if matches!(op, OpCode::Add) {
-                                Some(OpCode::AddSlotSlot(*a, *b))
+                                Some(OpCode::AddSlotSlot(*a as u16, *b as u16))
                             } else {
-                                cc_of(op).map(|cc| OpCode::CmpSlotSlot(*a, *b, cc))
+                                cc_of(op).map(|cc| OpCode::CmpSlotSlot(*a as u16, *b as u16, cc))
                             }
                         }
-                        (OpCode::LoadLocal(a), OpCode::PushInt(k), op) => {
+                        (OpCode::LoadLocal(a), OpCode::PushInt(k), op) if fits16(*a) => {
                             if matches!(op, OpCode::Add) {
-                                Some(OpCode::AddSlotImm(*a, *k))
+                                Some(OpCode::AddSlotImm(*a as u16, *k))
                             } else {
-                                cc_of(op).map(|cc| OpCode::CmpSlotImm(*a, *k, cc))
+                                cc_of(op).map(|cc| OpCode::CmpSlotImm(*a as u16, *k, cc))
                             }
                         }
-                        (OpCode::PushInt(k), OpCode::LoadLocal(b), op) => cc_of(op)
-                            .map(|cc| OpCode::CmpSlotImm(*b, *k, mirror(cc))),
+                        (OpCode::PushInt(k), OpCode::LoadLocal(b), op) if fits16(*b) => {
+                            cc_of(op)
+                                .map(|cc| OpCode::CmpSlotImm(*b as u16, *k, mirror(cc)))
+                        }
                         _ => None,
                     };
                 if let Some(f) = fused {
@@ -1126,9 +1161,10 @@ impl ByteCode {
         let mut i = 0;
         while i + 1 < len {
             match (&self.ops[i], &self.ops[i + 1]) {
-                // StoreVar(x) + Pop → StoreVarPop(x)
-                (OpCode::StoreVar(idx), OpCode::Pop) => {
-                    let idx = *idx;
+                // StoreVar(x) + Pop → StoreVarPop(x)（宽门：StoreVarPop
+                // 保持 u16 融合产物；超宽 idx 保留 StoreVar+Pop 原窗）
+                (OpCode::StoreVar(idx), OpCode::Pop) if fits16(*idx) => {
+                    let idx = *idx as u16;
                     self.ops[i] = OpCode::StoreVarPop(idx);
                     self.ops[i + 1] = OpCode::Nop;
                     changed = true;

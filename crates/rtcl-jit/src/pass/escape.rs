@@ -27,8 +27,11 @@ pub fn run(l1: &L1, code: &ByteCode) -> Result<(), Unsupported> {
 
     for (pc, a) in l1.ops.iter().enumerate() {
         let name_idx = match &a.op {
-            OpCode::LoadVar(i) | OpCode::StoreVar(i) | OpCode::StoreVarPop(i)
-            | OpCode::IncrVar(i, _) | OpCode::LappendVar(i) => Some(*i as u32),
+            OpCode::LoadVar(i)
+            | OpCode::StoreVar(i)
+            | OpCode::IncrVar(i, _)
+            | OpCode::LappendVar(i) => Some(*i),
+            OpCode::StoreVarPop(i) => Some(u32::from(*i)),
             _ => None,
         };
         if let Some(idx) = name_idx {

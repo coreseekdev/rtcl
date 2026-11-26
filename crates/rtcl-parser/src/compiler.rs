@@ -1273,16 +1273,6 @@ impl Compiler {
     // Tier 2 — Call (known built-in command, unified dispatch)
     // -----------------------------------------------------------------------
 
-    /// A command with more words than the `u16` argument count of
-    /// `Call`/`DynCall` carries (`list k k … ` with 70,001 words used to
-    /// call with `argc` wrapped to 4465 and read garbage off the stack):
-    /// the unit is flagged, and with it goes to the tree-walk.
-    fn note_argc_overflow(&mut self, cmd: &Command) {
-        if cmd.words.len() > u16::MAX as usize {
-            self.bytecode.mark_index_overflow();
-        }
-    }
-
     /// Compile as a Call (known built-in command by [`CmdId`]).
     fn compile_call(&mut self, cmd: &Command, name: &str) {
         let line = self.abs_line(cmd);
@@ -1291,8 +1281,9 @@ impl Compiler {
     }
 
     fn compile_call_by_id(&mut self, cmd: &Command, cmd_id: u16, line: u32) {
-        self.note_argc_overflow(cmd);
-        let argc = cmd.words.len() as u16;
+        // D2 第二步：argc 宽形（u32）——65535+ 词的命令照常编译，F1 的
+        // argc 截断旗标退役。
+        let argc = cmd.words.len() as u32;
         let has_expand = cmd.words.iter().any(|w| matches!(w, Word::Expand(_)));
 
         if has_expand {
@@ -1321,8 +1312,7 @@ impl Compiler {
 
     fn compile_dyncall(&mut self, cmd: &Command) {
         let line = self.abs_line(cmd);
-        self.note_argc_overflow(cmd);
-        let argc = cmd.words.len() as u16;
+        let argc = cmd.words.len() as u32;
         let has_expand = cmd.words.iter().any(|w| matches!(w, Word::Expand(_)));
 
         if has_expand {
@@ -1478,7 +1468,7 @@ impl crate::expr_compile::ExprSink for Compiler {
         self.bytecode.emit(op, line);
     }
 
-    fn add_const(&mut self, name: &str) -> u16 {
+    fn add_const(&mut self, name: &str) -> u32 {
         self.bytecode.add_const(name)
     }
 

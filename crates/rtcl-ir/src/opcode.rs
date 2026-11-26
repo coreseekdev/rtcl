@@ -238,12 +238,13 @@ pub enum OpCode {
     // Name indices point into the constant pool.  At runtime the VM resolves
     // through the scope chain: local frame → upvar links → namespace → global.
 
-    /// Load a variable by name (constant-pool index).
+    /// Load a variable by name (constant-pool index; u32 — the pool
+    /// wide path, D2 第二步消 C55).
     /// Resolves through the current scope chain.
-    LoadVar(u16),
+    LoadVar(u32),
 
     /// Store TOS into a variable by name.  Leaves the value on the stack.
-    StoreVar(u16),
+    StoreVar(u32),
 
     /// Store TOS into a variable by name and **pop** the value (discard).
     /// Used when the result of `set` is not needed.
@@ -254,12 +255,12 @@ pub enum OpCode {
     /// unset slot or a frame that degraded back to the name-keyed store
     /// (upvar/trace/array restructure) falls back to the ordinary
     /// scope-chain read of that name.
-    LoadLocal(u16),
+    LoadLocal(u32),
 
     /// Store TOS into a call-frame slot.  Leaves the value on the stack.
     /// Operand/naming contract as [`OpCode::LoadLocal`]; a degraded frame
     /// falls back to `set_var` of the name.
-    StoreLocal(u16),
+    StoreLocal(u32),
 
     /// Fusion of `[StoreLocal slot, Pop]` — the `set <var> <value>`
     /// statement shape: the value is moved into the slot, and the
@@ -276,7 +277,7 @@ pub enum OpCode {
     StoreArrayElem(u16),
 
     /// Increment a variable by a signed immediate and push the new value.
-    IncrVar(u16, i64),
+    IncrVar(u32, i64),
     /// Fusion of `[IncrVar idx, Pop]` — the increment's result is
     /// discarded (the bare-`incr` statement shape).  Same fast path and
     /// fallback ladder as [`OpCode::IncrVar`]; only the stack round-trip
@@ -286,7 +287,7 @@ pub enum OpCode {
     /// Increment a call-frame slot by a signed immediate (naming contract
     /// as [`OpCode::LoadLocal`]); a degraded frame or non-integer value
     /// falls back to the real `incr`, which owns the exact errors.
-    IncrLocal(u16, i64),
+    IncrLocal(u32, i64),
 
     /// Fusion of `[IncrLocal slot, Pop]` — the increment's result is
     /// discarded (the `for`-next / bare-`incr` statement shape).  Same
@@ -407,9 +408,9 @@ pub enum OpCode {
     /// list rep needing the strict parse, creation) falls back to
     /// dispatching `cmd_lappend` with the assembled arguments — same
     /// errors, same frames.
-    LappendLocal(u16),
+    LappendLocal(u32),
     /// The name-keyed twin of [`OpCode::LappendLocal`] (top-level units).
-    LappendVar(u16),
+    LappendVar(u32),
     /// Fusion of `[LoadVar src, LappendVar dst, Pop]` — the name-keyed
     /// `lappend <var> $value` statement shape: read the source variable
     /// (both operands are constant-pool name indices; the read replicates
@@ -540,22 +541,23 @@ pub enum OpCode {
     /// **Call** — invoke a built-in command by numeric [`CmdId`].
     ///
     /// `cmd_id` indexes the interpreter's unified command table.
-    /// `argc` arguments (including the command name itself) are on the stack.
-    Call { cmd_id: u16, argc: u16 },
+    /// `argc` arguments (including the command name itself) are on the
+    /// stack (u32 — wide argc, D2 第二步消 C55).
+    Call { cmd_id: u16, argc: u32 },
 
     /// **CallExpand** — like `Call`, but the argument list may contain
     /// `{*}` expanded elements.  `argc` is the *compile-time* word count;
     /// the actual argument count is determined at runtime by tracking
     /// preceding `ExpandList` ops.
-    CallExpand { cmd_id: u16, argc: u16 },
+    CallExpand { cmd_id: u16, argc: u32 },
 
     /// **DynCall** — dynamic command invocation.
     ///
     /// The command name is the *first* of `argc` values on the stack.
-    DynCall { argc: u16 },
+    DynCall { argc: u32 },
 
     /// **DynCallExpand** — dynamic call with `{*}` expansion.
-    DynCallExpand { argc: u16 },
+    DynCallExpand { argc: u32 },
 
     /// Call a user-defined proc by ID.
     CallProc { proc_id: u16, argc: u16 },
@@ -764,7 +766,7 @@ pub enum OpCode {
     /// `IncrVar`'s fallback ladder verbatim — a non-int amount or any
     /// fast-path guard failure delegates to the real `incr`, which owns
     /// creation, bignum promotion, traces and the exact errors.
-    IncrVarStack(u16),
+    IncrVarStack(u32),
 
     /// Fusion of `[SubEnd, IncrVarStack i]` — the `incr var [script]`
     /// statement tail in one dispatch.
@@ -772,7 +774,7 @@ pub enum OpCode {
 
     /// The slot twin of [`OpCode::IncrVarStack`]: pop the amount, increment
     /// the slot, push the new value.
-    IncrLocalStack(u16),
+    IncrLocalStack(u32),
 
     /// Fusion of `[SubEnd, IncrLocalStack s]` — the slot twin.
     SubEndIncrLocalStack(u16),

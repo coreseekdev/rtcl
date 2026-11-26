@@ -436,8 +436,11 @@ fn template(ctx: &Ctx, pc: u32, op: &OpCode) -> Result<Option<Instr>, Unsupporte
     let fail = || ctx.l2.fail_of[pc as usize].expect("fail id");
     let var = |ctx: &Ctx, pc: u32| -> u32 {
         let idx = match &ctx.l2.ops[pc as usize].op {
-            OpCode::LoadVar(i) | OpCode::StoreVar(i) | OpCode::StoreVarPop(i)
-            | OpCode::IncrVar(i, _) | OpCode::LappendVar(i) => *i as u32,
+            OpCode::LoadVar(i)
+            | OpCode::StoreVar(i)
+            | OpCode::IncrVar(i, _)
+            | OpCode::LappendVar(i) => *i,
+            OpCode::StoreVarPop(i) => u32::from(*i),
             _ => 0,
         };
         ctx.l2.vars.iter().find(|v| v.const_idx == idx).map(|v| v.cache).unwrap_or(0)

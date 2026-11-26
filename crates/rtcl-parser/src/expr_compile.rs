@@ -103,7 +103,7 @@ enum Token {
 /// expression on the runtime evaluator).
 pub trait ExprSink {
     fn emit(&mut self, op: OpCode, line: u32);
-    fn add_const(&mut self, name: &str) -> u16;
+    fn add_const(&mut self, name: &str) -> u32;
     fn emit_sub(&mut self, script: &str, abs_start: u32, line: u32) -> bool;
     /// Emit a variable read of `name` (a `$var` operand).  The default is
     /// the plain name-keyed op; the Compiler sink overrides it to use a
@@ -118,7 +118,7 @@ impl ExprSink for ByteCode {
     fn emit(&mut self, op: OpCode, line: u32) {
         ByteCode::emit(self, op, line);
     }
-    fn add_const(&mut self, name: &str) -> u16 {
+    fn add_const(&mut self, name: &str) -> u32 {
         ByteCode::add_const(self, name)
     }
     fn emit_sub(&mut self, _script: &str, _abs_start: u32, _line: u32) -> bool {

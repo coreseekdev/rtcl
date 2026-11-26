@@ -419,17 +419,14 @@ fn array_base_slot(code: &ByteCode, name: &str) -> Option<usize> {
 
 /// 写类 op（store/incr/lappend 及其融合形）失败时的 INNER 名。
 fn write_op_inner_hint(code: &ByteCode, op: &OpCode) -> Option<&'static str> {
-    let name_at = |i: u16| code.get_const(i).unwrap_or("");
+    let name_at = |i: u32| code.get_const(i).unwrap_or("");
     let is_array = |n: &str| n.contains('(') && n.ends_with(')');
     match op {
-        OpCode::StoreLocal(s)
-        | OpCode::StoreLocalPop(s)
-        | OpCode::SubEndStoreLocalPop(s) => {
-            Some(store_name(code, false, Some(*s as usize)))
+        OpCode::StoreLocal(s) => Some(store_name(code, false, Some(*s as usize))),
+        OpCode::StoreLocalPop(s) | OpCode::SubEndStoreLocalPop(s) => {
+            Some(store_name(code, false, Some(u32::from(*s) as usize)))
         }
-        OpCode::StoreVar(i)
-        | OpCode::StoreVarPop(i)
-        | OpCode::SubEndStoreVarPop(i) => {
+        OpCode::StoreVar(i) => {
             let name = name_at(*i);
             let arr = is_array(name);
             let slot = if arr {
@@ -439,20 +436,26 @@ fn write_op_inner_hint(code: &ByteCode, op: &OpCode) -> Option<&'static str> {
             };
             Some(store_name(code, arr, slot))
         }
-        OpCode::IncrLocal(s, _)
-        | OpCode::IncrLocalPop(s, _)
-        | OpCode::IncrLocalStack(s)
+        OpCode::StoreVarPop(i) | OpCode::SubEndStoreVarPop(i) => {
+            let name = name_at(u32::from(*i));
+            let arr = is_array(name);
+            let slot = if arr {
+                array_base_slot(code, name)
+            } else {
+                local_slot_of(code, name)
+            };
+            Some(store_name(code, arr, slot))
+        }
+        OpCode::IncrLocal(s, _) | OpCode::IncrLocalStack(s) => {
+            Some(incr_name(code, false, Some(*s as usize), true))
+        }
+        OpCode::IncrLocalPop(s, _)
         | OpCode::SubEndIncrLocalStack(s)
         | OpCode::BeginCmdIncrLocalPop(_, s, _)
         | OpCode::ForNextIncrLocal(_, s, _, _) => {
-            Some(incr_name(code, false, Some(*s as usize), true))
+            Some(incr_name(code, false, Some(u32::from(*s) as usize), true))
         }
-        OpCode::IncrVar(i, _)
-        | OpCode::IncrVarPop(i, _)
-        | OpCode::IncrVarStack(i)
-        | OpCode::SubEndIncrVarStack(i)
-        | OpCode::BeginCmdIncrVarPop(_, i, _)
-        | OpCode::ForNextIncrVar(_, i, _, _) => {
+        OpCode::IncrVar(i, _) | OpCode::IncrVarStack(i) => {
             let name = name_at(*i);
             let arr = is_array(name);
             let slot = if arr {
@@ -462,11 +465,35 @@ fn write_op_inner_hint(code: &ByteCode, op: &OpCode) -> Option<&'static str> {
             };
             Some(incr_name(code, arr, slot, true))
         }
-        OpCode::LappendLocal(s) | OpCode::LappendSlotSlot(_, s) => {
-            Some(lappend_name(code, false, Some(*s as usize)))
+        OpCode::IncrVarPop(i, _)
+        | OpCode::SubEndIncrVarStack(i)
+        | OpCode::BeginCmdIncrVarPop(_, i, _)
+        | OpCode::ForNextIncrVar(_, i, _, _) => {
+            let name = name_at(u32::from(*i));
+            let arr = is_array(name);
+            let slot = if arr {
+                array_base_slot(code, name)
+            } else {
+                local_slot_of(code, name)
+            };
+            Some(incr_name(code, arr, slot, true))
         }
-        OpCode::LappendVar(i) | OpCode::LappendVarVar(_, i) => {
+        OpCode::LappendLocal(s) => Some(lappend_name(code, false, Some(*s as usize))),
+        OpCode::LappendSlotSlot(_, s) => {
+            Some(lappend_name(code, false, Some(u32::from(*s) as usize)))
+        }
+        OpCode::LappendVar(i) => {
             let name = name_at(*i);
+            let arr = is_array(name);
+            let slot = if arr {
+                array_base_slot(code, name)
+            } else {
+                local_slot_of(code, name)
+            };
+            Some(lappend_name(code, arr, slot))
+        }
+        OpCode::LappendVarVar(_, i) => {
+            let name = name_at(u32::from(*i));
             let arr = is_array(name);
             let slot = if arr {
                 array_base_slot(code, name)
@@ -609,7 +636,7 @@ fn word_op_inner_hint(code: &ByteCode, op: &OpCode, msg: &str) -> Option<&'stati
             Some(scalar_load_name(code, name))
         }
         OpCode::LappendVarVar(src, _) => {
-            let name = code.get_const(*src).unwrap_or("");
+            let name = code.get_const(u32::from(*src)).unwrap_or("");
             Some(scalar_load_name(code, name))
         }
         OpCode::LoadVar(idx) => {
@@ -1372,7 +1399,9 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
             // ── Variables ───────────────────────────────────────────────
             OpCode::LoadVar(idx) => op_load_var(interp, code, st, *idx),
             OpCode::StoreVar(idx) => op_store_var(interp, code, st, *idx, true),
-            OpCode::StoreVarPop(idx) => op_store_var(interp, code, st, *idx, false),
+            OpCode::StoreVarPop(idx) => {
+                op_store_var(interp, code, st, u32::from(*idx), false)
+            }
             OpCode::IncrVar(idx, amount) => op_incr_var(interp, code, st, *idx, *amount),
             // 语句窗口四 op 不进热径 match——`_` 兜底已把它们路由到
             // exec_op 的表分派臂。本 match 的形状与基线逐字节同（代码
@@ -1472,7 +1501,7 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
             OpCode::SubSlotImm(a, k) => op_sub_slot_imm(interp, code, st, *a, *k),
             OpCode::SubEndDynCall(argc) => op_sub_end_dyn_call(interp, st, *argc),
             OpCode::IncrLocalPop(slot, amount) => {
-                let _ = incr_local_value(interp, code, *slot, *amount)?;
+                let _ = incr_local_value(interp, code, u32::from(*slot), *amount)?;
                 Ok(())
             }
 
@@ -1883,7 +1912,7 @@ fn op_push_const(st: &mut VmState, code: &ByteCode, idx: u16) {
         .as_deref()
         .and_then(|vs| vs.get(idx as usize))
         .cloned()
-        .unwrap_or_else(|| Value::from_str(code.get_const(idx).unwrap_or("")));
+        .unwrap_or_else(|| Value::from_str(code.get_const(u32::from(idx)).unwrap_or("")));
     st.stack.push(v);
 }
 
@@ -1903,7 +1932,7 @@ fn op_store_var(
     interp: &mut Interp,
     code: &ByteCode,
     st: &mut VmState,
-    idx: u16,
+    idx: u32,
     keep: bool,
 ) -> Result<()> {
     let name = code.get_const(idx).unwrap_or("");
@@ -1927,7 +1956,7 @@ fn op_incr_var(
     interp: &mut Interp,
     code: &ByteCode,
     st: &mut VmState,
-    idx: u16,
+    idx: u32,
     amount: i64,
 ) -> Result<()> {
     let name = code.get_const(idx).unwrap_or("");
@@ -1957,7 +1986,7 @@ fn op_incr_var(
 /// `LoadLocal + JumpTrue/JumpFalse` and `LoadLocal + LappendLocal` arms
 /// consume it directly.
 #[inline]
-fn load_local_value(interp: &mut Interp, code: &ByteCode, slot: u16) -> Result<Value> {
+fn load_local_value(interp: &mut Interp, code: &ByteCode, slot: u32) -> Result<Value> {
     let slot = slot as usize;
     match interp.frame_slot_value(slot) {
         Some(v) => Ok(v),
@@ -1976,14 +2005,14 @@ fn load_local_value(interp: &mut Interp, code: &ByteCode, slot: u16) -> Result<V
 }
 
 #[inline]
-fn op_load_local(interp: &mut Interp, code: &ByteCode, st: &mut VmState, slot: u16) -> Result<()> {
+fn op_load_local(interp: &mut Interp, code: &ByteCode, st: &mut VmState, slot: u32) -> Result<()> {
     let v = load_local_value(interp, code, slot)?;
     st.stack.push(v);
     Ok(())
 }
 
 #[inline]
-fn op_store_local(interp: &mut Interp, code: &ByteCode, st: &mut VmState, slot: u16) -> Result<()> {
+fn op_store_local(interp: &mut Interp, code: &ByteCode, st: &mut VmState, slot: u32) -> Result<()> {
     let slot = slot as usize;
     // `set` keeps its result: the value stays on the stack.
     let v = st.top_val();
@@ -2051,7 +2080,7 @@ fn op_sub_end_store_var_pop(
     idx: u16,
 ) -> Result<()> {
     op_sub_end(st);
-    op_store_var(interp, code, st, idx, false)
+    op_store_var(interp, code, st, u32::from(idx), false)
 }
 
 /// `[SubEnd, Return]` — `return [...]`: close the bracket region, then
@@ -2150,7 +2179,7 @@ fn op_for_next_incr_local(
 ) -> Result<()> {
     op_swap_to_next_mark(st);
     op_begin_cmd(interp, code, st, site)?;
-    let _ = incr_local_value(interp, code, slot, amount as i64)?;
+    let _ = incr_local_value(interp, code, u32::from(slot), amount as i64)?;
     op_jump_from(interp, st, t, st.pc + 1)
 }
 
@@ -2197,7 +2226,7 @@ fn op_begin_cmd_incr_local_pop(
     amount: i64,
 ) -> Result<()> {
     op_begin_cmd(interp, code, st, site)?;
-    let _ = incr_local_value(interp, code, slot, amount)?;
+    let _ = incr_local_value(interp, code, u32::from(slot), amount)?;
     Ok(())
 }
 
@@ -2261,11 +2290,11 @@ fn op_var_set_add_vv(
     op_begin_cmd(interp, code, st, set_site)?;
     st.bodies.push(Region::Sub(st.cur_site));
     op_begin_cmd(interp, code, st, expr_site)?;
-    let va = var_read(interp, code, a)?;
-    let vb = var_read(interp, code, b)?;
+    let va = var_read(interp, code, u32::from(a))?;
+    let vb = var_read(interp, code, u32::from(b))?;
     let v = crate::types::expr_ops::numeric_binop(&va, &vb, '+')?;
     op_sub_end(st);
-    let name = code.get_const(dst).unwrap_or("");
+    let name = code.get_const(u32::from(dst)).unwrap_or("");
     interp.set_var(name, v)?;
     Ok(())
 }
@@ -2434,7 +2463,7 @@ fn op_foreach_next_close(
 fn incr_local_value(
     interp: &mut Interp,
     code: &ByteCode,
-    slot: u16,
+    slot: u32,
     amount: i64,
 ) -> Result<Value> {
     let slot = slot as usize;
@@ -2470,7 +2499,7 @@ fn op_incr_local(
     interp: &mut Interp,
     code: &ByteCode,
     st: &mut VmState,
-    slot: u16,
+    slot: u32,
     amount: i64,
 ) -> Result<()> {
     let v = incr_local_value(interp, code, slot, amount)?;
@@ -2545,7 +2574,7 @@ fn op_cmp_slot_imm(
 /// `eval_var_ref` path (array references, link indirection, canonical
 /// errors) the unfused window's `LoadVar` would take.
 #[inline]
-fn var_read(interp: &mut Interp, code: &ByteCode, idx: u16) -> Result<Value> {
+fn var_read(interp: &mut Interp, code: &ByteCode, idx: u32) -> Result<Value> {
     let name = code.get_const(idx).unwrap_or("");
     // 顶层标量直读快路径（单扫描+单探测）；None → 全语义链
     //（下标替换/数组/traces/namespace）。
@@ -2563,8 +2592,8 @@ fn op_add_var_var(
     a: u16,
     b: u16,
 ) -> Result<()> {
-    let va = var_read(interp, code, a)?;
-    let vb = var_read(interp, code, b)?;
+    let va = var_read(interp, code, u32::from(a))?;
+    let vb = var_read(interp, code, u32::from(b))?;
     let v = crate::types::expr_ops::numeric_binop(&va, &vb, '+')?;
     st.stack.push(v);
     Ok(())
@@ -2578,7 +2607,7 @@ fn op_add_var_imm(
     a: u16,
     k: i64,
 ) -> Result<()> {
-    let va = var_read(interp, code, a)?;
+    let va = var_read(interp, code, u32::from(a))?;
     let vb = Value::from_int(k);
     let v = crate::types::expr_ops::numeric_binop(&va, &vb, '+')?;
     st.stack.push(v);
@@ -2594,8 +2623,8 @@ fn op_cmp_var_var(
     b: u16,
     cc: u8,
 ) -> Result<()> {
-    let va = var_read(interp, code, a)?;
-    let vb = var_read(interp, code, b)?;
+    let va = var_read(interp, code, u32::from(a))?;
+    let vb = var_read(interp, code, u32::from(b))?;
     st.stack.push(cmp_values(&va, &vb, cc));
     Ok(())
 }
@@ -2609,7 +2638,7 @@ fn op_cmp_var_imm(
     k: i64,
     cc: u8,
 ) -> Result<()> {
-    let va = var_read(interp, code, a)?;
+    let va = var_read(interp, code, u32::from(a))?;
     st.stack.push(cmp_values(&va, &Value::from_int(k), cc));
     Ok(())
 }
@@ -2628,8 +2657,8 @@ fn op_cmp_vv_jump(
     t: u32,
     want: bool,
 ) -> Result<()> {
-    let va = var_read(interp, code, a)?;
-    let vb = var_read(interp, code, b)?;
+    let va = var_read(interp, code, u32::from(a))?;
+    let vb = var_read(interp, code, u32::from(b))?;
     let cond = crate::types::expr_ops::cmp_bool(&va, &vb, cc);
     jump_if_bool(interp, st, cond, t, want, st.pc)?;
     Ok(())
@@ -2649,7 +2678,7 @@ fn op_cmp_vi_jump(
     t: u32,
     want: bool,
 ) -> Result<()> {
-    let va = var_read(interp, code, a)?;
+    let va = var_read(interp, code, u32::from(a))?;
     let cond = crate::types::expr_ops::cmp_bool(&va, &Value::from_int(k), cc);
     jump_if_bool(interp, st, cond, t, want, st.pc)?;
     Ok(())
@@ -2665,7 +2694,7 @@ fn op_cmp_vi_jump(
 fn lappend_var_impl(
     interp: &mut Interp,
     code: &ByteCode,
-    name_idx: u16,
+    name_idx: u32,
     value: Value,
 ) -> Result<Value> {
     let name = code.get_const(name_idx).unwrap_or("");
@@ -2691,8 +2720,8 @@ fn lappend_var_impl(
 /// path), append through [`lappend_var_impl`], discard the result.
 #[inline]
 fn op_lappend_var_var(interp: &mut Interp, code: &ByteCode, src: u16, dst: u16) -> Result<()> {
-    let value = var_read(interp, code, src)?;
-    let _ = lappend_var_impl(interp, code, dst, value)?;
+    let value = var_read(interp, code, u32::from(src))?;
+    let _ = lappend_var_impl(interp, code, u32::from(dst), value)?;
     Ok(())
 }
 
@@ -2700,7 +2729,7 @@ fn op_lappend_var_var(interp: &mut Interp, code: &ByteCode, src: u16, dst: u16) 
 /// discarded result.
 #[inline]
 fn op_incr_var_pop(interp: &mut Interp, code: &ByteCode, idx: u16, amount: i64) -> Result<()> {
-    let name = code.get_const(idx).unwrap_or("");
+    let name = code.get_const(u32::from(idx)).unwrap_or("");
     match interp.incr_var_fast(name, amount) {
         Some(_) => Ok(()),
         None => {
@@ -2776,7 +2805,7 @@ fn op_cmp_si_jump(
 /// the stack round-trip or the discarded result.
 #[inline]
 fn op_lappend_slot_slot(interp: &mut Interp, code: &ByteCode, src: u16, dst: u16) -> Result<()> {
-    let value = load_local_value(interp, code, src)?;
+    let value = load_local_value(interp, code, u32::from(src))?;
     let dst = dst as usize;
     if interp.lappend_slot_fast(dst, &value) {
         return Ok(());
@@ -3092,7 +3121,7 @@ fn op_sub_end(st: &mut VmState) {
 }
 
 #[inline]
-fn op_load_var(interp: &mut Interp, code: &ByteCode, st: &mut VmState, idx: u16) -> Result<()> {
+fn op_load_var(interp: &mut Interp, code: &ByteCode, st: &mut VmState, idx: u32) -> Result<()> {
     // eval_var_ref, not a raw read: `$a($i)` words compile to LoadVar with
     // the raw reference text and need the same index-substitution dance
     // eval_word does.（var_read = 同体 + 顶层标量直读快路径）
@@ -3167,10 +3196,8 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
 
         // ── Variables ───────────────────────────────────────────────────
         OpCode::LoadVar(idx) => op_load_var(interp, code, st, *idx)?,
-        OpCode::StoreVar(idx) | OpCode::StoreVarPop(idx) => {
-            let keep = matches!(op, OpCode::StoreVar(_));
-            op_store_var(interp, code, st, *idx, keep)?
-        }
+        OpCode::StoreVar(idx) => op_store_var(interp, code, st, *idx, true)?,
+        OpCode::StoreVarPop(idx) => op_store_var(interp, code, st, u32::from(*idx), false)?,
         OpCode::IncrVar(idx, amount) => op_incr_var(interp, code, st, *idx, *amount)?,
         // 语句窗口四 op（`incr var [script]`）：单一表分派臂。刻意不进
         // exec_inner 的热径 match——本文件热径代码的任何增量都会挪动
@@ -3442,7 +3469,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             op_cmp_vi_jump(interp, code, st, *a, *k, *cc, *t, false)?
         }
         OpCode::IncrLocalPop(slot, amount) => {
-            let _ = incr_local_value(interp, code, *slot, *amount)?;
+            let _ = incr_local_value(interp, code, u32::from(*slot), *amount)?;
         }
         OpCode::Sub => arith(st, '-')?,
         OpCode::Mul => arith(st, '*')?,

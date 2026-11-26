@@ -211,7 +211,7 @@ mod tests {
     fn valid_with_constants() {
         let mut bc = ByteCode::new();
         let idx = bc.add_const("hello");
-        bc.emit(OpCode::PushConst(idx), 0);
+        bc.emit(OpCode::PushConst(u16::try_from(idx).unwrap()), 0);
         bc.emit(OpCode::Pop, 0);
         assert!(validate(&bc).is_empty());
     }

@@ -224,7 +224,7 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // and plain var-write errors.  Only when the invocation is exactly
     // what the compiler would inline.
     if interp.lexical_body && foreach_inline_shape(interp, args) {
-        return foreach_lexical(interp, args, false);
+        return foreach_lexical(interp, args, LoopKind::Foreach);
     }
 
     let body = &args[args.len() - 1];
@@ -352,16 +352,39 @@ pub(crate) fn foreach_inline_shape(interp: &Interp, args: &[Value]) -> bool {
     interp.body_would_compile(n - 1, args[n - 1].as_str())
 }
 
-/// The compiled-shape foreach/lmap body (tclsh's inlined form, probed):
-/// body errors are FRAMELESS with absolute line attribution (no
+/// The three constructs that share tclsh's `EachloopCmd` shape: plain
+/// foreach (no collection), lmap (collect the body result), lfilter
+/// (TIP 735: collect the first variable's value when the body result is
+/// a true boolean; 9.1's tclCmdAH.c `TCL_EACH_FILTER`).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum LoopKind {
+    Foreach,
+    Lmap,
+    Lfilter,
+}
+
+impl LoopKind {
+    /// The lower-case name tclsh prints in NEEDVARS / body-exit frames.
+    fn name(self) -> &'static str {
+        match self {
+            LoopKind::Foreach => "foreach",
+            LoopKind::Lmap => "lmap",
+            LoopKind::Lfilter => "lfilter",
+        }
+    }
+}
+
+/// The compiled-shape foreach/lmap/lfilter body (tclsh's inlined form,
+/// probed): body errors are FRAMELESS with absolute line attribution (no
 /// `("foreach" body line N)`, the construct's own harness frame
 /// suppressed — only the innermost failing command's frame remains), and
 /// loop-variable writes fail PLAIN (no `(setting foreach loop variable)`
 /// decoration; the enclosing command's harness frame and TCL WRITE
-/// VARNAME errorCode are all tclsh's compiled form adds).  `collect`
-/// selects lmap: results accumulate, survive a `break`, and a `continue`
-/// skips the collection.
-pub(crate) fn foreach_lexical(interp: &mut Interp, args: &[Value], lmap: bool) -> Result<Value> {
+/// VARNAME errorCode are all tclsh's compiled form adds).  `kind`
+/// selects the collection mode: lmap accumulates body results (surviving
+/// a `break`, a `continue` skips), lfilter accumulates the first
+/// variable's value while the body result is a true boolean.
+pub(crate) fn foreach_lexical(interp: &mut Interp, args: &[Value], kind: LoopKind) -> Result<Value> {
     let n = args.len();
     let body = &args[n - 1];
 
@@ -402,7 +425,11 @@ pub(crate) fn foreach_lexical(interp: &mut Interp, args: &[Value], lmap: bool) -
 
     let mut collected: Vec<Value> = Vec::new();
     for idx in 0..max_iters {
-        for g in &groups {
+        // lfilter's collected value is the FIRST variable of the FIRST
+        // varlist (tclCmdAH.c `primeValueObj`), captured at assignment
+        // time — before the body runs.
+        let mut prime: Option<Value> = None;
+        for (gi, g) in groups.iter().enumerate() {
             let gn = g.vars.len();
             for (vi, var) in g.vars.iter().enumerate() {
                 let value = g
@@ -410,6 +437,9 @@ pub(crate) fn foreach_lexical(interp: &mut Interp, args: &[Value], lmap: bool) -
                     .get(idx * gn + vi)
                     .cloned()
                     .unwrap_or_else(Value::empty);
+                if gi == 0 && vi == 0 && kind == LoopKind::Lfilter {
+                    prime = Some(value.clone());
+                }
                 if let Err(e) = interp.set_var(var, value) {
                     // Plain failure: the error propagates to the enclosing
                     // command's ordinary harness frame; only the errorCode
@@ -429,8 +459,21 @@ pub(crate) fn foreach_lexical(interp: &mut Interp, args: &[Value], lmap: bool) -
         interp.line_offset = saved_offset;
         match r {
             Ok(v) => {
-                if lmap {
-                    collected.push(v);
+                match kind {
+                    LoopKind::Lmap => collected.push(v),
+                    LoopKind::Lfilter => {
+                        // tclCmdAH.c ForeachLoopStep: TCL_OK converts the
+                        // result to a boolean; only a TRUE one collects
+                        // the prime value. `continue` never reaches here.
+                        if let Some(p) = prime {
+                            match crate::types::expr_funcs::strict_bool(&v) {
+                                Ok(true) => collected.push(p),
+                                Ok(false) => {}
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    }
+                    LoopKind::Foreach => {}
                 }
             }
             Err(e) => {
@@ -458,7 +501,7 @@ pub(crate) fn foreach_lexical(interp: &mut Interp, args: &[Value], lmap: bool) -
         }
     }
 
-    if lmap {
+    if matches!(kind, LoopKind::Lmap | LoopKind::Lfilter) {
         return Ok(Value::from_list(&collected));
     }
     Ok(Value::empty())

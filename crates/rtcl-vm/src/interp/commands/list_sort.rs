@@ -14,12 +14,14 @@ const LSEARCH_OPTIONS: [&str; 21] = [
     "-stride", "-subindices",
 ];
 
-/// The documented (tclsh 8.6.17) option list, for error messages.
+/// The documented (tclsh 9.1) option list, for error messages.
+/// -stride 在 9.x 是文档化选项（8.6 时代作为 rtcl 扩展隐藏在错误清单
+/// 外）；-bool/-command 仍为 rtcl 扩展，接受但不列入。
 fn lsearch_option_list() -> String {
     let listed: Vec<&str> = LSEARCH_OPTIONS
         .iter()
         .copied()
-        .filter(|o| !matches!(*o, "-bool" | "-command" | "-stride"))
+        .filter(|o| !matches!(*o, "-bool" | "-command"))
         .collect();
     let mut s = String::from("must be ");
     for (i, o) in listed.iter().enumerate() {
@@ -663,10 +665,12 @@ impl IndexSpec {
 /// (negative ints, `end+N`) gets the `cannot select` error.
 fn validate_index_spec(interp: &mut Interp, s: &str) -> Result<IndexSpec> {
     use crate::value::is_tcl_space;
-    const CANNOT_SELECT: &str = "cannot select an element from any list";
+    // 9.1 wording (tclCmdIL.c lsort index precheck): `index "X" out of
+    // range`, errorCode TCL VALUE INDEX OUTOFRANGE (8.6 said "cannot
+    // select an element from any list" with a glued INDEXOUTOFRANGE).
     let reject = |interp: &mut Interp, s: &str| -> Result<IndexSpec> {
-        super::list::set_error_code(interp, "TCL VALUE INDEXOUTOFRANGE");
-        Err(super::list::tcl_err(format!("index \"{}\" {}", s, CANNOT_SELECT)))
+        super::list::set_error_code(interp, "TCL VALUE INDEX OUTOFRANGE");
+        Err(super::list::tcl_err(format!("index \"{}\" out of range", s)))
     };
     // TclGetIntForIndex grammar: integer?[+-]integer? or end?[+-]integer?
     let t = super::list::trim_tcl_space(s);
@@ -1597,7 +1601,7 @@ mod tests {
         let mut interp = Interp::new();
         let e = interp.eval("lsort -index -1 {{a 1} {b 0}}").unwrap_err();
         assert!(
-            e.to_string().contains("index \"-1\" cannot select an element from any list"),
+            e.to_string().contains("index \"-1\" out of range"),
             "{}",
             e
         );
@@ -1608,7 +1612,7 @@ mod tests {
         let mut interp = Interp::new();
         let e = interp.eval("lsort -index end+5 {{a}}").unwrap_err();
         assert!(
-            e.to_string().contains("index \"end+5\" cannot select an element from any list"),
+            e.to_string().contains("index \"end+5\" out of range"),
             "{}",
             e
         );

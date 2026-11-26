@@ -68,7 +68,7 @@
 | S18 | proc 内 2 万层嵌套 `[…]` | `parser/src/compiler.rs` | 不调用也崩 | 已修（M2） |
 | S19 | 正则：6000 层嵌套括号；`((a{255}){255}){255}`；`(.*)x` 匹配 3 万字符 | `regexp-spencer` `parser.rs` / `captures.rs` | 后两项吃满近 3GB 后 abort | 已修（M2） |
 | S20 | proc 递归 650–1000 层 | `interp/mod.rs` `max_call_depth` | 上限 1000 没按栈大小校准：wasm 必崩且毒化实例，原生栈 ≤3MB 也崩 | 已修（M3） |
-| S21 | `lrepeat 4294967296 x`、`string repeat x 4294967296` | 同 S9 | 分配失败 = abort，不可 catch；tclsh 报 Tcl 错误 | 未修 |
+| S21 | `lrepeat 4294967296 x`、`string repeat x 4294967296` | 同 S9 | 分配失败 = abort，不可 catch；tclsh 报 Tcl 错误 | 未修  已修（2026-11-26，task/b2-execfile @ 4246531）：lrepeat/string repeat 分配前守卫按 9.1 钉形（TIP 626 64 位 count/NEGARG/LIST_MAX/TCL MEMORY）；超预算段按 9.1 错误形状可 catch 拒绝，19 条探针逐字节一致 |
 | S22 | `eval eval … 1` 嵌套 2000 层 | `interp/eval.rs` | 输入 1 万字节，报递归错误前已占 306MB | 已修（M3） |
 
 ## P0：wasm 专有（Node 22 + 11-20 产物实测）
@@ -106,8 +106,8 @@
 | S35 | `file delete` 不带 `-force` 也递归删非空目录 | `commands/io.rs` | 已修（M5）：非空目录报 `error deleting "…": directory not empty`（`POSIX EEXIST`），内容不动；符号链接只删链接本身；不存在的路径不报错；未知选项是 tclsh 的 `bad option` |
 | S36 | `file normalize a/../x` 原样返回 | `commands/io.rs` | 已修（M5）：词法规范化（接上工作目录、消解 `.`/`..`、合并分隔符、`~` 展开），不查文件系统。`~user` 未实现（C33） |
 | S37 | `-async` socket 的 fd 无 `CLOEXEC` | `channel.rs` | 已修（M5）：裸 `socket()` 之后设 `FD_CLOEXEC`（A/B 实测：修复前 `exec` 子进程继承该描述符，修复后不继承） |
-| S38 | HTTP 客户端默认无超时、响应体无上限、无 URL 审查钩子（读码） | `rtcl-native/src/net.rs` | 未修 |
-| S39 | 变量表无密钥哈希，可预构造冲突键（风险低） | `interp/varmap.rs` | 未修 |
+| S38 | HTTP 客户端默认无超时、响应体无上限、无 URL 审查钩子（读码） | `rtcl-native/src/net.rs` | 未修  已修（2026-11-26，task/b2-execfile @ caebf8d）：连接超时默认 30s、总超时 300s（显式化 reqwest 隐式 30s——审计的『无超时』实为该无声值）、响应体 64MiB 上限、URL 宿主校验钩子，env/opts 可覆盖；11/11 测试 |
+| S39 | 变量表无密钥哈希，可预构造冲突键（风险低） | `interp/varmap.rs` | 未修  已修（2026-11-26，perf/wave2 @ 6e2154e）：VarHasher.finish() 加进程级随机种子（std RandomState 键派生，零依赖），fmix64 前异或——预构造冲突键不跨运行成立；P6 桶分布保持，迭代序实证不承载输出 |
 | S40 | Tk：畸形 PNG、多字节颜色串、`image put -to` 负坐标 panic（读码，未运行） | `rtcl-tk-runtime/src/lib.rs` | 未修 |
 
 ## 静默出错（不报错，结果是错的）
@@ -144,8 +144,8 @@
 | C29 | （第二批）rtcl 没有默认 `bgerror` proc（tclsh 的 init.tcl 提供）；`interp` 命令是 jimtcl 模型——裸 `interp` 创建子解释器并返回 `interp#N` 句柄，没有 `interp create/slaves/eval/delete/exists/expose/hide/hidden/invokehidden/limit/recursionlimit`（与 S25/S26 同源） | `commands/interp_cmd.rs` | 已修（M6）：`interp` 改为 tclsh 模型（见 S26）。别名 `interp alias 从 名 ?主路径? 目标 ?前缀…?` 的目标可以是父解释器（空路径）、自身或兄弟解释器，错误原样带回调用方（errorInfo 在调用处记 `invoked from within`）；跨解释器的别名环在建立与 `rename` 时拒绝（`cannot define or rename alias "x": would create a loop`）；删除目标解释器时一并删掉指向它的别名；解释器自己的命令被 rename 后仍可用。默认 `bgerror` proc 仍未提供（`::tcl::Bgerror` 在） |
 | C30 | （M5）exec 的错误语义与 tclsh 不同：子进程写了 stderr（未重定向、未 `-ignorestderr`）tclsh 让 exec **报错**、消息 = stdout + stderr（`catch {exec …} msg` 取 stderr 是 Tcl 惯用法），rtcl 把 stderr 打到自己的 stderr 并返回成功；失败消息多了 `(exit code N)`、stdout 与原因之间缺换行；被信号杀死 tclsh 报 `child killed: <描述>` + `CHILDKILLED pid SIGNAME {描述}`，rtcl 当成退出码 1；成功时 rtcl 把 `::errorCode` 清成 NONE（tclsh 不动）；重定向失败的消息与 `POSIX ENOENT …` errorCode 不同；非 UTF-8 字节 tclsh 逐个映射成同值的 Unicode 字符。语料与探针里没有任何 exec 调用，所以一直没被看见 | `commands/exec_cmd.rs` `cmd_exec` | 已修（M5）：按 `TclCleanupChildren` 与实测重写了原生路径的参数扫描、管道搭建与收尾（探针 d19，42 条断言在 tclsh 上同样全过）。一并对齐：`2>@1` 两流共用一根管道（保持写出顺序）、重定向在 spawn 之前按命令行顺序打开、目标可连写在操作符后（`2>/dev/null`）、CR LF 与孤立 CR 按换行处理、开关不接受缩写、各语法错误的 errorCode、子进程继承调用方的 stdin、中途失败时已启动的子进程分离而不是杀掉 |
 | C31 | （M5）`@通道` 重定向（`exec cmd 2>@ stderr`、`>@ $chan`、`<@ $chan`、`>>@`、`2>>@`、`>&@`）：tclsh 把通道的描述符传给子进程；rtcl 原来把这些词当普通参数传给命令（静默出错）。一度改成明确报错 | `commands/exec_cmd.rs`、`channel.rs` | 已修（M5）：`Channel::dup_for_child` 给出描述符的副本（文件、TCP、标准流、管道通道），文件通道的副本共享位置；未知通道 `can not find channel named` + `TCL LOOKUP CHANNEL`，方向不对 `channel "x" wasn't opened for writing/reading` + `TCL OPERATION EXEC BADCHAN`。已知差异：`>>@ chan` 时 tclsh 8.6.17 会**丢掉**子进程的输出，rtcl 追加在通道已有内容之后。带宿主 HostExec 的路径仍不支持（明确报错） |
-| C32 | （M5）带宿主 `HostExec` 的 exec 路径（`cmd_exec_host`，注入了宿主的 wasm 环境走它）仍是旧语义：stderr 不使 exec 失败、`(exit code N)`、成功时清 `::errorCode`、`bad switch` | `commands/exec_cmd.rs` `cmd_exec_host` | 未修 |
-| C33 | （M5）`file` 命令的零散缺口：`file attributes` 完全没有实现（`bad option "attributes"`）；`file normalize ~user` 不查用户（tclsh 报 `user "…" doesn't exist` / `TCL VALUE PATH NOUSER`，存在的用户展开到家目录）；`socket -server` 不支持（`server sockets are not supported in rtcl`） | `commands/io.rs`、`channel.rs` | 未修 |
+| C32 | （M5）带宿主 `HostExec` 的 exec 路径（`cmd_exec_host`，注入了宿主的 wasm 环境走它）仍是旧语义：stderr 不使 exec 失败、`(exit code N)`、成功时清 `::errorCode`、`bad switch` | `commands/exec_cmd.rs` `cmd_exec_host` | 未修  已修（2026-11-26，task/b2-execfile @ 708d29b）：cmd_exec_host 按 9.1 exec 语义重写（开关表/重定向连写/TclCleanupChildren 分类），15 个 mock-host 单元测试与 d19 同钉形 |
+| C33 | （M5）`file` 命令的零散缺口：`file attributes` 完全没有实现（`bad option "attributes"`）；`file normalize ~user` 不查用户（tclsh 报 `user "…" doesn't exist` / `TCL VALUE PATH NOUSER`，存在的用户展开到家目录）；`socket -server` 不支持（`server sockets are not supported in rtcl`） | `commands/io.rs`、`channel.rs` | 未修  已修（2026-11-26，task/b2-execfile @ 0ae5636）：file attributes 按 9.1 实现（unix 属性集/权限串/errno 文案）；normalize 去 ~ 展开（9.0 变更）+ file tildeexpand/home 补齐；38 条探针逐字节一致 |
 | C34 | （M5）`file rename` 跨文件系统直接失败（`Invalid cross-device link`；tclsh 复制后删除）。一并对齐了的：目标 是目录时移入其中、源不存在与已存在的消息和 `POSIX` 码、`mkdir`/`copy` 的消息（原来是 Rust 的 `No such file or directory (os error 2)` 且没有 errorCode） | `commands/io.rs` | 部分已修（M5）；跨文件系统未修 |
 | C35 | （M6）`tcl_hash`（Tcl 字符串哈希的移植）用普通 `+`：键长到 22 个字符即 u64 溢出。release 回绕（与 C 的无符号运算一致），debug 构建直接 panic——`array names env`、`unset env` 这类要给元素名排插入序的操作，在单元测试里一碰长环境变量名就崩 | `interp/tclhash.rs` | 已修（M6）：`wrapping_add` |
 | C36 | （M6）`exec` 不带参数报 `wrong # args: should be "exec exec ?switches? arg ?arg ...?"`（命令名重复，用法文本过时）；只有重定向、没有命令时报 `no command given`，tclsh 是 `illegal use of | or |& in command` + `TCL OPERATION EXEC PIPESYNTAX` | `commands/exec_cmd.rs` | 已修（M6，原生路径）；宿主路径未动（C32） |

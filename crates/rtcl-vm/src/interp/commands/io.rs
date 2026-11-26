@@ -12,6 +12,7 @@ use crate::value::Value;
 #[cfg(feature = "std")]
 pub(crate) fn errno_text(code: i32) -> Option<(&'static str, &'static str)> {
     Some(match code {
+        1 => ("operation not permitted", "EPERM"),
         2 => ("no such file or directory", "ENOENT"),
         9 => ("bad file descriptor", "EBADF"),
         11 => ("resource temporarily unavailable", "EAGAIN"),
@@ -332,6 +333,30 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // Subcommands that need no path argument
     match subcmd {
         "tempfile" => return file_tempfile(interp, args),
+        // C33（9.1 实测钉形）：`file attributes name ?-option value ...?`、
+        // `file tildeexpand path`、`file home ?user?`——各自的 arity 与
+        // 用法文本独立于通用路径检查。
+        "attributes" => return file_attributes(interp, args),
+        "tildeexpand" => {
+            if args.len() != 3 {
+                return Err(Error::wrong_args_with_usage(
+                    "file tildeexpand", 3, args.len(), "path",
+                ));
+            }
+            return file_tildeexpand(interp, args[2].as_str());
+        }
+        "home" => {
+            let user = match args.len() {
+                2 => None,
+                3 => Some(args[2].as_str()),
+                _ => {
+                    return Err(Error::wrong_args_with_usage(
+                        "file home", 2, args.len(), "?user?",
+                    ))
+                }
+            };
+            return user_home_dir(interp, user).map(|h| Value::from_str(&h));
+        }
         // Nothing named is nothing to delete (tclsh: no error).
         "delete" if args.len() == 2 => return Ok(Value::empty()),
         "rename" | "copy" if args.len() == 2 => {
@@ -735,11 +760,11 @@ pub fn cmd_file(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
         _ => Err(Error::runtime(
             format!(
-                "bad option \"{}\": must be atime, copy, delete, dirname, \
-                 executable, exists, extension, isdirectory, isfile, join, \
-                 link, lstat, mkdir, mtime, normalize, owned, readable, \
-                 readlink, rename, rootname, separator, size, split, stat, \
-                 tail, tempfile, type, or writable",
+                "bad option \"{}\": must be atime, attributes, copy, delete, \
+                 dirname, executable, exists, extension, home, isdirectory, \
+                 isfile, join, link, lstat, mkdir, mtime, normalize, owned, \
+                 readable, readlink, rename, rootname, separator, size, \
+                 split, stat, tail, tempfile, tildeexpand, type, or writable",
                 subcmd
             ),
             crate::error::ErrorCode::InvalidOp,
@@ -872,24 +897,21 @@ fn random_suffix() -> String {
 }
 
 /// tclsh's `file normalize`: lexical.  The path is made absolute against
-/// `cwd` (a leading `~` is the home directory), `.` and `..` are resolved
-/// and repeated separators collapsed — nothing is asked of the file
-/// system, so a path that does not exist normalizes too.  (`~user` is
-/// not expanded here.)
+/// `cwd`, `.` and `..` are resolved and repeated separators collapsed —
+/// nothing is asked of the file system, so a path that does not exist
+/// normalizes too.  A leading `~` stays the literal component it is
+/// (Tcl 9 no longer interprets `~` in pathnames; expansion is
+/// `file tildeexpand`'s job).
 #[cfg(feature = "file")]
 fn file_normalize(cwd: &str, path: &str) -> Result<Value> {
     if path.is_empty() {
         return Ok(Value::empty());
     }
     let mut path = path.to_string();
-    #[cfg(feature = "std")]
-    if let Some(rest) = path.strip_prefix('~') {
-        if rest.is_empty() || rest.starts_with('/') {
-            if let Ok(home) = std::env::var("HOME") {
-                path = format!("{}{}", home.trim_end_matches('/'), rest);
-            }
-        }
-    }
+    // Tcl 9 起路径名里的 `~` 不再展开（9.0 不兼容清单："Ended
+    // interpretation of `~` as home directory in pathnames"）——`~` 与
+    // `~user` 是普通路径分量；展开只有 `file tildeexpand`（与
+    // `file home ?user?`）做，见 `file_tildeexpand`。
     let full = if path.starts_with('/') || cwd.is_empty() {
         path
     } else {
@@ -916,6 +938,587 @@ fn file_normalize(cwd: &str, path: &str) -> Result<Value> {
     } else {
         joined
     }))
+}
+
+// ── file attributes / tildeexpand / home（C33，按 9.1 实测钉形）─────────
+
+/// unix 用户/组查询与 chown 的最小 C 投影：rtcl-vm 不直接依赖 libc
+/// crate（file 特性不拉它），extern 声明与 host.rs 的 getuid 同法。
+#[cfg(all(unix, feature = "file"))]
+mod pw {
+    use std::ffi::c_char;
+
+    /// glibc/musl 的 `struct passwd`（只用 pw_uid / pw_dir）。
+    #[repr(C)]
+    pub struct Passwd {
+        pub pw_name: *mut c_char,
+        pub pw_passwd: *mut c_char,
+        pub pw_uid: u32,
+        pub pw_gid: u32,
+        pub pw_gecos: *mut c_char,
+        pub pw_dir: *mut c_char,
+        pub pw_shell: *mut c_char,
+    }
+
+    /// glibc/musl 的 `struct group`（只用 gr_name / gr_gid）。
+    #[repr(C)]
+    pub struct Group {
+        pub gr_name: *mut c_char,
+        pub gr_passwd: *mut c_char,
+        pub gr_gid: u32,
+        pub gr_mem: *mut *mut c_char,
+    }
+
+    extern "C" {
+        pub fn getpwnam(name: *const c_char) -> *mut Passwd;
+        pub fn getpwuid(uid: u32) -> *mut Passwd;
+        pub fn getgrnam(name: *const c_char) -> *mut Group;
+        pub fn getgrgid(gid: u32) -> *mut Group;
+        pub fn chown(path: *const c_char, owner: u32, group: u32) -> i32;
+    }
+
+    /// NUL 结尾的 Rust 串 → C 串的临时视图（查询函数不保存指针）。
+    pub(crate) fn cstr(s: &str) -> std::ffi::CString {
+        std::ffi::CString::new(s).unwrap_or_default()
+    }
+
+    pub(crate) fn ptr_str(p: *const c_char) -> Option<String> {
+        if p.is_null() {
+            return None;
+        }
+        unsafe { std::ffi::CStr::from_ptr(p) }.to_str().ok().map(|s| s.to_string())
+    }
+}
+
+/// 名字 → uid（getpwnam）；找不到 = None。非 unix 无此概念。
+#[cfg(all(unix, feature = "file"))]
+fn uid_of(name: &str) -> Option<u32> {
+    let c = pw::cstr(name);
+    let p = unsafe { pw::getpwnam(c.as_ptr()) };
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { (*p).pw_uid })
+    }
+}
+
+/// 非 unix（wasm）存根：没有用户/组数据库——名字查询一律 None（取值
+/// 回退数字，设置一律 NO_USER），数值 uid/gid 由 chown_one 的非 unix
+/// 分支报 EPERM。
+#[cfg(all(not(unix), feature = "file"))]
+fn uid_of(_name: &str) -> Option<u32> {
+    None
+}
+#[cfg(all(not(unix), feature = "file"))]
+fn gid_of(_name: &str) -> Option<u32> {
+    None
+}
+#[cfg(all(not(unix), feature = "file"))]
+fn name_of_uid(_uid: u32) -> Option<String> {
+    None
+}
+#[cfg(all(not(unix), feature = "file"))]
+fn name_of_gid(_gid: u32) -> Option<String> {
+    None
+}
+
+/// uid → 名字（getpwuid）；无 passwd 条目 = None（tclsh 回退数字）。
+#[cfg(all(unix, feature = "file"))]
+fn name_of_uid(uid: u32) -> Option<String> {
+    let p = unsafe { pw::getpwuid(uid) };
+    if p.is_null() {
+        None
+    } else {
+        pw::ptr_str(unsafe { (*p).pw_name })
+    }
+}
+
+#[cfg(all(unix, feature = "file"))]
+fn gid_of(name: &str) -> Option<u32> {
+    let c = pw::cstr(name);
+    let p = unsafe { pw::getgrnam(c.as_ptr()) };
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { (*p).gr_gid })
+    }
+}
+
+#[cfg(all(unix, feature = "file"))]
+fn name_of_gid(gid: u32) -> Option<String> {
+    let p = unsafe { pw::getgrgid(gid) };
+    if p.is_null() {
+        None
+    } else {
+        pw::ptr_str(unsafe { (*p).gr_name })
+    }
+}
+
+/// `file attributes name ?-option value ...?`（9.1 unix 属性集：
+/// -group / -owner / -permissions，tclUnixFCmd.c 的
+/// tclpFileAttrStrings）。取得/设置的消息与 errorCode 按实测钉形：
+/// 不存在 `could not read "X": <posix>` + POSIX；坏选项
+/// `bad option "X": must be -group, -owner, or -permissions` +
+/// TCL LOOKUP INDEX；缺值 `value for "X" missing` +
+/// TCL OPERATION FATTR NOVALUE；未知用户/组
+/// `could not set owner/group for file "X": user/group "Y" does not
+/// exist` + TCL OPERATION SETOWN NO_USER / SETGRP NO_GROUP；坏权限串
+/// `unknown permission string format "X"` + TCL VALUE PERMISSION。
+#[cfg(feature = "file")]
+fn file_attributes(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 3 {
+        return Err(Error::wrong_args_with_usage(
+            "file attributes", 3, args.len(),
+            "name ?-option value ...?",
+        ));
+    }
+    const ATTRS: [&str; 3] = ["-group", "-owner", "-permissions"];
+    let attr_table: Vec<String> = ATTRS.iter().map(|s| s.to_string()).collect();
+    let path = args[2].as_str();
+    let rest = &args[3..];
+
+    // 一次 stat 支撑取值（tclsh 每个属性各 stat 一次，可观察行为相同：
+    // 文件不存在时同样报 could not read + POSIX ENOENT）。
+    let s = match interp.host_fs.stat_full(path, true) {
+        Ok(s) => s,
+        Err(e) => {
+            return Err(posix_error(
+                interp,
+                format!("could not read \"{}\"", path),
+                &e,
+            ))
+        }
+    };
+
+    if rest.is_empty() {
+        // 全部属性：-group <g> -owner <u> -permissions <mode>（9.1 顺序）。
+        let group = name_of_gid(s.gid as u32).unwrap_or_else(|| s.gid.to_string());
+        let owner = name_of_uid(s.uid as u32).unwrap_or_else(|| s.uid.to_string());
+        let perms = format!("{:#05o}", s.mode & 0x7FFF);
+        return Ok(Value::from_list(&[
+            Value::from_str("-group"),
+            Value::from_str(&group),
+            Value::from_str("-owner"),
+            Value::from_str(&owner),
+            Value::from_str("-permissions"),
+            Value::from_str(&perms),
+        ]));
+    }
+
+    if rest.len() == 1 {
+        // 取一个属性；选项允许唯一前缀缩写（tclsh 的 GetIndexFromObj）。
+        let which = super::misc::index_in_table(rest[0].as_str(), &attr_table, "option", false)
+            .map_err(|(e, code)| {
+                super::list::set_error_code(interp, &code);
+                e
+            })?;
+        return Ok(match which {
+            0 => Value::from_str(&name_of_gid(s.gid as u32).unwrap_or_else(|| s.gid.to_string())),
+            1 => Value::from_str(&name_of_uid(s.uid as u32).unwrap_or_else(|| s.uid.to_string())),
+            _ => Value::from_str(&format!("{:#05o}", s.mode & 0x7FFF)),
+        });
+    }
+
+    // 设置 option/value 对。
+    let mut i = 0;
+    while i < rest.len() {
+        let which = super::misc::index_in_table(rest[i].as_str(), &attr_table, "option", false)
+            .map_err(|(e, code)| {
+                super::list::set_error_code(interp, &code);
+                e
+            })?;
+        let Some(value) = rest.get(i + 1) else {
+            super::list::set_error_code(interp, "TCL OPERATION FATTR NOVALUE");
+            return Err(Error::runtime(
+                format!("value for \"{}\" missing", rest[i].as_str()),
+                crate::error::ErrorCode::Generic,
+            ));
+        };
+        match which {
+            0 => set_group_attr(interp, path, value.as_str())?,
+            1 => set_owner_attr(interp, path, value.as_str())?,
+            _ => set_permissions_attr(interp, path, s.mode as u32, value.as_str())?,
+        }
+        i += 2;
+    }
+    Ok(Value::empty())
+}
+
+/// `-owner` 的设置：数字即 uid，否则查 passwd（tclUnixFCmd.c 的
+/// SetOwnerAttribute）。
+#[cfg(feature = "file")]
+fn set_owner_attr(interp: &mut Interp, path: &str, value: &str) -> Result<()> {
+    let uid = match crate::types::bignum::parse_int(value) {
+        Some(crate::types::bignum::IntRep::I64(v)) if v >= 0 && v <= u32::MAX as i64 => v as u32,
+        _ => match uid_of(value) {
+            Some(u) => u,
+            None => {
+                super::list::set_error_code(interp, "TCL OPERATION SETOWN NO_USER");
+                return Err(Error::runtime(
+                    format!(
+                        "could not set owner for file \"{}\": user \"{}\" does not exist",
+                        path, value
+                    ),
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
+        },
+    };
+    chown_one(interp, path, Some(uid), None, "owner")
+}
+
+/// `-group` 的设置：数字即 gid，否则查 group。
+#[cfg(feature = "file")]
+fn set_group_attr(interp: &mut Interp, path: &str, value: &str) -> Result<()> {
+    let gid = match crate::types::bignum::parse_int(value) {
+        Some(crate::types::bignum::IntRep::I64(v)) if v >= 0 && v <= u32::MAX as i64 => v as u32,
+        _ => match gid_of(value) {
+            Some(g) => g,
+            None => {
+                super::list::set_error_code(interp, "TCL OPERATION SETGRP NO_GROUP");
+                return Err(Error::runtime(
+                    format!(
+                        "could not set group for file \"{}\": group \"{}\" does not exist",
+                        path, value
+                    ),
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
+        },
+    };
+    chown_one(interp, path, None, Some(gid), "group")
+}
+
+/// chown 包装（非 unix 无操作系统能力：一切设置如实报 permission
+/// denied，tclsh 在没有所有权的文件系统上同样如此）。
+#[cfg(feature = "file")]
+fn chown_one(
+    interp: &mut Interp,
+    path: &str,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    what: &str,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let c = pw::cstr(path);
+        // (uid_t)-1 = 不变。
+        let u = uid.unwrap_or(u32::MAX);
+        let g = gid.unwrap_or(u32::MAX);
+        let rc = unsafe { pw::chown(c.as_ptr(), u, g) };
+        if rc != 0 {
+            let e = std::io::Error::last_os_error();
+            return Err(posix_error(
+                interp,
+                format!("could not set {} for file \"{}\"", what, path),
+                &e,
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, what);
+        super::list::set_error_code(interp, "POSIX EPERM {operation not permitted}");
+        Err(Error::runtime(
+            format!("could not set {} for file \"{}\": operation not permitted", what, path),
+            crate::error::ErrorCode::Io,
+        ))
+    }
+}
+
+/// `-permissions` 的设置（SetPermissionsAttribute）：先吃 `0` 开头的
+/// 八进制（`0755`），再试整数字面量（十进制、`0x`/`0o`），都不行按当前
+/// 模式解析 `rwxrwxrwx` 与 `ugoa+-=rwxst` 形式的 chmod 串。掩码
+/// 0x7FFF，与 tclsh 相同。
+#[cfg(feature = "file")]
+fn set_permissions_attr(interp: &mut Interp, path: &str, old_mode: u32, value: &str) -> Result<()> {
+    let mode: Option<i64> = {
+        // SetPermissionsAttribute 的两个分支按原文与 9.1 实测：
+        // 分支一，前导 `0` 跟 [0-7] 时跳过这个 `0`、加 `0o` 前缀按
+        // 八进制读（`0755` → 493；`0o18` 不是合法八进制 → 分支失败）；
+        // 分支二，整数字面量直读——TclParseNumber 的 ZERO 态对数字
+        // `goto decimal`：9.x 移除了 legacy 八进制，`018`/`0799`/`09`
+        // 都是十进制（expr/scan/is integer 实测同为十进制）。rtcl 的
+        // 共享 parse_int 仍按 expr 的 8.6 钉形把 `0NN` 拒成
+        // invalid-octal，这里按本命令的 9.1 钉形补十进制直读。
+        let scanned_ws = value.trim_start_matches(|c: char| c.is_whitespace());
+        let b = scanned_ws.as_bytes();
+        let mut parsed = None;
+        if b.len() >= 2 && b[0] == b'0' && (b'0'..=b'7').contains(&b[1]) {
+            parsed = match crate::types::bignum::parse_int(&format!("0o{}", &scanned_ws[1..])) {
+                Some(crate::types::bignum::IntRep::I64(v)) => Some(v),
+                _ => None,
+            };
+        }
+        if parsed.is_none() {
+            // 分支二按 TclGetWideIntFromObj：整数字面量直读（十六进制
+            // `0x1a4`、`0b`、显式 `0o` 都收），parse_int 拒绝的 `0NN`
+            // 再按 TclParseNumber 的 ZERO→decimal 补十进制直读
+            // （9.x 移除 legacy 八进制，`018`/`0799`/`09` 都是十进制；
+            // rtcl 的共享 parse_int 按 expr 的 8.6 钉形仍拒绝它们）。
+            parsed = match crate::types::bignum::parse_int(scanned_ws) {
+                Some(crate::types::bignum::IntRep::I64(v)) => Some(v),
+                _ => {
+                    let (neg, digits) = match scanned_ws.strip_prefix('-') {
+                        Some(r) => (true, r),
+                        None => (false, scanned_ws.strip_prefix('+').unwrap_or(scanned_ws)),
+                    };
+                    if !digits.is_empty() && digits.bytes().all(|d| d.is_ascii_digit()) {
+                        digits.parse::<i64>().ok().map(|v| if neg { -v } else { v })
+                    } else {
+                        None
+                    }
+                }
+            };
+        }
+        parsed
+    };
+    let new_mode = match mode {
+        Some(v) => (v & 0x7FFF) as u32,
+        None => {
+            let mut m = old_mode & 0x7FFF;
+            if !get_mode_from_perm_string(value, &mut m) {
+                super::list::set_error_code(interp, "TCL VALUE PERMISSION");
+                return Err(Error::runtime(
+                    format!("unknown permission string format \"{}\"", value),
+                    crate::error::ErrorCode::Generic,
+                ));
+            }
+            m
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let set = std::fs::set_permissions(path, std::fs::Permissions::from_mode(new_mode));
+        if let Err(e) = set {
+            return Err(posix_error(
+                interp,
+                format!("could not set permissions for file \"{}\"", path),
+                &e,
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, new_mode);
+        super::list::set_error_code(interp, "POSIX EPERM {operation not permitted}");
+        Err(Error::runtime(
+            format!("could not set permissions for file \"{}\": operation not permitted", path),
+            crate::error::ErrorCode::Io,
+        ))
+    }
+}
+
+/// tclUnixFCmd.c 的 GetModeFromPermString：`rwxrwxrwx`（恰 9 个字符，
+/// `-` 占位；s/S/t/T 处理 setuid/setgid/sticky）或 `ugoa+-=rwxst`
+/// 的 chmod 风格（逗号分隔多段，基于传入的当前模式）。移植按原文，
+/// 位常量不变。
+#[cfg(feature = "file")]
+fn get_mode_from_perm_string(mode_string: &str, mode: &mut u32) -> bool {
+    let cs = mode_string.as_bytes();
+    if cs.len() == 9 {
+        let mut new_mode = 0u32;
+        let mut ok = true;
+        for (i, ch) in cs.iter().enumerate() {
+            let bit = |p: usize| 1u32 << (8 - p);
+            match ch {
+                b'r' if i % 3 == 0 => new_mode |= bit(i),
+                b'w' if i % 3 == 1 => new_mode |= bit(i),
+                b'x' if i % 3 == 2 => new_mode |= bit(i),
+                b's' if i % 3 == 2 && i <= 5 => {
+                    new_mode |= bit(i);
+                    new_mode |= 1 << (11 - i / 3);
+                }
+                b'S' if i % 3 == 2 && i <= 5 => new_mode |= 1 << (11 - i / 3),
+                b't' if i == 8 => {
+                    new_mode |= bit(i);
+                    new_mode |= 1 << 9;
+                }
+                b'T' if i == 8 => new_mode |= 1 << 9,
+                b'-' => {}
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            *mode = new_mode;
+            return true;
+        }
+    }
+    // chmod 风格：ugoa+-=rwxst，逗号分隔。
+    let mut n = 0usize;
+    while n < cs.len() {
+        let old_mode = *mode;
+        let (mut who, mut what) = (0u32, 0u32);
+        let mut op = 0u8;
+        let mut op_found = false;
+        let mut who_found = false;
+        let mut i = 0usize;
+        while n + i < cs.len() {
+            let ch = cs[n + i];
+            if !who_found {
+                match ch {
+                    b'u' => {
+                        who |= 0x9C0;
+                        i += 1;
+                        continue;
+                    }
+                    b'g' => {
+                        who |= 0x438;
+                        i += 1;
+                        continue;
+                    }
+                    b'o' => {
+                        who |= 0x207;
+                        i += 1;
+                        continue;
+                    }
+                    b'a' => {
+                        who |= 0xFFF;
+                        i += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            who_found = true;
+            if who == 0 {
+                who = 0xFFF;
+            }
+            if !op_found {
+                match ch {
+                    b'+' => {
+                        op = 1;
+                        op_found = true;
+                        i += 1;
+                        continue;
+                    }
+                    b'-' => {
+                        op = 2;
+                        op_found = true;
+                        i += 1;
+                        continue;
+                    }
+                    b'=' => {
+                        op = 3;
+                        op_found = true;
+                        i += 1;
+                        continue;
+                    }
+                    _ => return false,
+                }
+            }
+            match ch {
+                b'r' => what |= 0x124,
+                b'w' => what |= 0x92,
+                b'x' => what |= 0x49,
+                b's' => what |= 0xC00,
+                b't' => what |= 0x200,
+                b',' => {}
+                _ => return false,
+            }
+            if ch == b',' {
+                i += 1;
+                break;
+            }
+            i += 1;
+        }
+        *mode = match op {
+            1 => old_mode | (who & what),
+            2 => old_mode & !(who & what),
+            3 => (old_mode & !who) | (who & what),
+            _ => return false,
+        };
+        n += i;
+    }
+    true
+}
+
+/// 用户主目录（TclGetUserHome / MakeTildeRelativePath）：None = 当前
+/// 用户（$HOME 环境变量；没有报 `couldn't find HOME environment
+/// variable to expand path` + TCL VALUE PATH HOMELESS）；Some(u) =
+/// passwd 的 pw_dir，未知用户报 `user "u" doesn't exist` +
+/// TCL VALUE PATH NOUSER。
+#[cfg(feature = "file")]
+fn user_home_dir(interp: &mut Interp, user: Option<&str>) -> Result<String> {
+    match user {
+        None | Some("") => match std::env::var("HOME") {
+            Ok(h) => Ok(h),
+            Err(_) => {
+                super::list::set_error_code(interp, "TCL VALUE PATH HOMELESS");
+                Err(Error::runtime(
+                    "couldn't find HOME environment variable to expand path",
+                    crate::error::ErrorCode::Generic,
+                ))
+            }
+        },
+        Some(u) => {
+            #[cfg(unix)]
+            {
+                let c = pw::cstr(u);
+                let p = unsafe { pw::getpwnam(c.as_ptr()) };
+                let dir = if p.is_null() {
+                    None
+                } else {
+                    pw::ptr_str(unsafe { (*p).pw_dir })
+                };
+                match dir {
+                    Some(d) => Ok(d),
+                    None => {
+                        super::list::set_error_code(interp, "TCL VALUE PATH NOUSER");
+                        Err(Error::runtime(
+                            format!("user \"{}\" doesn't exist", u),
+                            crate::error::ErrorCode::Generic,
+                        ))
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = u;
+                super::list::set_error_code(interp, "TCL VALUE PATH NOUSER");
+                Err(Error::runtime(
+                    format!("user \"{}\" doesn't exist", u),
+                    crate::error::ErrorCode::Generic,
+                ))
+            }
+        }
+    }
+}
+
+/// `file tildeexpand path`（9.0 新命令；Tcl_FSTildeExpand）：只有开头
+/// 的 `~`/`~user` 展开——`~`/`~/...` 到当前用户主目录，`~user/...` 到
+/// 该用户主目录（未知用户报 NOUSER）；不以 `~` 开头原样返回，中间的
+/// `~` 无意义。
+#[cfg(feature = "file")]
+fn file_tildeexpand(interp: &mut Interp, path: &str) -> Result<Value> {
+    if !path.starts_with('~') {
+        return Ok(Value::from_str(path));
+    }
+    // FindSplitPos：第一个分隔符（'~' 自身算 1）。
+    let split = path.find('/').unwrap_or(path.len());
+    let (home, sub) = if split == 1 {
+        // '~' 或 '~/...'：当前用户；sub = path[2..]（'~' 之后非空才拼）。
+        (user_home_dir(interp, None)?, path.get(2..))
+    } else {
+        let user = &path[1..split];
+        // '~user/...' 的 sub 在分隔符之后；'~user' 结尾没有。
+        let sub = if path.len() > split { Some(&path[split + 1..]) } else { None };
+        (user_home_dir(interp, Some(user))?, sub)
+    };
+    let mut out = home.trim_end_matches('/').to_string();
+    if let Some(s) = sub {
+        if !s.is_empty() {
+            out.push('/');
+            out.push_str(s);
+        }
+    }
+    Ok(Value::from_str(&out))
 }
 
 /// The `-force` / `--` options of `file copy` and `file rename`, and

@@ -195,6 +195,12 @@ pub(crate) struct CallFrame {
     /// `vars.rs`; cleared with `array_locals` wherever a frame's maps are
     /// emptied (pool return, tail-call rebind).
     pub elem_counts: VarMap<usize>,
+    /// `const`-marked variable names in this frame (tclsh 9.1's
+    /// VAR_CONSTANT flag, TIP 508-era).  `None` while the frame declares
+    /// no constants — the write guards in `vars.rs` probe this first so
+    /// const-free frames pay one branch.  Cleared with `array_locals`
+    /// wherever a frame's maps are emptied.
+    pub consts: Option<Vec<String>>,
     pub upvars: UpvarMap,
     /// Namespace the running proc was defined in (tclsh: `namespace current`
     /// inside the proc resolves here).  Variable *reads* do NOT fall back to
@@ -516,6 +522,15 @@ pub struct Interp {
     /// at the element write/remove sites (`vars.rs`) and at the direct
     /// removal purges (namespace delete, oo destroy).
     pub(crate) elem_counts: VarMap<usize>,
+    /// `array default` values (TIP 508, tclsh 9.1): keyed by the same
+    /// stamp key as the array-search state (`G:name` / `F<idx>:name`).
+    /// Consulted on element-miss reads (the default is NOT materialized:
+    /// `info exists` stays 0, `array size` uncounted) and cleared at
+    /// array removal (`loc_remove_array`) and frame death.
+    pub(crate) array_defaults: VarMap<Value>,
+    /// `const`-marked variables at the global level (tclsh 9.1's
+    /// VAR_CONSTANT).  Frame-scoped marks ride [`CallFrame::consts`].
+    pub(crate) const_globals: Vec<String>,
     /// Procedure call frames (empty at global level).  Boxed: a `CallFrame`
     /// is ~264 bytes and pool-pop/frame-push/frame-pop/pool-push moved the
     /// whole struct four times per call (a memcpy each — the fib profile's
@@ -1164,6 +1179,8 @@ impl Interp {
             array_globals: VarSet::default(),
             arrays_env_only: true,
             elem_counts: VarMap::default(),
+            array_defaults: VarMap::default(),
+            const_globals: Vec::new(),
             array_searches: HashMap::new(),
             array_stamps: HashMap::new(),
             array_generation: 0,
@@ -1310,7 +1327,7 @@ impl Interp {
             event_queue: Vec::new(),
             copy_jobs: Vec::new(),
             #[cfg(feature = "std")]
-            next_event_id: 1,
+            next_event_id: 0,  // tclsh 9.x: after/timer ids start at after#0 (8.6 was 1-based)
             #[cfg(feature = "std")]
             clock: Rc::new(crate::host::NativeClock),
             #[cfg(feature = "std")]

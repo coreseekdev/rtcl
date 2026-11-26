@@ -2780,3 +2780,40 @@ judge 88/88、crash-gate 128/128（d28 在内）、sweep 12 既有、probes **31
   链接链，alloc-only 开关自抵。
 - 基准：arith_loop/var_incr ±5% 内（快径零改动）；bignum 链收益：阶乘
   400×30 轮 58ms→**9ms**、2^63 加链 10 万次 47ms→**18ms**。
+
+## B2 对齐与加固批（task/b2-execfile @ 708d29b/0ae5636/caebf8d/4246531/d6654b6，2026-11-26，子代理施工）
+
+- **C32**：宿主 HostExec exec 路径按 9.1 重写（开关表同原生路径、重定向
+  连写、TclCleanupChildren 分类收尾）；15 个 mock-host 单元测试与 d19
+  同钉形。宿主面余项登记：-ignorestderr stderr 丢弃、CHILDKILLED 无
+  宿主 ABI 对应物。
+- **C33**：`file attributes` 按 9.1 实现（unix 属性集 `-group/-owner/
+  -permissions`、权限 `0o%05o`、errno 文案）；`file normalize` 去 ~ 展开
+  （9.0 变更）+ `file tildeexpand`/`file home` 补齐；38 条探针逐字节一致。
+- **S38**：HTTP 连接超时默认 30s、总超时 300s（显式化 reqwest 隐式 30s
+  ——审计的"无超时"实为该无声值，>30s 的 SSE 流会被它切断）、响应体
+  64MiB 上限、URL scheme 白名单 + 宿主校验钩子（`set_url_guard`）；
+  env（`RTCL_HTTP_*`）与逐请求 opts 可覆盖；11/11 测试。
+- **S21**：`lrepeat`/`string repeat` 分配前守卫按 9.1 钉形（TIP 626 64 位
+  count、NEGARG、LIST_MAX 1152921504606846970、TCL MEMORY/ARITH IOVERFLOW）；
+  超物化预算段按 9.1 错误形状可 catch 拒绝（tclsh 走惰性 rep 即刻成功，
+  rtcl 急切物化的容量差已登记）。19 条探针逐字节一致。
+- **objsec flake 根治**：墙钟断言改容差形（≤2s；三次独立会话实证 ±1s 抖动）。
+- 门禁：judge 58/95（新语料基线持平）、crash-gate 128/128、sweep 12 既有、
+  probes 327/118（objsec flake 态）→ 修复后 328/117 口径、workspace exit 0、
+  rtcl-native(net) 11/11、wasm32 过、五特性 check 过。
+
+## B3/B2 对齐与加固（task/b3-commands + task/b2-execfile，2026-11-26）
+
+B3（timer/regexp/regsub/lsearch/process/混合包，部分子代理+主会话接手）：
+- tcl::process ensemble（autopurge/list/purge/status，空态钉形）
+- regsub -command（TIP 463 回调替换：前缀+匹配+捕获组按值求值）
+- regexp 编译错误文案 couldn't→cannot（9.1 全族）
+- lsearch 错误清单补 -stride、REG_BADRPT 措辞序 invalid quantifier operand
+- binary f32 字段窄化走最短十进制字符串按 f32 RN 解析（位级 cast 在
+  半点值上与 tclsh 分叉——binary-53.22/53.25 钉形）
+- 事件 id 基 after#1→after#0（9.x 口径）；timer/timerate ensemble
+- case 级：4157→4531/4849（93.4%），gen_lfilter/lpop/lseq/timer/
+  dict/subst/array/const/regexp/lsearch/binary/process 十余文件转绿
+
+B2（exec 宿主路径/file/HTTP/大小守卫）：见 BASELINE 2026-11-26 B2 节。

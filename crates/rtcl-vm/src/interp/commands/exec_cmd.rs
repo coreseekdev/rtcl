@@ -11,6 +11,7 @@ use crate::interp::Interp;
 use crate::value::Value;
 
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -923,31 +924,49 @@ fn host_channel_redirect() -> Error {
 /// 端点直连，最后一段的 stdout/stderr 由父进程侧端点捕获。
 ///
 /// 0/1/2 只是 fd 号；重定向、管道、heredoc 全部走同一套 `HostFd`。
+///
+/// 语义与原生路径 `cmd_exec` 同一套（C32）：开关走同一张表与
+/// index-lookup 错误；重定向操作符可连写目标；语法错误带 tclsh 的
+/// errorCode；收尾按 TclCleanupChildren 分类——子进程写了 stderr 即报错
+/// （消息 = stdout + stderr、errorCode NONE）、非零退出报
+/// `child process exited abnormally`（无 `(exit code N)`）+
+/// `CHILDSTATUS pid code`、成功不碰 `::errorCode`。
 fn cmd_exec_host(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        // Bare: the registry's usage text completes it (tclsh: `exec
+        // ?-option ...? arg ?arg ...?`).
+        return Err(Error::wrong_args(args[0].as_str(), 2, args.len()));
+    }
+
+    // Switches: exactly, and anything else is refused by tclsh's
+    // index-lookup error — the same table the native path parses with.
+    const SWITCHES: [&str; 3] = ["-ignorestderr", "-keepnewline", "--"];
+    let switch_table: Vec<String> = SWITCHES.iter().map(|o| o.to_string()).collect();
     let mut i = 1;
     let mut ignore_stderr = false;
     let mut keep_newline = false;
     while i < args.len() {
-        match args[i].as_str() {
-            "-ignorestderr" => {
-                ignore_stderr = true;
-                i += 1;
-            }
-            "-keepnewline" => {
-                keep_newline = true;
-                i += 1;
-            }
-            "--" => {
+        let word = args[i].as_str();
+        if !word.starts_with('-') {
+            break;
+        }
+        let which = super::misc::index_in_table(word, &switch_table, "option", true)
+            .map_err(|(e, code)| {
+                super::list::set_error_code(interp, &code);
+                e
+            })?;
+        match SWITCHES[which] {
+            "-ignorestderr" => ignore_stderr = true,
+            "-keepnewline" => keep_newline = true,
+            _ => {
                 i += 1;
                 break;
             }
-            s if s.starts_with('-') => {
-                return Err(exec_err_str(format!(
-                    "bad switch \"{s}\": must be -ignorestderr, -keepnewline, or --"
-                )));
-            }
-            _ => break,
         }
+        i += 1;
+    }
+    if i >= args.len() {
+        return Err(Error::wrong_args(args[0].as_str(), 2, args.len()));
     }
 
     let mut stages: Vec<Vec<String>> = Vec::new();
@@ -961,98 +980,103 @@ fn cmd_exec_host(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     while i < args.len() {
         let token = args[i].as_str();
         match token {
-            "|" => {
+            "|" | "|&" => {
                 if current.is_empty() {
-                    return Err(exec_err_str("illegal use of | or |& in command"));
+                    return Err(exec_usage_error(
+                        interp,
+                        "illegal use of | or |& in command",
+                        "TCL OPERATION EXEC PIPESYNTAX",
+                    ));
                 }
                 stages.push(std::mem::take(&mut current));
+                if token == "|&" {
+                    merge_stderr_in_pipe = true;
+                }
                 i += 1;
-            }
-            "|&" => {
-                if current.is_empty() {
-                    return Err(exec_err_str("illegal use of | or |& in command"));
-                }
-                stages.push(std::mem::take(&mut current));
-                merge_stderr_in_pipe = true;
-                i += 1;
-            }
-            "<" => {
-                if i + 1 >= args.len() {
-                    return Err(exec_err_str("can't specify \"<\" as last word in command"));
-                }
-                input_redirect = Some(InputRedirect::File(args[i + 1].as_str().to_string()));
-                i += 2;
-            }
-            "<<" => {
-                if i + 1 >= args.len() {
-                    return Err(exec_err_str("can't specify \"<<\" as last word in command"));
-                }
-                input_redirect = Some(InputRedirect::String(args[i + 1].as_str().to_string()));
-                i += 2;
-            }
-            ">" => {
-                if i + 1 >= args.len() {
-                    return Err(exec_err_str("can't specify \">\" as last word in command"));
-                }
-                output_redirect = Some(OutputRedirect::Truncate(args[i + 1].as_str().to_string()));
-                i += 2;
-            }
-            ">>" => {
-                if i + 1 >= args.len() {
-                    return Err(exec_err_str("can't specify \">>\" as last word in command"));
-                }
-                output_redirect = Some(OutputRedirect::Append(args[i + 1].as_str().to_string()));
-                i += 2;
-            }
-            "2>" => {
-                if i + 1 >= args.len() {
-                    return Err(exec_err_str("can't specify \"2>\" as last word in command"));
-                }
-                stderr_redirect = Some(StderrRedirect::Truncate(args[i + 1].as_str().to_string()));
-                i += 2;
-            }
-            "2>>" => {
-                if i + 1 >= args.len() {
-                    return Err(exec_err_str("can't specify \"2>>\" as last word in command"));
-                }
-                stderr_redirect = Some(StderrRedirect::Append(args[i + 1].as_str().to_string()));
-                i += 2;
-            }
-            "2>@1" => {
-                stderr_redirect = Some(StderrRedirect::ToStdout);
-                i += 1;
-            }
-            ">&" | ">>&" => {
-                if i + 1 >= args.len() {
-                    return Err(exec_err_str(format!(
-                        "can't specify \"{token}\" as last word in command"
-                    )));
-                }
-                let path = args[i + 1].as_str().to_string();
-                if token == ">&" {
-                    output_redirect = Some(OutputRedirect::Truncate(path.clone()));
-                    stderr_redirect = Some(StderrRedirect::Truncate(path));
-                } else {
-                    output_redirect = Some(OutputRedirect::Append(path.clone()));
-                    stderr_redirect = Some(StderrRedirect::Append(path));
-                }
-                i += 2;
+                continue;
             }
             "&" if i + 1 == args.len() => {
                 background = true;
                 i += 1;
+                continue;
             }
-            _ => {
-                current.push(token.to_string());
-                i += 1;
-            }
+            _ => {}
         }
+        let Some((op, attached)) = redirect_op(token) else {
+            current.push(token.to_string());
+            i += 1;
+            continue;
+        };
+        if op.ends_with('@') {
+            // `<@`/`>@`… name a channel: the host's descriptors are its
+            // own, an interpreter channel has no counterpart to hand over
+            // (C31's standing limit).
+            return Err(host_channel_redirect());
+        }
+        if op == "2>@1" {
+            if i + 1 != args.len() {
+                return Err(exec_usage_error(
+                    interp,
+                    "must specify \"2>@1\" as last word in command",
+                    "TCL OPERATION EXEC PIPESYNTAX",
+                ));
+            }
+            stderr_redirect = Some(StderrRedirect::ToStdout);
+            i += 1;
+            continue;
+        }
+        let target: String = if !attached.is_empty() {
+            attached.to_string()
+        } else {
+            match args.get(i + 1) {
+                Some(t) => t.as_str().to_string(),
+                None => {
+                    return Err(exec_usage_error(
+                        interp,
+                        format!("can't specify \"{op}\" as last word in command"),
+                        "TCL OPERATION EXEC SYNTAX",
+                    ));
+                }
+            }
+        };
+        match op {
+            "<" => input_redirect = Some(InputRedirect::File(target)),
+            "<<" => input_redirect = Some(InputRedirect::String(target)),
+            ">" => output_redirect = Some(OutputRedirect::Truncate(target)),
+            ">>" => output_redirect = Some(OutputRedirect::Append(target)),
+            "2>" => stderr_redirect = Some(StderrRedirect::Truncate(target)),
+            "2>>" => stderr_redirect = Some(StderrRedirect::Append(target)),
+            // `>& file` / `>>& file`: stderr goes to the same file.
+            ">&" => {
+                output_redirect = Some(OutputRedirect::Truncate(target.clone()));
+                stderr_redirect = Some(StderrRedirect::Truncate(target));
+            }
+            ">>&" => {
+                output_redirect = Some(OutputRedirect::Append(target.clone()));
+                stderr_redirect = Some(StderrRedirect::Append(target));
+            }
+            _ => unreachable!("every operator is handled or refused above"),
+        }
+        i += if attached.is_empty() { 2 } else { 1 };
     }
     if !current.is_empty() {
         stages.push(current);
+    } else if !stages.is_empty() {
+        // A pipeline that ends in `|`.
+        return Err(exec_usage_error(
+            interp,
+            "illegal use of | or |& in command",
+            "TCL OPERATION EXEC PIPESYNTAX",
+        ));
     }
     if stages.is_empty() {
-        return Err(exec_err_str("no command given"));
+        // Redirections, but no command anywhere (tclsh: the same error
+        // as a misplaced `|`).
+        return Err(exec_usage_error(
+            interp,
+            "illegal use of | or |& in command",
+            "TCL OPERATION EXEC PIPESYNTAX",
+        ));
     }
     if background && interp.host_jobs().is_none() {
         return Err(exec_err_str("exec: host job table unavailable"));
@@ -1200,8 +1224,8 @@ fn cmd_exec_host(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let mut out_eof = out_r.is_none();
     let mut err_eof = err_r.is_none();
     let mut done = vec![false; handles.len()];
-    let mut any_error = false;
-    let mut exit_code = 0i32;
+    // Each stage's exit code, filled in as it reaches a terminal state.
+    let mut codes: Vec<Option<i32>> = vec![None; handles.len()];
 
     loop {
         #[cfg(all(unix, not(target_arch = "wasm32")))]
@@ -1272,10 +1296,7 @@ fn cmd_exec_host(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
             if let Some(code) = p.wait().map_err(exec_err_str)? {
                 done[idx] = true;
-                if code != 0 {
-                    any_error = true;
-                    exit_code = code;
-                }
+                codes[idx] = Some(code);
             } else {
                 all = false;
             }
@@ -1298,38 +1319,46 @@ fn cmd_exec_host(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
     }
 
-    let mut stdout = String::from_utf8_lossy(&out).to_string();
-    if !keep_newline && stdout.ends_with('\n') {
-        stdout.pop();
-        if stdout.ends_with('\r') {
-            stdout.pop();
+    // The result is the output as tclsh reads it (UTF-8, `auto`
+    // translation: CR LF and a lone CR are one newline, an unknown byte
+    // is the character of its value), then each completion classified in
+    // tclsh's order (TclCleanupChildren): a failing stage's errorCode
+    // replaces the one before it.  The host ABI reports exit codes only
+    // (`HostProcess::wait` → `Some(code)`; a killed job is 137), so the
+    // native path's CHILDKILLED report has no counterpart here.
+    let mut text = tcl_output_text(out);
+    let stderr = tcl_output_text(err);
+    let mut failed = false;
+    let mut abnormal_exit = false;
+    let mut error_code: Option<String> = None;
+    for (idx, p) in handles.iter().enumerate() {
+        match codes[idx] {
+            Some(0) | None => {}
+            Some(code) => {
+                failed = true;
+                abnormal_exit = true;
+                error_code = Some(format!("CHILDSTATUS {} {}", p.id(), code));
+            }
         }
     }
-    let stderr = String::from_utf8_lossy(&err).to_string();
+    if !stderr.is_empty() {
+        failed = true;
+        text.push_str(&stderr);
+    } else if abnormal_exit {
+        text.push_str("child process exited abnormally");
+    }
+    if !keep_newline && text.ends_with('\n') {
+        text.pop();
+    }
 
-    if any_error {
-        let last_pid = handles.last().map(|p| p.id()).unwrap_or(0);
-        let error_code = format!("CHILDSTATUS {last_pid} {exit_code}");
-        let _ = interp.set_var("::errorCode", Value::from_str(&error_code));
-        interp.err_code_raised = true;
-        let mut msg = stderr.clone();
-        if msg.is_empty() {
-            msg = format!("child process exited abnormally (exit code {exit_code})");
+    if failed {
+        match error_code {
+            Some(code) => super::list::set_error_code(interp, &code),
+            None => super::list::set_error_code(interp, "NONE"),
         }
-        if msg.ends_with('\n') {
-            msg.pop();
-        }
-        return Err(Error::runtime(
-            format!("{stdout}{msg}"),
-            ErrorCode::Generic,
-        ));
+        return Err(Error::runtime(text, ErrorCode::Generic));
     }
-
-    let _ = interp.set_var("::errorCode", Value::from_str("NONE"));
-    if !stderr.is_empty() && !ignore_stderr {
-        eprint!("{stderr}");
-    }
-    Ok(Value::from_str(&stdout))
+    Ok(Value::from_str(&text))
 }
 
 fn host_open(fs: Option<&dyn HostFdFs>, path: &str, mode: FdMode) -> Result<Box<dyn HostFd>> {
@@ -1708,5 +1737,424 @@ mod tests {
         let mut interp = Interp::new();
         let result = interp.eval("exec this_command_does_not_exist_xyz123");
         assert!(result.is_err());
+    }
+
+    // ── host-backed exec (C32)：与原生路径同一套语义 ───────────────────────────
+    //
+    // 期望值全部按 tclsh9.1 实测钉形（同 crash-probes/d19 的断言——那批
+    // 探针在 tclsh 9.1.0 上逐字节过）。宿主路径从 CLI 不可达（HostExec
+    // 由 rogo 这类嵌入方注入），这批单元测试就是它的探针。
+
+    use crate::host::{ExecCommand, ExecIoError, HostExec, HostFd, HostProcess};
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct PipeBuf {
+        data: VecDeque<u8>,
+        closed: bool,
+    }
+
+    struct TestPipe {
+        buf: Arc<Mutex<PipeBuf>>,
+        writer: bool,
+    }
+
+    impl TestPipe {
+        fn pair() -> (Box<dyn HostFd>, Box<dyn HostFd>) {
+            let buf = Arc::new(Mutex::new(PipeBuf::default()));
+            (
+                Box::new(TestPipe { buf: buf.clone(), writer: false }),
+                Box::new(TestPipe { buf, writer: true }),
+            )
+        }
+    }
+
+    impl HostFd for TestPipe {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn read(&mut self, out: &mut [u8]) -> Result<usize, ExecIoError> {
+            if self.writer {
+                return Err(ExecIoError::Other("write-only".into()));
+            }
+            let mut b = self.buf.lock().unwrap();
+            if b.data.is_empty() {
+                return if b.closed { Ok(0) } else { Err(ExecIoError::WouldBlock) };
+            }
+            let n = out.len().min(b.data.len());
+            for slot in out[..n].iter_mut() {
+                *slot = b.data.pop_front().unwrap();
+            }
+            Ok(n)
+        }
+        fn write(&mut self, src: &[u8]) -> Result<usize, ExecIoError> {
+            if !self.writer {
+                return Err(ExecIoError::Other("read-only".into()));
+            }
+            let mut b = self.buf.lock().unwrap();
+            if b.closed {
+                return Err(ExecIoError::BrokenPipe);
+            }
+            b.data.extend(src.iter().copied());
+            Ok(src.len())
+        }
+        fn close(&mut self) -> Result<(), String> {
+            self.buf.lock().unwrap().closed = true;
+            Ok(())
+        }
+        fn poll(&mut self, _read: bool, _write: bool, _timeout_ms: u64) -> Result<(), String> {
+            Ok(())
+        }
+        fn dup(&self) -> Result<Box<dyn HostFd>, String> {
+            Ok(Box::new(TestPipe { buf: self.buf.clone(), writer: self.writer }))
+        }
+    }
+
+    struct TestProc {
+        id: u64,
+        code: i32,
+    }
+
+    impl HostProcess for TestProc {
+        fn id(&self) -> u64 {
+            self.id
+        }
+        fn state(&mut self) -> Result<crate::host::JobState, String> {
+            Ok(crate::host::JobState::Exited(self.code))
+        }
+        fn stop(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn wait(&mut self) -> Result<Option<i32>, String> {
+            Ok(Some(self.code))
+        }
+        fn kill(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn poll(&mut self, _timeout_ms: u64) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// A host that runs every stage in-process: stdout/stderr go into the
+    /// fd-1/fd-2 endpoints (shared state when `2>@1` dups them), each
+    /// spawn consumes the next exit code.  Id 7 so CHILDSTATUS pids are
+    /// deterministic (probes normalize them the same way).
+    struct TestHost {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        codes: Mutex<VecDeque<i32>>,
+        argvs: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl TestHost {
+        fn new(stdout: &str, stderr: &str, codes: &[i32]) -> Self {
+            Self {
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: stderr.as_bytes().to_vec(),
+                codes: Mutex::new(codes.iter().copied().collect()),
+                argvs: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl HostExec for TestHost {
+        fn spawn(
+            &self,
+            cmd: &ExecCommand,
+            mut fds: Vec<Option<Box<dyn HostFd>>>,
+            _env: &[(String, String)],
+        ) -> Result<Box<dyn HostProcess>, String> {
+            self.argvs.lock().unwrap().push(cmd.argv.clone());
+            // Write both streams before closing either: with `2>@1` they
+            // share one pipe, and an early close would EPIPE the second.
+            let mut ends: Vec<Option<Box<dyn HostFd>>> =
+                vec![fds.get_mut(1).and_then(Option::take), fds.get_mut(2).and_then(Option::take)];
+            if let Some(w) = ends[0].as_mut() {
+                let _ = w.write(&self.stdout);
+            }
+            if let Some(w) = ends[1].as_mut() {
+                let _ = w.write(&self.stderr);
+            }
+            for w in ends.iter_mut().flatten() {
+                let _ = w.close();
+            }
+            let code = self.codes.lock().unwrap().pop_front().unwrap_or(0);
+            Ok(Box::new(TestProc { id: 7, code }))
+        }
+
+        fn pipe(&self) -> Result<(Box<dyn HostFd>, Box<dyn HostFd>), String> {
+            Ok(TestPipe::pair())
+        }
+    }
+
+    /// Every file open succeeds with a sink that discards: enough for the
+    /// redirection tests, which only observe the command line and the
+    /// capture pipes.
+    struct DiscardFs;
+
+    impl crate::host::HostFdFs for DiscardFs {
+        fn open(
+            &self,
+            _path: &str,
+            _mode: crate::host::FdMode,
+        ) -> std::result::Result<Box<dyn HostFd>, String> {
+            Ok(Box::new(crate::host::NullFd))
+        }
+    }
+
+    fn host_interp(stdout: &str, stderr: &str, codes: &[i32]) -> Interp {
+        let mut interp = Interp::new();
+        interp.set_exec(Box::new(TestHost::new(stdout, stderr, codes)));
+        // d19 sets it the same way: errorCode does not exist until an error.
+        let _ = interp.eval("set ::errorCode NONE");
+        interp
+    }
+
+    /// `catch`'s triple, with the pid deterministic (mock id 7).
+    fn host_catch(interp: &mut Interp, script: &str) -> String {
+        interp
+            .eval(&format!("set c [catch {{{script}}} r]; list $c $r $::errorCode"))
+            .unwrap()
+            .as_str()
+            .to_string()
+    }
+
+    #[test]
+    fn test_host_stderr_fails() {
+        // d19: stderr-fails — the message is stdout then stderr, errorCode NONE.
+        let mut interp = host_interp("OUT\n", "ERR\n", &[0]);
+        assert_eq!(host_catch(&mut interp, "exec mock"), "1 {OUT\nERR} NONE");
+    }
+
+    #[test]
+    fn test_host_stderr_only() {
+        let mut interp = host_interp("", "ERR\n", &[0]);
+        assert_eq!(host_catch(&mut interp, "exec mock"), "1 ERR NONE");
+    }
+
+    #[test]
+    fn test_host_stderr_ignorestderr() {
+        let mut interp = host_interp("OUT\n", "ERR\n", &[0]);
+        assert_eq!(host_catch(&mut interp, "exec -ignorestderr mock"), "0 OUT NONE");
+    }
+
+    #[test]
+    fn test_host_stderr_keepnewline() {
+        let mut interp = host_interp("OUT\n", "ERR\n", &[0]);
+        assert_eq!(host_catch(&mut interp, "exec -keepnewline mock"), "1 {OUT\nERR\n} NONE");
+    }
+
+    #[test]
+    fn test_host_exit_code() {
+        // d19: exit-code — no "(exit code N)", CHILDSTATUS carries the code.
+        let mut interp = host_interp("", "", &[3]);
+        assert_eq!(
+            host_catch(&mut interp, "exec mock"),
+            "1 {child process exited abnormally} {CHILDSTATUS 7 3}"
+        );
+    }
+
+    #[test]
+    fn test_host_exit_stdout() {
+        let mut interp = host_interp("A\n", "", &[3]);
+        assert_eq!(
+            host_catch(&mut interp, "exec mock"),
+            "1 {A\nchild process exited abnormally} {CHILDSTATUS 7 3}"
+        );
+    }
+
+    #[test]
+    fn test_host_exit_with_stderr() {
+        // d19: exit-with-stderr — the stderr replaces the abnormal-exit note.
+        let mut interp = host_interp("A", "B\n", &[3]);
+        assert_eq!(host_catch(&mut interp, "exec mock"), "1 AB {CHILDSTATUS 7 3}");
+    }
+
+    #[test]
+    fn test_host_success_leaves_errorcode() {
+        // d19: success-untouched — a success leaves ::errorCode alone.
+        let mut interp = host_interp("hi\n", "", &[0]);
+        interp.eval("set ::errorCode SENTINEL").unwrap();
+        assert_eq!(host_catch(&mut interp, "exec mock"), "0 hi SENTINEL");
+    }
+
+    #[test]
+    fn test_host_two_failures() {
+        // d19: two-failures — the last failing stage wins the errorCode.
+        let mut interp = host_interp("", "", &[1, 2]);
+        assert_eq!(
+            host_catch(&mut interp, "exec a | b"),
+            "1 {child process exited abnormally} {CHILDSTATUS 7 2}"
+        );
+    }
+
+    #[test]
+    fn test_host_bad_switch() {
+        // tclsh's index-lookup refusal (native path's test_exec_bad_switch,
+        // on the host path's scanner now too).
+        let mut interp = host_interp("", "", &[]);
+        assert_eq!(
+            host_catch(&mut interp, "exec -badswitch echo hello"),
+            "1 {bad option \"-badswitch\": must be -ignorestderr, -keepnewline, or --} {TCL LOOKUP INDEX option -badswitch}"
+        );
+    }
+
+    #[test]
+    fn test_host_trailing_pipe() {
+        let mut interp = host_interp("", "", &[]);
+        assert_eq!(
+            host_catch(&mut interp, "exec mock |"),
+            "1 {illegal use of | or |& in command} {TCL OPERATION EXEC PIPESYNTAX}"
+        );
+    }
+
+    #[test]
+    fn test_host_no_command() {
+        // C36's host-path remainder: redirections but no command is the
+        // misplaced-| error (native path's d19: before-spawn).
+        let mut interp = host_interp("", "", &[]);
+        assert_eq!(
+            host_catch(&mut interp, "exec > somewhere"),
+            "1 {illegal use of | or |& in command} {TCL OPERATION EXEC PIPESYNTAX}"
+        );
+    }
+
+    #[test]
+    fn test_host_2at1_not_last() {
+        let mut interp = host_interp("", "", &[]);
+        assert_eq!(
+            host_catch(&mut interp, "exec mock 2>@1 | mock"),
+            "1 {must specify \"2>@1\" as last word in command} {TCL OPERATION EXEC PIPESYNTAX}"
+        );
+    }
+
+    #[test]
+    fn test_host_2at1_merged() {
+        // d19: merged — both streams on one pipe, in the order written.
+        let mut interp = host_interp("1\n2\n", "E1\nE2\n", &[0]);
+        assert_eq!(host_catch(&mut interp, "exec mock 2>@1"), "0 {1\n2\nE1\nE2} NONE");
+    }
+
+    #[test]
+    fn test_host_channel_redirect_refused() {
+        // C31's standing limit stays an explicit error on the host path.
+        let mut interp = host_interp("", "", &[]);
+        assert_eq!(
+            host_catch(&mut interp, "exec mock >@ stdout"),
+            "1 {redirection to a channel is not supported by the host's exec} NONE"
+        );
+    }
+
+    #[test]
+    fn test_host_attached_target_not_an_argument() {
+        // Attached targets (`>file`) are redirections, not arguments
+        // (d19: attached): with a discard fs the command runs and its
+        // argv carries only the command words.
+        let host = Arc::new(TestHost::new("", "", &[0]));
+        let mut interp = Interp::new();
+        interp.set_exec(Box::new(RecordingHost(host.clone())));
+        interp.set_fd_fs(Box::new(DiscardFs));
+        let _ = interp.eval("set ::errorCode NONE");
+        let r = host_catch(&mut interp, "exec echo hi >somewhere");
+        assert_eq!(r, "0 {} NONE");
+        let argvs = host.argvs.lock().unwrap();
+        assert_eq!(argvs.as_slice(), [vec!["echo".to_string(), "hi".to_string()]]);
+    }
+
+    struct RecordingHost(Arc<TestHost>);
+
+    impl HostExec for RecordingHost {
+        fn spawn(
+            &self,
+            cmd: &ExecCommand,
+            fds: Vec<Option<Box<dyn HostFd>>>,
+            env: &[(String, String)],
+        ) -> Result<Box<dyn HostProcess>, String> {
+            self.0.spawn(cmd, fds, env)
+        }
+        fn pipe(&self) -> Result<(Box<dyn HostFd>, Box<dyn HostFd>), String> {
+            self.0.pipe()
+        }
+    }
+}
+
+// ── tcl::process（9.1 的子进程管理 ensemble）────────────────────────
+// 进程在本仓的 exec 模型里由宿主（HostExec）或 std::process 托管，本
+// ensemble 承载其管理面：autopurge 开关、存活列表与状态字典。当前执
+// 行器的子进程随 exec 调用即收即清（M5 语义），故 list/status 的常态
+// 为空——与语料 process-1.1..3.2 钉形一致；有常驻子进程后的填充点在
+// `children()`。
+
+static PROCESS_AUTOPURGE: AtomicBool = AtomicBool::new(true);
+
+pub fn cmd_tcl_process(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    const SUBCMDS: &str = "autopurge, list, purge, or status";
+    if args.len() < 2 {
+        return Err(Error::wrong_args_with_usage(
+            "tcl::process",
+            1,
+            args.len(),
+            "subcommand ?arg ...?",
+        ));
+    }
+    let raw = args[1].as_str();
+    const KNOWN: [&str; 4] = ["autopurge", "list", "purge", "status"];
+    let sub = if KNOWN.contains(&raw) {
+        raw.to_string()
+    } else {
+        let hits: Vec<&str> = KNOWN.iter().copied().filter(|s| s.starts_with(raw)).collect();
+        match hits.as_slice() {
+            [one] => (*one).to_string(),
+            _ => {
+                super::list::set_error_code(
+                    interp,
+                    &format!("TCL LOOKUP SUBCOMMAND {}", raw),
+                );
+                return Err(Error::runtime(
+                    format!("unknown or ambiguous subcommand \"{}\": must be {}", raw, SUBCMDS),
+                    ErrorCode::Generic,
+                ));
+            }
+        }
+    };
+
+    match sub.as_str() {
+        // autopurge ?boolean? — get/set the auto-reap flag (returns current).
+        "autopurge" => {
+            let cur = PROCESS_AUTOPURGE.load(Ordering::Relaxed);
+            if args.len() > 2 {
+                let v = args[2]
+                    .as_int()
+                    .or_else(|| {
+                        match args[2].as_str() {
+                            "true" => Some(1),
+                            "false" => Some(0),
+                            _ => None,
+                        }
+                    })
+                    .ok_or_else(|| {
+                        Error::runtime(
+                            format!("expected boolean value but got \"{}\"", args[2].as_str()),
+                            ErrorCode::Generic,
+                        )
+                    })?;
+                PROCESS_AUTOPURGE.store(v != 0, Ordering::Relaxed);
+                return Ok(Value::from_int(v));
+            }
+            Ok(Value::from_int(cur as i64))
+        }
+        // list — pids of live child processes (empty: exec children are
+        // reaped at call completion, M5 semantics).
+        "list" => Ok(Value::empty()),
+        // purge — reap finished children (no-op under call-scoped reaping).
+        "purge" => Ok(Value::empty()),
+        // status ?pattern? — dict of child status (empty same as list).
+        "status" => Ok(Value::empty()),
+        _ => unreachable!(),
     }
 }

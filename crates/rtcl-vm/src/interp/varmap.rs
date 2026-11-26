@@ -21,14 +21,39 @@
 #[cfg(not(feature = "embedded"))]
 mod fx {
     use std::hash::Hasher;
+    use std::sync::OnceLock;
 
     /// FxHash's mixing constant.
     const SEED: u64 = 0x517c_c1b7_2722_0a95;
 
+    /// Per-process random seed (S39，审计：无密钥哈希可预构造冲突键).
+    /// std 的 RandomState 每**实例**持一对随机 SipHash 键——对固定消息
+    /// 求一次 finish 即得到进程内一次性的伪随机值，不引入任何依赖。
+    /// 同进程内所有表同种子（序确定性保持，双引擎/sweep 一致）；跨进
+    /// 程不可预测，预构造的冲突键不再跨运行成立。迭代序已实证不承载
+    /// 输出（P6 的 fmix64 换序后 judge/probes/sweep 全绿）。
+    fn process_seed() -> u64 {
+        static SEED: OnceLock<u64> = OnceLock::new();
+        *SEED.get_or_init(|| {
+            use std::hash::{BuildHasher, Hash, Hasher};
+            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+            0x7274_636c_5f73_3339_u64.hash(&mut h); // "rtcl_s39"
+            let a = h.finish();
+            a.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        })
+    }
+
     /// Unkeyed multiply-mix hasher for short string keys.
-    #[derive(Default, Clone)]
+    #[derive(Clone)]
     pub struct VarHasher {
         hash: u64,
+        seed: u64,
+    }
+
+    impl Default for VarHasher {
+        fn default() -> Self {
+            Self { hash: 0, seed: process_seed() }
+        }
     }
 
     impl VarHasher {
@@ -44,17 +69,19 @@ mod fx {
     impl Hasher for VarHasher {
         #[inline]
         fn finish(&self) -> u64 {
-            // Murmur3 fmix64 avalanche (the same finalizer value.rs's
-            // dict-key FxHasher has run since its 300k-probe-chain
-            // incident).  The raw multiply-mix leaves the bucket index
-            // (HashMap's LOW bits) dependent only on the first ~2 bytes
-            // of a name: generated families that share a prefix and
-            // length — `k000000..kN` — collapsed into ~32 of 131072
-            // buckets (chains of 1800+) at 60k variables; the variable
-            // tables degenerated exactly like the dict tables did.  A
-            // bijection, so distinct names stay distinct; ~3 ops per
+            // Per-process seed XOR (S39) before the Murmur3 fmix64
+            // avalanche (the same finalizer value.rs's dict-key FxHasher
+            // has run since its 300k-probe-chain incident).  The raw
+            // multiply-mix leaves the bucket index (HashMap's LOW bits)
+            // dependent only on the first ~2 bytes of a name: generated
+            // families that share a prefix and length — `k000000..kN` —
+            // collapsed into ~32 of 131072 buckets (chains of 1800+) at
+            // 60k variables; the variable tables degenerated exactly
+            // like the dict tables did.  fmix64 is a bijection, so
+            // distinct names stay distinct; the seed XOR keeps the
+            // distribution (P6) while decorrelating runs; ~4 ops per
             // finish, far under the probe chains it removes (P6).
-            let mut x = self.hash;
+            let mut x = self.hash ^ self.seed;
             x ^= x >> 33;
             x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
             x ^= x >> 33;

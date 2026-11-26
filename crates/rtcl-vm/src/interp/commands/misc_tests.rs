@@ -657,7 +657,7 @@ fn test_info_subcommand_ambiguous_message() {
     let e = interp.eval("info com").unwrap_err().to_string();
     assert_eq!(
         e,
-        "unknown or ambiguous subcommand \"com\": must be args, body, class, cmdcount, commands, complete, coroutine, default, errorstack, exists, frame, functions, globals, hostname, level, library, loaded, locals, nameofexecutable, object, patchlevel, procs, script, sharedlibextension, tclversion, or vars"
+        "unknown or ambiguous subcommand \"com\": must be args, body, class, cmdcount, cmdtype, commands, complete, constant, consts, coroutine, default, errorstack, exists, frame, functions, globals, hostname, level, library, loaded, locals, nameofexecutable, object, patchlevel, procs, script, sharedlibextension, tclversion, or vars"
     );
 }
 

@@ -13,6 +13,10 @@
 > 定稿 = 路线 C，见 `docs/JIT-WASM-GC.md`，实现仍暂停）。
 >
 > 最后更新：2026-11-26（横幅与「审计后续轮」一节）；其余各节按各自日期。
+> **W-B 进行中（2026-11-26）**：B2 已落地（exec 宿主路径 9.1 对齐、file
+> attributes/tildeexpand/home、S38 HTTP 加固、S21 大小守卫、objsec flake
+> 根治——记录见 BASELINE 2026-11-26 B2 节）；B1（C16/C28/C38/C39/C47 等
+> 语义对齐）与 B3（命令清单 374 case 主战场）在途。
 > **W-A 落地（2026-11-26）**：语料 9.1 重提取（judge 新基线 4157/4849=85.7%，
 > 失败归组见 TODO「对标迁移」横幅）+ D5 num-bigint（arch 设计 specs/ARCH-DESIGN-20261126.md）。
 > **事务任务包 T0–T13 全部完成（2026-11-26）**：9.1 迁移启动（oracle

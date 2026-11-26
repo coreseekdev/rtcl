@@ -27,6 +27,7 @@ pub mod package;
 pub mod chan_io;
 pub mod compat;
 pub mod mathop;
+pub mod fpmath;
 pub mod coro;
 pub mod dynmod;
 

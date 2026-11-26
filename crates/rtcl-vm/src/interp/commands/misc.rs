@@ -260,6 +260,17 @@ pub fn cmd_env(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 // ---------- rand ----------
 
 /// `rand ?min? ?max?` — Generate random integer.
+/// `::tcl::mathfunc::<fn>` — expr 数学函数的真命令形态（9.1 的
+/// BuiltinFuncTable 双注册面；`info commands tcl::mathfunc::*` 列出的
+/// 就是这些名字）。函数体与 expr 共用
+/// [`crate::types::expr_funcs::call_math_func`]，rand 的种子语义也和
+/// expr 求值路径一致（call_depth）。
+pub fn cmd_mathfunc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let fname = args[0].as_str().rsplit("::").next().unwrap_or("");
+    let seed = interp.call_depth;
+    crate::types::expr_funcs::call_math_func(fname, args[1..].to_vec(), seed)
+}
+
 pub fn cmd_rand(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let (min, max) = match args.len() {
         1 => (0i64, i64::MAX),
@@ -404,6 +415,69 @@ pub fn cmd_xtrace(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     Ok(Value::empty())
 }
 
+/// const varName value — tclsh 9.1 (tclVar.c Tcl_ConstObjCmd): create
+/// the variable and flag it constant; writes, unsets and incr error.
+/// Re-const on an existing constant is a silent no-op; on an existing
+/// non-constant it errors (TCL LOOKUP CONST).
+pub fn cmd_const(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() != 3 {
+        set_error_code(interp, "TCL WRONGARGS");
+        return Err(Error::wrong_args_with_usage("const", 3, args.len(), "varName value"));
+    }
+    let name = args[1].as_str();
+    if name.contains('(') {
+        set_error_code(interp, "TCL LOOKUP CONST");
+        return Err(tcl_err(format!(
+            "can't make constant \"{}\": name refers to an element in an array",
+            name
+        )));
+    }
+    // An existing array cannot become a constant.
+    if interp.is_array_semantic(name) {
+        set_error_code(interp, "TCL LOOKUP CONST");
+        return Err(tcl_err(format!(
+            "can't make constant \"{}\": variable is array",
+            name
+        )));
+    }
+    if interp.var_exists_quiet(name) {
+        if interp.is_const_marked(name) {
+            return Ok(Value::empty());
+        }
+        set_error_code(interp, "TCL LOOKUP CONST");
+        return Err(tcl_err(format!(
+            "can't make constant \"{}\": variable already exists",
+            name
+        )));
+    }
+    // Create through the ordinary set (fires write traces, tclsh pins
+    // the creation-set as a write), then flag constant in the owning
+    // scope: frame-scoped for proc locals, the global set otherwise.
+    // A ::-qualified name in a missing parent namespace errors with the
+    // const-command path text (var-25.6: can't const "::nosuchns::x":
+    // parent namespace doesn't exist) — set_var's own guard produces the
+    // same message with a can't set head, so reword it.
+    if let Err(e) = interp.set_var(name, args[2].clone()) {
+        let msg = e.to_string();
+        if msg.contains("parent namespace doesn't exist") {
+            set_error_code(interp, "TCL LOOKUP VARNAME");
+            return Err(tcl_err(format!(
+                "can't const \"{}\": parent namespace doesn't exist",
+                name
+            )));
+        }
+        return Err(e);
+    }
+    if interp.frames.is_empty() {
+        interp.const_globals.push(name.to_string());
+    } else {
+        if let Some(frame) = interp.frames.last_mut() {
+            frame.consts.get_or_insert_with(Vec::new).push(name.to_string());
+        }
+    }
+    Ok(Value::empty())
+}
+
 pub fn cmd_set(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     match args.len() {
         2 => interp.read_var(args[1].as_str()),
@@ -478,6 +552,12 @@ fn incr_int_of(interp: &mut Interp, v: &Value) -> std::result::Result<num_bigint
 }
 
 pub fn cmd_incr(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    // const 守卫（tclVar.c 2310：incr 路径的 ISCONST 错形）。
+    if args.len() >= 2 {
+        if let Some(e) = interp.const_incr_err(args[1].as_str()) {
+            return Err(e);
+        }
+    }
     if args.len() < 2 || args.len() > 3 {
         return Err(Error::wrong_args("incr", 2, args.len()));
     }
@@ -763,17 +843,25 @@ fn list_commands_in(
 /// unknown-or-ambiguous error.
 /// The expr math functions, in tclsh 8.6.17's `Tcl_ListMathFuncs` table
 /// order (deterministic per build) — `info functions` lists them.
+/// C99 全集（TIP 745/521）入列，顺序对 tclsh 9.1.0 的表序实测钉形
+/// （info4 的 `info functions` 逐字节一致）。
 const EXPR_MATH_FUNCTIONS: &[&str] = &[
-    "round", "wide", "sqrt", "sin", "log10", "double", "hypot", "atan", "bool", "rand",
-    "abs", "acos", "atan2", "entier", "srand", "sinh", "log", "floor", "tanh", "tan",
-    "isqrt", "int", "asin", "min", "ceil", "cos", "cosh", "exp", "max", "pow", "fmod",
+    "signbit", "wide", "isinf", "sin", "dim", "log10", "log1p", "bool", "atan", "hypot",
+    "isnormal", "tanh", "tan", "int", "atanh", "ldexp", "pow", "round", "copysign",
+    "rand", "atan2", "abs", "trunc", "min", "erf", "exp", "max", "nextafter", "cbrt",
+    "acos", "entier", "issubnormal", "srand", "erfc", "isnan", "floor", "logb", "cos",
+    "sqrt", "double", "expm1", "gamma", "isfinite", "exp2", "sinh", "log", "asinh",
+    "asin", "isqrt", "fma", "isunordered", "log2", "ceil", "cosh", "acosh", "fmod",
+    "lgamma", "remainder",
 ];
 
+/// tclsh 9.1.0's `info` subcommand list (unknown-or-ambiguous error
+/// order; `cmdtype`/`constant`/`consts` are 9.x additions).
 const INFO_CANONICAL_SUBCMDS: &[&str] = &[
-    "args", "body", "class", "cmdcount", "commands", "complete", "coroutine", "default",
-    "errorstack", "exists", "frame", "functions", "globals", "hostname", "level", "library",
-    "loaded", "locals", "nameofexecutable", "object", "patchlevel", "procs", "script",
-    "sharedlibextension", "tclversion", "vars",
+    "args", "body", "class", "cmdcount", "cmdtype", "commands", "complete", "constant",
+    "consts", "coroutine", "default", "errorstack", "exists", "frame", "functions",
+    "globals", "hostname", "level", "library", "loaded", "locals", "nameofexecutable",
+    "object", "patchlevel", "procs", "script", "sharedlibextension", "tclversion", "vars",
 ];
 
 /// Resolve an `info` subcommand word: exact matches win (including the
@@ -786,6 +874,7 @@ fn resolve_info_subcmd(sub_raw: &str) -> Result<String> {
         "locals", "nameofexecutable", "patchlevel", "library", "procs", "script", "vars", "alias",
         "aliases", "channels", "version", "help", "returncodes", "usage", "frame",
         "stacktrace", "references", "tainted", "statics", "source",
+        "constant", "consts", "cmdtype",
     ];
     if EXACT_KNOWN.contains(&sub_raw) {
         return Ok(sub_raw.to_string());
@@ -1304,6 +1393,101 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         "version" => Ok(Value::from_str("8.6")),
         "patchlevel" => Ok(Value::from_str("8.6.17")),
+        // info constant varName — 9.1 (tclInfo.c InfoConstantCmd): 1 when
+        // the name is const-marked in the reading scope.  A missing
+        // variable reads 0 (pinned: `info constant foo` -> 0).
+        "constant" => {
+            if args.len() != 3 {
+                set_error_code(interp, "TCL WRONGARGS");
+                return Err(Error::wrong_args_with_usage(
+                    "info",
+                    2,
+                    args.len(),
+                    "constant varName",
+                ));
+            }
+            Ok(Value::from_bool(interp.is_const_marked(args[2].as_str())))
+        }
+        // info consts ?pattern? — the const-marked names visible in the
+        // current scope (frame marks first, then the global set), in
+        // hash-table replay order.
+        "consts" => {
+            if args.len() > 3 {
+                set_error_code(interp, "TCL WRONGARGS");
+                return Err(Error::wrong_args_with_usage(
+                    "info",
+                    2,
+                    args.len(),
+                    "consts ?pattern?",
+                ));
+            }
+            let pattern = args.get(2).map(|v| v.as_str());
+            // Proc scope lists only the frame's constants (pinned:
+            // `info consts` inside apply does not leak the global ones).
+            let mut names: Vec<Value> = Vec::new();
+            if let Some(frame) = interp.frames.last() {
+                if let Some(consts) = &frame.consts {
+                    for c in consts {
+                        names.push(Value::from_str(c));
+                    }
+                }
+            } else {
+                for c in &interp.const_globals {
+                    names.push(Value::from_str(c));
+                }
+            }
+            if let Some(p) = pattern {
+                names.retain(|n| crate::interp::glob_match(p, n.as_str()));
+            }
+            Ok(Value::from_list(&names))
+        }
+        // info cmdtype commandName — 9.0 (tclInfo.c InfoCmdTypeCmd):
+        // proc | native | alias | ensemble (the corpus pins proc/native).
+        "cmdtype" => {
+            if args.len() != 3 {
+                set_error_code(interp, "TCL WRONGARGS");
+                return Err(Error::wrong_args_with_usage(
+                    "info",
+                    2,
+                    args.len(),
+                    "cmdtype commandName",
+                ));
+            }
+            let name = args[2].as_str();
+            let lookup = |k: &str| {
+                interp.procs.contains_key(k)
+                    || interp.commands.contains_key(k)
+                    || interp.ensembles.contains_key(k)
+                    || interp.import_aliases.contains_key(k)
+                    || {
+                        let alt = format!("::{}", k);
+                        interp.procs.contains_key(&alt)
+                            || interp.commands.contains_key(&alt)
+                            || interp.ensembles.contains_key(&alt)
+                            || interp.import_aliases.contains_key(&alt)
+                    }
+            };
+            if !lookup(name) {
+                set_error_code(interp, "TCL LOOKUP COMMAND");
+                return Err(tcl_err(format!("unknown command \"{}\"", name)));
+            }
+            let bare = name.trim_start_matches("::");
+            let kind = if interp.procs.contains_key(name)
+                || interp.procs.contains_key(&format!("::{}", name))
+            {
+                "proc"
+            } else if interp.import_aliases.contains_key(name)
+                || interp
+                    .import_aliases
+                    .contains_key(&format!("::{}", name))
+            {
+                "alias"
+            } else {
+                "native"
+            };
+            let _ = bare;
+            Ok(Value::from_str(kind))
+        }
         "library" => Ok(interp
             .get_var("::tcl_library")
             .map(|v| v.clone())
@@ -1530,35 +1714,81 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 pub fn cmd_subst(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
-        return Err(Error::wrong_args("subst", 2, args.len()));
+        // 9.1 usage spells the positive options first (pinned
+        // subst-1.1).
+        return Err(Error::wrong_args_with_usage(
+            "subst",
+            2,
+            args.len(),
+            "?-backslashes? ?-commands? ?-variables? ?-nobackslashes? ?-nocommands? ?-novariables? string",
+        ));
     }
 
+    // 9.1 option face (tclCmdMZ.c TclSubstOptions): EVERY argument but
+    // the last is an option — GetIndexFromObj's exact/prefix rules with
+    // `ambiguous option` vs `bad option` wordings; the positive options
+    // (-backslashes/-commands/-variables) turn on ONLY those
+    // substitutions, the negative ones mask the default all-on set, and
+    // mixing the two families errors.
+    const SUBST_OPTIONS: [&str; 6] = [
+        "-backslashes",
+        "-commands",
+        "-variables",
+        "-nobackslashes",
+        "-nocommands",
+        "-novariables",
+    ];
+    let mut pos_back = false;
+    let mut pos_cmds = false;
+    let mut pos_vars = false;
     let mut nobackslashes = false;
     let mut nocommands = false;
     let mut novariables = false;
-    let mut i = 1;
-
-    while i < args.len() - 1 {
-        // tclsh accepts unambiguous prefixes (-nov, -nob, -noc).
-        let a = args[i].as_str();
-        let flag = |full: &str| a.len() > 1 && full.starts_with(a);
-        let (m_nob, m_noc, m_nov) = (
-            flag("-nobackslashes"),
-            flag("-nocommands"),
-            flag("-novariables"),
-        );
-        match m_nob as u8 + m_noc as u8 + m_nov as u8 {
-            1 => {
-                nobackslashes |= m_nob;
-                nocommands |= m_noc;
-                novariables |= m_nov;
+    for a in &args[1..args.len() - 1] {
+        let word = a.as_str();
+        let resolved = if SUBST_OPTIONS.contains(&word) {
+            Some(word)
+        } else {
+            let hits: Vec<&str> = SUBST_OPTIONS
+                .iter()
+                .copied()
+                .filter(|o| o.starts_with(word))
+                .collect();
+            match hits.as_slice() {
+                [one] => Some(*one),
+                _ => {
+                    set_error_code(
+                        interp,
+                        &format!("TCL LOOKUP INDEX option {}", word),
+                    );
+                    let kind = if hits.is_empty() { "bad" } else { "ambiguous" };
+                    return Err(tcl_err(format!(
+                        "{} option \"{}\": must be -backslashes, -commands, -variables, -nobackslashes, -nocommands, or -novariables",
+                        kind, word
+                    )));
+                }
             }
-            _ => break,
+        };
+        match resolved {
+            Some("-backslashes") => pos_back = true,
+            Some("-commands") => pos_cmds = true,
+            Some("-variables") => pos_vars = true,
+            Some("-nobackslashes") => nobackslashes = true,
+            Some("-nocommands") => nocommands = true,
+            Some("-novariables") => novariables = true,
+            _ => {}
         }
-        i += 1;
+    }
+    if pos_back || pos_cmds || pos_vars {
+        if nobackslashes || nocommands || novariables {
+            return Err(tcl_err("cannot combine positive and negative options"));
+        }
+        nobackslashes = !pos_back;
+        nocommands = !pos_cmds;
+        novariables = !pos_vars;
     }
 
-    let template = args[i].as_str();
+    let template = args[args.len() - 1].as_str();
     let mut result = String::new();
     let chars: Vec<char> = template.chars().collect();
     let mut ci = 0;

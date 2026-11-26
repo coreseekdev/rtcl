@@ -2195,7 +2195,12 @@ fn format_float(n: f64) -> String {
         return if n > 0.0 { "Inf".to_string() } else { "-Inf".to_string() };
     }
     if n.is_nan() {
-        return "NaN".to_string();
+        // 符号位跟随（remquo 域错误的 NaN 在 tclsh 印作 "-NaN"）。
+        return if n.is_sign_negative() {
+            "-NaN".to_string()
+        } else {
+            "NaN".to_string()
+        };
     }
     // tclsh (8.6.17, verified): shortest round-trip digits, laid out in
     // fixed notation when the decimal exponent is in -4..=16, exponent

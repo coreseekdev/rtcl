@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 use crate::interp::Interp;
 use crate::value::Value;
 
-use super::list::set_error_code;
+use super::list::{set_error_code, tcl_err};
 
 /// Evaluate an `if` arm body script.  tclsh compiles these constructs
 /// inline: a body error propagates framelessly (F2/N8 — no frame names the
@@ -208,25 +208,36 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let objc = args.len();
 
     #[derive(PartialEq, Clone, Copy)]
-    enum MatchMode { Exact, Glob, Regexp }
+    enum MatchMode { Exact, Glob, Regexp, Integer }
+
+    impl MatchMode {
+        fn option_name(self) -> &'static str {
+            match self {
+                MatchMode::Exact => "-exact",
+                MatchMode::Glob => "-glob",
+                MatchMode::Regexp => "-regexp",
+                MatchMode::Integer => "-integer",
+            }
+        }
+    }
 
     // tclsh parses options only while two arguments (string + at least one
     // pattern) remain — `switch -- x` never consumes the "--", so the string
     // is "--" and the lone "x" is an odd list element.
-    const OPTIONS: [&str; 7] = [
-        "-exact", "-glob", "-indexvar", "-matchvar", "-nocase", "-regexp", "--",
+    const OPTIONS: [&str; 8] = [
+        "-exact", "-glob", "-indexvar", "-integer", "-matchvar", "-nocase", "-regexp", "--",
     ];
+    const OPTION_LIST: &str =
+        "must be -exact, -glob, -indexvar, -integer, -matchvar, -nocase, -regexp, or --";
     let mut mode = MatchMode::Exact;
     let mut found_mode = false;
     let mut nocase = false;
     let mut matchvar: Option<String> = None;
     let mut indexvar: Option<String> = None;
 
-    let bad_option = |opt: &str, msg: &str| {
-        Error::runtime(
-            format!("bad option \"{}\": {}", opt, msg),
-            crate::error::ErrorCode::Generic,
-        )
+    let bad_option = |interp: &mut Interp, opt: &str, msg: &str, code: &str| {
+        set_error_code(interp, code);
+        tcl_err(format!("bad option \"{}\": {}", opt, msg))
     };
 
     let mut i = 1usize;
@@ -243,38 +254,30 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             .collect();
         let opt = match hits.as_slice() {
             [one] => *one,
-            [] => {
-                return Err(bad_option(
-                    word,
-                    "must be -exact, -glob, -indexvar, -matchvar, -nocase, -regexp, or --",
-                ));
-            }
             _ => {
                 return Err(bad_option(
+                    interp,
                     word,
-                    "must be -exact, -glob, -indexvar, -matchvar, -nocase, -regexp, or --",
+                    OPTION_LIST,
+                    &format!("TCL LOOKUP INDEX option {}", word),
                 ));
             }
         };
         match opt {
-            "-exact" | "-glob" | "-regexp" => {
+            "-exact" | "-glob" | "-regexp" | "-integer" => {
                 if found_mode {
                     return Err(bad_option(
+                        interp,
                         word,
-                        &format!(
-                            "{} option already found",
-                            match mode {
-                                MatchMode::Exact => "-exact",
-                                MatchMode::Glob => "-glob",
-                                MatchMode::Regexp => "-regexp",
-                            }
-                        ),
+                        &format!("{} option already found", mode.option_name()),
+                        "TCL OPERATION SWITCH DOUBLEOPT",
                     ));
                 }
                 found_mode = true;
                 mode = match opt {
                     "-glob" => MatchMode::Glob,
                     "-regexp" => MatchMode::Regexp,
+                    "-integer" => MatchMode::Integer,
                     _ => MatchMode::Exact,
                 };
             }
@@ -317,9 +320,29 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             crate::error::ErrorCode::Generic,
         ));
     }
+    // -integer rejects -nocase (9.1; either spelling order, pinned:
+    // TCL OPERATION SWITCH MODERESTRICTION).
+    if nocase && mode == MatchMode::Integer {
+        set_error_code(interp, "TCL OPERATION SWITCH MODERESTRICTION");
+        return Err(tcl_err(
+            "-nocase option cannot be used with -integer option",
+        ));
+    }
 
     let string = args[i].as_str();
     i += 1;
+
+    // -integer: the STRING is parsed once up front (a bad one errors
+    // before any arm runs, even with a default arm — pinned), each
+    // PATTERN lazily as its arm is compared.  The literal grammar is
+    // Tcl's (0x/0o/0b/legacy octal, sign); doubles and huge bignums are
+    // rejected by GetWideIntFromObj's error shapes.
+    let int_string: Option<i64>;
+    if mode == MatchMode::Integer {
+        int_string = Some(switch_int_value(interp, string)?);
+    } else {
+        int_string = None;
+    }
 
     let patterns: Vec<(String, String)> = if objc - i == 1 {
         let list = args[i].as_list().unwrap_or_default();
@@ -381,6 +404,14 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
 
         let matched = match mode {
+            MatchMode::Integer => {
+                // The string parsed clean up front; a pattern that is not
+                // an integer errors when the scan reaches it (pinned:
+                // `switch -integer 9 {x {...} default {...}}` -> expected
+                // integer but got "x").
+                let pv = switch_int_value(interp, pattern)?;
+                pv == int_string.unwrap_or(0)
+            }
             MatchMode::Exact => haystack == fold(pattern),
             MatchMode::Glob => super::super::glob_match(&fold(pattern), &haystack),
             MatchMode::Regexp => {
@@ -438,6 +469,26 @@ pub fn cmd_switch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     Ok(Value::empty())
+}
+
+/// `switch -integer`'s integer conversion (tclsh TclGetWideIntFromObj
+/// error shapes, pinned against 9.1): doubles and non-numbers ->
+/// `expected integer but got "X"` with TCL VALUE NUMBER; a bignum
+/// beyond the wide range -> `integer value too large to represent` with
+/// TCL VALUE INTEGER.
+fn switch_int_value(interp: &mut Interp, v: &str) -> Result<i64> {
+    use crate::types::bignum::{parse_int, IntRep};
+    match parse_int(v) {
+        Some(IntRep::I64(i)) => Ok(i),
+        Some(IntRep::Big(_)) => {
+            set_error_code(interp, "TCL VALUE INTEGER");
+            Err(tcl_err("integer value too large to represent"))
+        }
+        None => {
+            set_error_code(interp, "TCL VALUE NUMBER");
+            Err(tcl_err(format!("expected integer but got \"{}\"", v)))
+        }
+    }
 }
 
 /// Evaluate a matched `switch` arm body.  A body error gains the

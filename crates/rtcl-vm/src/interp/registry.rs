@@ -89,10 +89,25 @@ static CMD_TABLE: &[CmdEntry] = &[
     CmdEntry { name: "lassign",   func: list::cmd_lassign,       cat: Standard, cmd_id: Some(CmdId::Lassign   as u16),   usage: "list ?varName ...?",               help: "Assign list elements to variables" },
     CmdEntry { name: "lrepeat",   func: list::cmd_lrepeat,       cat: Standard, cmd_id: Some(CmdId::Lrepeat   as u16),   usage: "count ?value ...?",              help: "Build a list by repetition" },
     CmdEntry { name: "lreverse",  func: list::cmd_lreverse,      cat: Standard, cmd_id: Some(CmdId::Lreverse  as u16),   usage: "list",                             help: "Reverse a list" },
+    // lseq — TIP 746 (tclsh 9.1): pure numeric series; args decode per
+    // tclCmdIL.c Tcl_LseqObjCmd, math per tclArithSeries.c.
+    CmdEntry { name: "lseq",      func: list::cmd_lseq,          cat: Standard, cmd_id: None,                            usage: "start ?(..|to)? end ??by? step?",  help: "Build a numeric sequence" },
+    // lpop/lremove/ledit — tclsh 9.0 commands (tclCmdIL.c Tcl_LpopObjCmd,
+    // Tcl_LremoveObjCmd, Tcl_LeditObjCmd).
+    CmdEntry { name: "lpop",      func: list::cmd_lpop,          cat: Standard, cmd_id: None,                            usage: "listVar ?index ...?",              help: "Remove and return a list element" },
+    CmdEntry { name: "lremove",   func: list::cmd_lremove,       cat: Standard, cmd_id: None,                            usage: "list ?index ...?",                 help: "Remove elements from a list by index" },
+    CmdEntry { name: "ledit",     func: list::cmd_ledit,         cat: Standard, cmd_id: None,                            usage: "listVar first last ?element ...?", help: "Replace elements of a list stored in variable" },
     CmdEntry { name: "concat",    func: list::cmd_concat,        cat: Standard, cmd_id: Some(CmdId::Concat    as u16),   usage: "?arg ...?",                        help: "Concatenate arguments" },
+    // const varName value — tclsh 9.1 (tclVar.c Tcl_ConstObjCmd):
+    // create + VAR_CONSTANT flag; writes/unsets error.
+    CmdEntry { name: "const",     func: misc::cmd_const,         cat: Language, cmd_id: None,                            usage: "varName value",                    help: "Create a constant variable" },
     CmdEntry { name: "split",     func: list::cmd_split,         cat: Standard, cmd_id: Some(CmdId::Split     as u16),   usage: "string ?splitChars?",              help: "Split a string into a list" },
     CmdEntry { name: "join",      func: list::cmd_join,          cat: Standard, cmd_id: Some(CmdId::Join      as u16),   usage: "list ?joinString?",                help: "Join list elements into a string" },
     CmdEntry { name: "lmap",      func: list::cmd_lmap,          cat: Standard, cmd_id: Some(CmdId::Lmap      as u16),   usage: "varList list ?varList list ...? command", help: "Map over list elements" },
+    // lfilter — TIP 735 (tclsh 9.1): collect the first variable's value
+    // while the body result is a true boolean (doc/lfilter.n,
+    // tclCmdAH.c EachloopCmd TCL_EACH_FILTER).
+    CmdEntry { name: "lfilter",   func: list::cmd_lfilter,       cat: Standard, cmd_id: None,                            usage: "varList list ?varList list ...? command", help: "Select list elements by a boolean expression" },
     CmdEntry { name: "lset",      func: list::cmd_lset,          cat: Standard, cmd_id: Some(CmdId::Lset      as u16),   usage: "listVar ?index? ?index ...? value",        help: "Set a list element" },
     CmdEntry { name: "dict",      func: dict::cmd_dict,          cat: Standard, cmd_id: Some(CmdId::Dict      as u16),   usage: "subcommand ?arg ...?",             help: "Dictionary operations" },
     CmdEntry { name: "array",     func: array::cmd_array,        cat: Standard, cmd_id: Some(CmdId::Array     as u16),   usage: "subcommand ?arg ...?",   help: "Array operations" },
@@ -107,6 +122,9 @@ static CMD_TABLE: &[CmdEntry] = &[
     CmdEntry { name: "time",      func: loops::cmd_time,         cat: Standard, cmd_id: Some(CmdId::Time      as u16),   usage: "command ?count?",                   help: "Measure script execution time" },
     CmdEntry { name: "trace",     func: trace::cmd_trace,        cat: Standard, cmd_id: None, usage: "option ?arg ...?", help: "Register variable/command/execution traces" },
     CmdEntry { name: "timerate",  func: loops::cmd_timerate,     cat: Standard, cmd_id: Some(CmdId::Timerate  as u16),   usage: "?-direct? ?-calibrate? ?-overhead double? command ?time ?max-count??",            help: "Measure script throughput" },
+    // timer — tclsh 9.1's monotonic microsecond timer ensemble
+    // (doc/timer.n; error faces pinned in judge/probes/timer91.tcl).
+    CmdEntry { name: "timer",     func: event::cmd_timer,        cat: Standard, cmd_id: None,                            usage: "subcommand ?arg ...?",             help: "Monotonic timer events" },
     CmdEntry { name: "namespace", func: oo::cmd_namespace_entry, cat: Language,  cmd_id: Some(CmdId::Namespace as u16),  usage: "subcommand ?arg ...?",             help: "Namespace operations" },
     CmdEntry { name: "variable",  func: namespace::cmd_variable,  cat: Language,  cmd_id: Some(CmdId::Variable as u16),  usage: "?name value ...? name ?value?",    help: "Declare namespace variable" },
     // ── Extension commands (always available) ──────────────────────────────
@@ -147,6 +165,12 @@ static CMD_TABLE: &[CmdEntry] = &[
     CmdEntry { name: "json::decode", func: json::cmd_json_decode,    cat: Extension, cmd_id: None, usage: "?-index? ?-null string? ?-schema? json-string", help: "Decode JSON to Tcl value" },
     #[cfg(feature = "json")]
     CmdEntry { name: "json::encode", func: json::cmd_json_encode,    cat: Extension, cmd_id: None, usage: "value ?schema?",             help: "Encode Tcl value to JSON" },
+    // ── 9.1 新增数学命令（TIP 521/745；tclBasic.c 的 builtin 注册面）──
+    CmdEntry { name: "divmod",     func: fpmath::cmd_divmod,     cat: Standard, cmd_id: None, usage: "dividend divisor", help: "Integer division: {quotient remainder} list" },
+    CmdEntry { name: "fpclassify", func: fpmath::cmd_fpclassify, cat: Standard, cmd_id: None, usage: "floatValue",       help: "Floating point classification word" },
+    CmdEntry { name: "frexp",      func: fpmath::cmd_frexp,      cat: Standard, cmd_id: None, usage: "floatValue",       help: "Split float into {fraction exponent}" },
+    CmdEntry { name: "modf",       func: fpmath::cmd_modf,       cat: Standard, cmd_id: None, usage: "floatValue",       help: "Split float into {integer fraction} parts" },
+    CmdEntry { name: "remquo",     func: fpmath::cmd_remquo,     cat: Standard, cmd_id: None, usage: "dividend divisor", help: "IEEE remainder and quadrant bits" },
 ];
 
 
@@ -198,6 +222,12 @@ static CMD_TABLE_ENSEMBLE: &[CmdEntry] = &[
     CmdEntry { name: "::tcl::mathop::>=", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "Numeric >= chain (expr >=)" },
     CmdEntry { name: "::tcl::mathop::==", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "Numeric == chain (expr ==)" },
     CmdEntry { name: "::tcl::mathop::eq", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "String eq chain (expr eq)" },
+    // lt/le/gt/ge（9.0 新增，TIP 461）：纯字符串比较链，mathOpCmds[] 的
+    // 表尾四项。
+    CmdEntry { name: "::tcl::mathop::lt", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "String < chain (expr lt)" },
+    CmdEntry { name: "::tcl::mathop::le", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "String <= chain (expr le)" },
+    CmdEntry { name: "::tcl::mathop::gt", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "String > chain (expr gt)" },
+    CmdEntry { name: "::tcl::mathop::ge", func: mathop::cmd_mathop, cat: Standard, cmd_id: None, usage: "value ?value ...?", help: "String >= chain (expr ge)" },
     // ::tcl::pkgconfig — build-configuration query (tclPkgConfig.c parity);
     // keyed absolute so `::tcl::pkgconfig` resolves directly and the
     // relative `tcl::pkgconfig` falls through the `::`+name lookup.
@@ -210,6 +240,41 @@ static CMD_TABLE_ENSEMBLE: &[CmdEntry] = &[
     // ::tcl::unsupported::assemble — tclsh 8.6's bytecode assembler
     // (assemble-52.1 exception-range pattern; stack-machine interpreter).
     CmdEntry { name: "::tcl::unsupported::assemble", func: misc::cmd_assemble, cat: Extension, cmd_id: None, usage: "bytecodeList", help: "Assemble and execute bytecode instructions" },
+];
+
+/// `::tcl::mathfunc::*` — 9.1.0 BuiltinFuncTable 的全命令化（TIP 745/
+/// 521 后 58 名；表序按 tclsh 9.1.0 `info functions` 实测钉形）。每个
+/// expr 数学函数在 tclsh 里同时是真命令（可 rename/namespace which），
+/// rtcl 同构：命令形态统一分派 [`misc::cmd_mathfunc`] → 与 expr 共用
+/// 的 [`crate::types::expr_funcs::call_math_func`]。
+macro_rules! mf_entry {
+    ($n:expr) => {
+        CmdEntry {
+            name: concat!("::tcl::mathfunc::", $n),
+            func: misc::cmd_mathfunc,
+            cat: Standard,
+            cmd_id: None,
+            usage: "?arg ...?",
+            help: "Expr math function (command form)",
+        }
+    };
+}
+static CMD_TABLE_MATHFUNC: &[CmdEntry] = &[
+    mf_entry!("signbit"), mf_entry!("wide"), mf_entry!("isinf"), mf_entry!("sin"),
+    mf_entry!("dim"), mf_entry!("log10"), mf_entry!("log1p"), mf_entry!("bool"),
+    mf_entry!("atan"), mf_entry!("hypot"), mf_entry!("isnormal"), mf_entry!("tanh"),
+    mf_entry!("tan"), mf_entry!("int"), mf_entry!("atanh"), mf_entry!("ldexp"),
+    mf_entry!("pow"), mf_entry!("round"), mf_entry!("copysign"), mf_entry!("rand"),
+    mf_entry!("atan2"), mf_entry!("abs"), mf_entry!("trunc"), mf_entry!("min"),
+    mf_entry!("erf"), mf_entry!("exp"), mf_entry!("max"), mf_entry!("nextafter"),
+    mf_entry!("cbrt"), mf_entry!("acos"), mf_entry!("entier"), mf_entry!("issubnormal"),
+    mf_entry!("srand"), mf_entry!("erfc"), mf_entry!("isnan"), mf_entry!("floor"),
+    mf_entry!("logb"), mf_entry!("cos"), mf_entry!("sqrt"), mf_entry!("double"),
+    mf_entry!("expm1"), mf_entry!("gamma"), mf_entry!("isfinite"), mf_entry!("exp2"),
+    mf_entry!("sinh"), mf_entry!("log"), mf_entry!("asinh"), mf_entry!("asin"),
+    mf_entry!("isqrt"), mf_entry!("fma"), mf_entry!("isunordered"), mf_entry!("log2"),
+    mf_entry!("ceil"), mf_entry!("cosh"), mf_entry!("acosh"), mf_entry!("fmod"),
+    mf_entry!("lgamma"), mf_entry!("remainder"),
 ];
 
 /// Commands gated behind `feature = "clock"`.
@@ -259,6 +324,8 @@ static CMD_TABLE_IO: &[CmdEntry] = &[
 static CMD_TABLE_EXEC: &[CmdEntry] = &[
     CmdEntry { name: "exec",  func: exec_cmd::cmd_exec, cat: Extension, cmd_id: Some(CmdId::Exec as u16), usage: "?-option ...? arg ?arg ...?", help: "Execute a system command with I/O redirections" },
     CmdEntry { name: "job",   func: exec_cmd::cmd_job,  cat: Extension, cmd_id: None,                     usage: "list|stop|resume|fg|bg|kill|wait ?job-id?", help: "Manage background jobs" },
+    // tcl::process（9.1 子进程管理 ensemble；子进程面属 exec 特性域）
+    CmdEntry { name: "tcl::process", func: exec_cmd::cmd_tcl_process, cat: Standard, cmd_id: None, usage: "subcommand ?arg ...?", help: "Manage child processes (autopurge/list/purge/status)" },
     CmdEntry { name: "wait",  func: os::cmd_wait,       cat: Extension, cmd_id: None,                     usage: "?-nohang? ?pid?",  help: "Wait for a process" },
 ];
 
@@ -350,6 +417,9 @@ impl Interp {
         for entry in CMD_TABLE_ENSEMBLE {
             self.register_entry(entry);
         }
+        for entry in CMD_TABLE_MATHFUNC {
+            self.register_entry(entry);
+        }
     }
 
     /// 内建名 → 内建本体 fn（M3 遮蔽感知折叠的判别基准）：`commands`
@@ -385,36 +455,48 @@ impl Interp {
         #[cfg(feature = "std")]
         let f = f.or_else(|| in_table(CMD_TABLE_EVENT, name));
         let f = f.or_else(|| in_table(CMD_TABLE_ENSEMBLE, name));
-        f
+        f.or_else(|| in_table(CMD_TABLE_MATHFUNC, name))
     }
 
-    /// tclsh 8.6.17's `::` command-table registration sequence, recovered
-    /// from tclBasic.c 8.6.17 + init.tcl + tclsh's stdin `history add`
-    /// auto-load, validated by replaying the Tcl hash-table mechanics
-    /// against the oracle's `info commands` (specs/tclhash/fit_model.py).
+    /// tclsh 9.1.0's `::` command-table registration sequence, recovered
+    /// from tclBasic.c 9.1.0 (builtInCmds[] generic core + OS interface,
+    /// ensembleCommands[], TclInterpInit) + init.tcl + tclsh's stdin
+    /// `history add` auto-load, validated by replaying the Tcl hash-table
+    /// mechanics against the oracle's `info commands` (specs/tclhash/
+    /// fit_model.py; the 9.1 replay reproduces the oracle listing
+    /// byte-for-byte once every name in this list is registered).
     /// `info commands`/`info procs` replay the iteration order from this
-    /// sequence, so it must match tclsh exactly.
+    /// sequence, so it must match tclsh exactly. 8.6.17's sequence (git
+    /// history) differed: `case` (removed in 9.1) sat after `gets`, and
+    /// the const/coroinject/coroprobe/divmod/fpclassify/frexp/ledit/
+    /// lfilter/lpop/lremove/lseq/modf/remquo/timer/unicode/zipfs/
+    /// timerate names were absent.
     const TCL_INIT_CMD_ORDER: &[&str] = &[
-        // builtInCmds[] — generic core (8.6.17)
-        "append", "apply", "break", "case", "catch", "concat", "continue",
-        "coroutine", "error", "eval", "expr", "for", "foreach", "format",
-        "global", "if", "incr", "join", "lappend", "lassign", "lindex",
-        "linsert", "list", "llength", "lmap", "lrange", "lrepeat",
-        "lreplace", "lreverse", "lsearch", "lset", "lsort", "package",
-        "proc", "regexp", "regsub", "rename", "return", "scan", "set",
-        "split", "subst", "switch", "tailcall", "throw", "trace", "try",
-        "unset", "uplevel", "upvar", "variable", "while", "yield",
-        "yieldto",
+        // builtInCmds[] — generic core (9.1.0, tclBasic.c registration order)
+        "append", "apply", "break", "catch", "concat", "const",
+        "continue", "coroinject", "coroprobe", "coroutine", "divmod",
+        "error", "eval", "expr", "for", "foreach", "format", "fpclassify",
+        "frexp", "global", "if", "incr", "join", "lappend", "lassign",
+        "ledit", "lfilter", "lindex", "linsert", "list", "llength",
+        "lmap", "lpop", "lrange", "lremove", "lrepeat", "lreplace",
+        "lreverse", "lsearch", "lseq", "lset", "lsort", "modf",
+        "package", "proc", "regexp", "regsub", "remquo", "rename",
+        "return", "scan", "set", "split", "subst", "switch", "tailcall",
+        "throw", "trace", "try", "unset", "uplevel", "upvar", "variable",
+        "while", "yield", "yieldto",
         // builtInCmds[] — OS interface
         "after", "cd", "close", "eof", "exec", "exit", "fblocked",
         "fconfigure", "fcopy", "fileevent", "flush", "gets", "glob",
         "load", "open", "pid", "puts", "pwd", "read", "seek", "socket",
-        "source", "tell", "time", "unload", "update", "vwait",
-        // ensembles (TclInit*Cmd) + TclClockInit
-        "array", "binary", "chan", "dict", "encoding", "file", "info",
-        "namespace", "string", "clock",
-        // TclInterpInit, TclZlibInit
-        "interp", "zlib",
+        "source", "tell", "time", "timerate", "unload", "update", "vwait",
+        // ensembleCommands[] — global-table ensembles (the ::tcl::* ones
+        // — binary encode/decode, ::tcl::prefix, ::tcl::process,
+        // ::tcl::unsupported::grapheme — register into namespace tables)
+        "array", "binary", "chan", "clock", "dict", "encoding", "file",
+        "info", "namespace", "string", "timer", "unicode", "zipfs",
+        "zlib",
+        // TclInterpInit
+        "interp",
         // init.tcl proc definitions (tclsh startup)
         "tclLog", "unknown", "auto_load", "auto_load_index",
         "auto_qualify", "auto_import", "auto_execok",

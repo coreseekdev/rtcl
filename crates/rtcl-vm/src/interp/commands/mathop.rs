@@ -77,6 +77,19 @@ pub fn cmd_mathop(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             };
             Ok(Value::from_bool(expr_ops::cmp_bool(a, b, cc)))
         }),
+        // lt/le/gt/ge（9.0 新增，TIP 461）：纯 UNICODE 字符串比较链
+        // —— `::tcl::mathop::lt 2 10` 是 0（"2">"10" 的字典序），与
+        // 数值比较运算符 `<` 系分界。少于两个实参恒真（9.1 手册）。
+        "lt" | "le" | "gt" | "ge" => chain(rest, |a, b| {
+            let ord = a.as_str().cmp(b.as_str());
+            let ok = match op {
+                "lt" => ord == core::cmp::Ordering::Less,
+                "le" => ord != core::cmp::Ordering::Greater,
+                "gt" => ord == core::cmp::Ordering::Greater,
+                _ => ord != core::cmp::Ordering::Less,
+            };
+            Ok(Value::from_bool(ok))
+        }),
         "eq" | "ne" => chain(rest, |a, b| {
             let r = if op == "eq" {
                 expr_ops::op_str_eq(a, b)

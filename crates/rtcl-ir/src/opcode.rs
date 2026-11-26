@@ -201,14 +201,6 @@ impl CmdId {
 // OpCode — the instruction set
 // ---------------------------------------------------------------------------
 
-/// A constant as it sat in a peephole fold window: the exact value the
-/// `PushInt`/`PushFloat` would have pushed.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum FoldConst {
-    Int(i64),
-    Float(f64),
-}
-
 /// A single VM instruction.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OpCode {
@@ -499,9 +491,10 @@ pub enum OpCode {
     /// At execution the shared expr_ops raise the exact runtime error
     /// (identical text/errorCode), and the expr command frame appends
     /// with tclsh 9.1's folded-literal keyword `invoked from within`.
-    /// Payload: the operator char and the two constants as they would
-    /// have been pushed.
-    ExprFoldError(u8, FoldConst, FoldConst),
+    /// Payload: the operator char and the two operands as constant-pool
+    /// indices — decimals for ints; float bits hex under a `#f` marker
+    /// (the executor reconstructs the exact f64; op size budget ≤16B).
+    ExprFoldError(u8, u16, u16),
     Neg,
 
     // ── Comparison ──────────────────────────────────────────────────────────
@@ -914,7 +907,7 @@ impl fmt::Display for OpCode {
             OpCode::Mod => write!(f, "MOD"),
             OpCode::Pow => write!(f, "POW"),
             OpCode::ExprFoldError(op, a, b) => {
-                write!(f, "EXPR_FOLD_ERROR {} {:?} {:?}", *op as char, a, b)
+                write!(f, "EXPR_FOLD_ERROR {} c{} c{}", *op as char, a, b)
             }
             OpCode::Neg => write!(f, "NEG"),
 

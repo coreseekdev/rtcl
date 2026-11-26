@@ -2476,18 +2476,23 @@ fn op_expr_fold_error(
     code: &ByteCode,
     st: &mut VmState,
     op: u8,
-    a: rtcl_ir::opcode::FoldConst,
-    b: rtcl_ir::opcode::FoldConst,
+    a: u16,
+    b: u16,
 ) -> Result<()> {
-    use rtcl_ir::opcode::FoldConst;
-    let va = match a {
-        FoldConst::Int(i) => Value::from_int(i),
-        FoldConst::Float(f) => crate::types::expr_funcs::float_value(f),
+    // 操作数从常量池还原：十进制串 = int；`#f<bits>` = 精确 f64 位型
+    // （rtcl-ir 无 tcl 规范浮点渲染器）。串值对 expr_ops 的分类/消息
+    // 与原生值逐字节同形（as_str/as_float/int_rep 同判）。
+    let fold_const_value = |s: &str| -> Value {
+        match s.strip_prefix("#f") {
+            Some(hex) => {
+                let bits = u64::from_str_radix(hex, 16).unwrap_or(0);
+                crate::types::expr_funcs::float_value(f64::from_bits(bits))
+            }
+            None => Value::from_str(s),
+        }
     };
-    let vb = match b {
-        FoldConst::Int(i) => Value::from_int(i),
-        FoldConst::Float(f) => crate::types::expr_funcs::float_value(f),
-    };
+    let va = fold_const_value(code.get_const(a).unwrap_or(""));
+    let vb = fold_const_value(code.get_const(b).unwrap_or(""));
     let r = match op {
         b'/' => crate::types::expr_ops::numeric_binop(&va, &vb, '/'),
         b'%' => crate::types::expr_ops::int_mod(&va, &vb),

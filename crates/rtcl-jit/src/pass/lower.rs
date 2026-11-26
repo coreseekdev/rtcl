@@ -483,7 +483,7 @@ fn template(ctx: &Ctx, pc: u32, op: &OpCode) -> Result<Option<Instr>, Unsupporte
             src: Reg(r[0]),
             fail: fail(),
         },
-        OpCode::EvalExpr => Instr::EvalExpr {
+        OpCode::EvalExpr | OpCode::EvalExprCond => Instr::EvalExpr {
             dst: dst(),
             src: Reg(r[0]),
             fail: fail(),

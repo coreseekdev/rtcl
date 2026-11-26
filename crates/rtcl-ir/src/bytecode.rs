@@ -4,7 +4,7 @@
 //! script: a constant pool, an instruction list, local-variable names, and
 //! source-line mappings for diagnostics.
 
-use crate::opcode::{FoldConst, OpCode};
+use crate::opcode::OpCode;
 use core::fmt;
 use std::rc::Rc;
 
@@ -14,20 +14,50 @@ enum FoldResult {
     Bool(bool),
 }
 
+/// An operand of a fold window: the exact value the `PushInt`/`PushFloat`
+/// would have pushed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FoldV {
+    Int(i64),
+    Float(f64),
+}
+
+impl FoldV {
+    /// Constant-pool form: decimals for ints; float bits hex under a
+    /// `#f` marker (the executor reconstructs the exact f64 — rtcl-ir
+    /// has no tcl-canonical float renderer).
+    fn const_form(self) -> String {
+        match self {
+            FoldV::Int(i) => i.to_string(),
+            FoldV::Float(f) => format!("#f{:x}", f.to_bits()),
+        }
+    }
+    fn as_int(&self) -> Option<i64> {
+        match self {
+            FoldV::Int(i) => Some(*i),
+            FoldV::Float(_) => None,
+        }
+    }
+    fn as_float(&self) -> Option<f64> {
+        match self {
+            FoldV::Int(_) => None,
+            FoldV::Float(f) => Some(*f),
+        }
+    }
+    fn is_zero(&self) -> bool {
+        self.as_int() == Some(0) || self.as_float() == Some(0.0)
+    }
+}
+
 /// The operator byte an [`OpCode::ExprFoldError`] carries, keyed to the
 /// executor's expr_ops dispatch (`/` Div, `%` Mod, `P` Pow, `<` Shl,
-/// `>` Shr, `&`/`|`/`^` BitAnd/Or/Xor).
-fn fold_error_char(op: &OpCode, a: FoldConst, b: FoldConst) -> Option<u8> {
-    let (ai, af) = match a {
-        FoldConst::Int(i) => (Some(i), None),
-        FoldConst::Float(f) => (None, Some(f)),
-    };
-    let (bi, bf) = match b {
-        FoldConst::Int(i) => (Some(i), None),
-        FoldConst::Float(f) => (None, Some(f)),
-    };
+/// `>` Shr, `&`/`|`/`^` BitAnd/Or/Xor, `~` BitNot).  `Some(())` when the
+/// window's constant evaluation the runtime refuses.
+fn fold_errors(op: &OpCode, a: FoldV, b: FoldV) -> bool {
+    let (ai, af) = (a.as_int(), a.as_float());
+    let (bi, bf) = (b.as_int(), b.as_float());
     let float_involved = af.is_some() || bf.is_some();
-    let errors = match op {
+    match op {
         // 1/0 and friends: divide by zero.  With a float involved only
         // 0/0.0 errors (domain, either form — `0.0/0` too); x/0.0 (x≠0)
         // is ±Inf per IEEE.
@@ -79,8 +109,12 @@ fn fold_error_char(op: &OpCode, a: FoldConst, b: FoldConst) -> Option<u8> {
         // Bitwise ops take ints only.
         OpCode::BitAnd | OpCode::BitOr | OpCode::BitXor => float_involved,
         _ => false,
-    };
-    errors.then(|| match op {
+    }
+}
+
+/// The ExprFoldError operator byte for `op` when it errors over `a`/`b`.
+fn fold_error_char(op: &OpCode, a: FoldV, b: FoldV) -> Option<u8> {
+    fold_errors(op, a, b).then(|| match op {
         OpCode::Div => b'/',
         OpCode::Mod => b'%',
         OpCode::Pow => b'P',
@@ -1441,18 +1475,20 @@ impl ByteCode {
             let mut i = 0;
             while i + 2 < len {
                 let av = match &self.ops[i] {
-                    OpCode::PushInt(k) => Some(FoldConst::Int(*k)),
-                    OpCode::PushFloat(f) => Some(FoldConst::Float(*f)),
+                    OpCode::PushInt(k) => Some(FoldV::Int(*k)),
+                    OpCode::PushFloat(f) => Some(FoldV::Float(*f)),
                     _ => None,
                 };
                 let bv = match &self.ops[i + 1] {
-                    OpCode::PushInt(k) => Some(FoldConst::Int(*k)),
-                    OpCode::PushFloat(f) => Some(FoldConst::Float(*f)),
+                    OpCode::PushInt(k) => Some(FoldV::Int(*k)),
+                    OpCode::PushFloat(f) => Some(FoldV::Float(*f)),
                     _ => None,
                 };
                 if let (Some(av), Some(bv)) = (av, bv) {
                     if let Some(opc) = fold_error_char(&self.ops[i + 2], av, bv) {
-                        self.ops[i] = OpCode::ExprFoldError(opc, av, bv);
+                        let ia = self.add_const(&av.const_form());
+                        let ib = self.add_const(&bv.const_form());
+                        self.ops[i] = OpCode::ExprFoldError(opc, ia, ib);
                         self.ops[i + 1] = OpCode::Nop;
                         self.ops[i + 2] = OpCode::Nop;
                         changed = true;
@@ -1476,8 +1512,8 @@ impl ByteCode {
             while i + 1 < len {
                 if let OpCode::PushFloat(f) = &self.ops[i] {
                     if matches!(self.ops[i + 1], OpCode::BitNot) {
-                        self.ops[i + 1] =
-                            OpCode::ExprFoldError(b'~', FoldConst::Float(*f), FoldConst::Int(0));
+                        let idx = self.add_const(&FoldV::Float(*f).const_form());
+                        self.ops[i + 1] = OpCode::ExprFoldError(b'~', idx, idx);
                         changed = true;
                         i += 2;
                         continue;
@@ -1486,6 +1522,7 @@ impl ByteCode {
                 i += 1;
             }
         }
+
 
         // --- 3-op constant folding ---
         //

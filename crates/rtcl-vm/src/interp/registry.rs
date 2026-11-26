@@ -230,6 +230,41 @@ static CMD_TABLE_ENSEMBLE: &[CmdEntry] = &[
     CmdEntry { name: "::tcl::unsupported::assemble", func: misc::cmd_assemble, cat: Extension, cmd_id: None, usage: "bytecodeList", help: "Assemble and execute bytecode instructions" },
 ];
 
+/// `::tcl::mathfunc::*` — 9.1.0 BuiltinFuncTable 的全命令化（TIP 745/
+/// 521 后 58 名；表序按 tclsh 9.1.0 `info functions` 实测钉形）。每个
+/// expr 数学函数在 tclsh 里同时是真命令（可 rename/namespace which），
+/// rtcl 同构：命令形态统一分派 [`misc::cmd_mathfunc`] → 与 expr 共用
+/// 的 [`crate::types::expr_funcs::call_math_func`]。
+macro_rules! mf_entry {
+    ($n:expr) => {
+        CmdEntry {
+            name: concat!("::tcl::mathfunc::", $n),
+            func: misc::cmd_mathfunc,
+            cat: Standard,
+            cmd_id: None,
+            usage: "?arg ...?",
+            help: "Expr math function (command form)",
+        }
+    };
+}
+static CMD_TABLE_MATHFUNC: &[CmdEntry] = &[
+    mf_entry!("signbit"), mf_entry!("wide"), mf_entry!("isinf"), mf_entry!("sin"),
+    mf_entry!("dim"), mf_entry!("log10"), mf_entry!("log1p"), mf_entry!("bool"),
+    mf_entry!("atan"), mf_entry!("hypot"), mf_entry!("isnormal"), mf_entry!("tanh"),
+    mf_entry!("tan"), mf_entry!("int"), mf_entry!("atanh"), mf_entry!("ldexp"),
+    mf_entry!("pow"), mf_entry!("round"), mf_entry!("copysign"), mf_entry!("rand"),
+    mf_entry!("atan2"), mf_entry!("abs"), mf_entry!("trunc"), mf_entry!("min"),
+    mf_entry!("erf"), mf_entry!("exp"), mf_entry!("max"), mf_entry!("nextafter"),
+    mf_entry!("cbrt"), mf_entry!("acos"), mf_entry!("entier"), mf_entry!("issubnormal"),
+    mf_entry!("srand"), mf_entry!("erfc"), mf_entry!("isnan"), mf_entry!("floor"),
+    mf_entry!("logb"), mf_entry!("cos"), mf_entry!("sqrt"), mf_entry!("double"),
+    mf_entry!("expm1"), mf_entry!("gamma"), mf_entry!("isfinite"), mf_entry!("exp2"),
+    mf_entry!("sinh"), mf_entry!("log"), mf_entry!("asinh"), mf_entry!("asin"),
+    mf_entry!("isqrt"), mf_entry!("fma"), mf_entry!("isunordered"), mf_entry!("log2"),
+    mf_entry!("ceil"), mf_entry!("cosh"), mf_entry!("acosh"), mf_entry!("fmod"),
+    mf_entry!("lgamma"), mf_entry!("remainder"),
+];
+
 /// Commands gated behind `feature = "clock"`.
 #[cfg(feature = "clock")]
 static CMD_TABLE_CLOCK: &[CmdEntry] = &[
@@ -370,6 +405,9 @@ impl Interp {
         for entry in CMD_TABLE_ENSEMBLE {
             self.register_entry(entry);
         }
+        for entry in CMD_TABLE_MATHFUNC {
+            self.register_entry(entry);
+        }
     }
 
     /// 内建名 → 内建本体 fn（M3 遮蔽感知折叠的判别基准）：`commands`
@@ -405,7 +443,7 @@ impl Interp {
         #[cfg(feature = "std")]
         let f = f.or_else(|| in_table(CMD_TABLE_EVENT, name));
         let f = f.or_else(|| in_table(CMD_TABLE_ENSEMBLE, name));
-        f
+        f.or_else(|| in_table(CMD_TABLE_MATHFUNC, name))
     }
 
     /// tclsh 9.1.0's `::` command-table registration sequence, recovered

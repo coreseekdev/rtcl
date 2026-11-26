@@ -260,6 +260,17 @@ pub fn cmd_env(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
 // ---------- rand ----------
 
 /// `rand ?min? ?max?` — Generate random integer.
+/// `::tcl::mathfunc::<fn>` — expr 数学函数的真命令形态（9.1 的
+/// BuiltinFuncTable 双注册面；`info commands tcl::mathfunc::*` 列出的
+/// 就是这些名字）。函数体与 expr 共用
+/// [`crate::types::expr_funcs::call_math_func`]，rand 的种子语义也和
+/// expr 求值路径一致（call_depth）。
+pub fn cmd_mathfunc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let fname = args[0].as_str().rsplit("::").next().unwrap_or("");
+    let seed = interp.call_depth;
+    crate::types::expr_funcs::call_math_func(fname, args[1..].to_vec(), seed)
+}
+
 pub fn cmd_rand(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let (min, max) = match args.len() {
         1 => (0i64, i64::MAX),
@@ -832,10 +843,16 @@ fn list_commands_in(
 /// unknown-or-ambiguous error.
 /// The expr math functions, in tclsh 8.6.17's `Tcl_ListMathFuncs` table
 /// order (deterministic per build) — `info functions` lists them.
+/// C99 全集（TIP 745/521）入列，顺序对 tclsh 9.1.0 的表序实测钉形
+/// （info4 的 `info functions` 逐字节一致）。
 const EXPR_MATH_FUNCTIONS: &[&str] = &[
-    "round", "wide", "sqrt", "sin", "log10", "double", "hypot", "atan", "bool", "rand",
-    "abs", "acos", "atan2", "entier", "srand", "sinh", "log", "floor", "tanh", "tan",
-    "isqrt", "int", "asin", "min", "ceil", "cos", "cosh", "exp", "max", "pow", "fmod",
+    "signbit", "wide", "isinf", "sin", "dim", "log10", "log1p", "bool", "atan", "hypot",
+    "isnormal", "tanh", "tan", "int", "atanh", "ldexp", "pow", "round", "copysign",
+    "rand", "atan2", "abs", "trunc", "min", "erf", "exp", "max", "nextafter", "cbrt",
+    "acos", "entier", "issubnormal", "srand", "erfc", "isnan", "floor", "logb", "cos",
+    "sqrt", "double", "expm1", "gamma", "isfinite", "exp2", "sinh", "log", "asinh",
+    "asin", "isqrt", "fma", "isunordered", "log2", "ceil", "cosh", "acosh", "fmod",
+    "lgamma", "remainder",
 ];
 
 /// tclsh 9.1.0's `info` subcommand list (unknown-or-ambiguous error

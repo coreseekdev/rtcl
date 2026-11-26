@@ -242,6 +242,259 @@ fn require_args(name: &str, expected: usize, actual: usize) -> Result<()> {
     }
 }
 
+// ── C99 全集（TIP 745 / TIP 521；9.1 的 BuiltinFuncTable 把它们直映射
+// 到 C 库同名函数，后端在 [`super::c99`]）────────────────────────────
+
+/// `Tcl_GetDoubleFromObj` 口径的浮点实参：整数/bignum/数字串均可；
+/// NaN（含 "nan" 串）拒绝 — `floating point value is Not a Number`；
+/// 非数字串 — `expected floating-point number but got "..."`（9.1 钉形）。
+pub(crate) fn f64_arg(v: &Value) -> Result<f64> {
+    // 整数串（0x/0b/0o 前缀、宽十进制）先走精确整数读再转 double
+    // ——GetDoubleFromObj 对 "0x10" 给 16.0（cbrt 0x10 = 2.5198… 钉形）；
+    // as_float 的字符串臂只认 bignum，i64 前缀字面量会漏到这里。
+    if let Some(rep) = super::bignum::int_rep(v) {
+        return Ok(match rep {
+            super::bignum::IntRep::I64(i) => i as f64,
+            super::bignum::IntRep::Big(b) => super::bignum::to_f64(&b),
+        });
+    }
+    match v.as_float() {
+        Some(f) if f.is_nan() => Err(Error::Msg(
+            "floating point value is Not a Number".to_string(),
+        )),
+        Some(f) => Ok(f),
+        None => Err(Error::Msg(format!(
+            "expected floating-point number but got \"{}\"{}",
+            v.as_str(),
+            octal_hint(v)
+        ))),
+    }
+}
+
+/// `fpclassify` 命令的分类词（fpclassify.n：zero/subnormal/normal/
+/// infinite/nan）；非数字串报 expected number（fp_class 的钉形）。
+pub(crate) fn fp_classify_word(v: &Value) -> Result<&'static str> {
+    Ok(match fp_class(v)? {
+        FpClass::Zero => "zero",
+        FpClass::Subnormal => "subnormal",
+        FpClass::Normal => "normal",
+        FpClass::Infinite => "infinite",
+        FpClass::Nan => "nan",
+    })
+}
+
+/// `Tcl_CheckDoubleResult` 的 errno 等价判定（tclBasic.c）：NaN → 域
+/// 错误；`errno_err`（本机 oracle 实测会置 ERANGE 的函数：asinh/atanh/
+/// erfc/nextafter）的子正规结果 → `floating-point value too large to
+/// represent`；0.0 / ±Inf / 其余原样接受（exp2(1e300) 是 Inf，不报错）。
+fn check_double(r: f64, errno_err: bool) -> Result<Value> {
+    if r.is_nan() {
+        return Err(domain_error());
+    }
+    if errno_err && r.is_subnormal() {
+        return Err(Error::Msg(
+            "floating-point value too large to represent".to_string(),
+        ));
+    }
+    Ok(float_value(r))
+}
+
+fn c99_unary(
+    name: &str,
+    args: &[Value],
+    errno_err: bool,
+    f: impl Fn(f64) -> f64,
+) -> Result<Value> {
+    require_args(name, 1, args.len())?;
+    let x = f64_arg(&args[0])?;
+    check_double(f(x), errno_err)
+}
+
+fn c99_binary(
+    name: &str,
+    args: &[Value],
+    errno_err: bool,
+    f: impl Fn(f64, f64) -> f64,
+) -> Result<Value> {
+    require_args(name, 2, args.len())?;
+    let (a, b) = (f64_arg(&args[0])?, f64_arg(&args[1])?);
+    check_double(f(a, b), errno_err)
+}
+
+/// IEEE 浮点分类（fpclassify 的五类）。
+#[derive(Clone, Copy, PartialEq)]
+enum FpClass {
+    Zero,
+    Subnormal,
+    Normal,
+    Infinite,
+    Nan,
+}
+
+fn classify(d: f64) -> FpClass {
+    if d.is_nan() {
+        FpClass::Nan
+    } else if d.is_infinite() {
+        FpClass::Infinite
+    } else if d == 0.0 {
+        FpClass::Zero
+    } else if d.is_subnormal() {
+        FpClass::Subnormal
+    } else {
+        FpClass::Normal
+    }
+}
+
+/// `Tcl_GetNumberFromObj` 口径的浮点分类（isinf/isnan/isnormal/
+/// issubnormal/isunordered/fpclassify/signbit 共用）：接受 "nan"/"inf"
+/// 串；整数 0 → zero、非零 → normal（i64→double 恒为 normal）；bignum
+/// 转 double 可溢出为 ±Inf（isinf(2**400) 是 1 的钉形）；非数字串
+/// `expected number but got "..."`（无 floating-point 字样，9.1 钉形）。
+fn fp_class(v: &Value) -> Result<FpClass> {
+    use super::bignum::IntRep;
+    // 整数走原始值口径：0 是 zero，其余恒 normal（转 double 不可能
+    // subnormal；i64::MIN 也远超 normal 下界）。
+    if let Some(IntRep::I64(i)) = super::bignum::int_rep(v) {
+        return Ok(if i == 0 {
+            FpClass::Zero
+        } else {
+            FpClass::Normal
+        });
+    }
+    match v.as_float() {
+        Some(d) => Ok(classify(d)),
+        None => Err(Error::Msg(format!(
+            "expected number but got \"{}\"{}",
+            v.as_str(),
+            octal_hint(v)
+        ))),
+    }
+}
+
+/// `Tcl_GetIntFromObj`（64 位平台）口径：接受 [INT_MIN, UINT_MAX] 的
+/// 整数，超界报 `integer value too large to represent`；随后按 C int
+/// 截断（2147483648 → -2147483648 — oracle `ldexp 1 2147483648` 是 0.0
+/// 的钉形；非整数 `expected integer but got "..."`）。
+fn int_arg_32(v: &Value) -> Result<i32> {
+    use super::bignum::IntRep;
+    let l: i64 = match super::bignum::int_rep(v) {
+        Some(IntRep::I64(i)) => i,
+        Some(IntRep::Big(b)) => i64::try_from(b.clone()).map_err(|_| {
+            Error::Msg("integer value too large to represent".to_string())
+        })?,
+        None => {
+            return Err(Error::Msg(format!(
+                "expected integer but got \"{}\"",
+                v.as_str()
+            )))
+        }
+    };
+    if l < i32::MIN as i64 || l > u32::MAX as i64 {
+        return Err(Error::Msg(
+            "integer value too large to represent".to_string(),
+        ));
+    }
+    Ok((l as u32) as i32)
+}
+
+/// C99 函数族执行体：expr 内 `f(x)` 与 `tcl::mathfunc::f` 命令共用。
+/// 各函数的 `errno_err` 旗标与边界钉形见 [`check_double`]。
+pub(crate) fn call_c99_math_func(name: &str, args: Vec<Value>) -> Result<Value> {
+    use super::c99::sys;
+    match name {
+        "acosh" => c99_unary(name, &args, false, sys::acosh),
+        "asinh" => c99_unary(name, &args, true, sys::asinh),
+        "atanh" => c99_unary(name, &args, true, sys::atanh),
+        "cbrt" => c99_unary(name, &args, false, sys::cbrt),
+        "erf" => c99_unary(name, &args, false, sys::erf),
+        "erfc" => c99_unary(name, &args, true, sys::erfc),
+        "exp2" => c99_unary(name, &args, false, sys::exp2),
+        "expm1" => c99_unary(name, &args, false, sys::expm1),
+        // 9.1 的 gamma 就是 tgamma（gamma(-0.5) 是负数 — 手册的
+        // "absolute value" 表述与实现不符，实现为准）。
+        "gamma" => c99_unary(name, &args, false, sys::tgamma),
+        "lgamma" => c99_unary(name, &args, false, sys::lgamma),
+        "log1p" => c99_unary(name, &args, false, sys::log1p),
+        "log2" => c99_unary(name, &args, false, sys::log2),
+        "logb" => c99_unary(name, &args, false, sys::logb),
+        "trunc" => c99_unary(name, &args, false, sys::trunc),
+        "copysign" => c99_binary(name, &args, false, sys::copysign),
+        "dim" => c99_binary(name, &args, false, sys::fdim),
+        "nextafter" => c99_binary(name, &args, true, sys::nextafter),
+        "remainder" => c99_binary(name, &args, false, sys::remainder),
+        "fma" => {
+            require_args(name, 3, args.len())?;
+            let (a, b, c) = (f64_arg(&args[0])?, f64_arg(&args[1])?, f64_arg(&args[2])?);
+            check_double(sys::fma(a, b, c), false)
+        }
+        // ldexp 的第二实参走 GetIntFromObj 口径（32 位 int 截断）；子
+        // 正规结果不置 ERANGE（ldexp(1,-1074) 是 5e-324，接受）。
+        "ldexp" => {
+            require_args(name, 2, args.len())?;
+            let x = f64_arg(&args[0])?;
+            let y = int_arg_32(&args[1])?;
+            check_double(sys::ldexp(x, y), false)
+        }
+        // 分类函数：isinf/isnan 等只看类别，NaN 实参显式接受。
+        "isinf" => {
+            require_args(name, 1, args.len())?;
+            Ok(Value::from_int(
+                (fp_class(&args[0])? == FpClass::Infinite) as i64,
+            ))
+        }
+        "isfinite" => {
+            require_args(name, 1, args.len())?;
+            let c = fp_class(&args[0])?;
+            Ok(Value::from_int(
+                (c != FpClass::Infinite && c != FpClass::Nan) as i64,
+            ))
+        }
+        "isnan" => {
+            require_args(name, 1, args.len())?;
+            Ok(Value::from_int((fp_class(&args[0])? == FpClass::Nan) as i64))
+        }
+        "isnormal" => {
+            require_args(name, 1, args.len())?;
+            Ok(Value::from_int(
+                (fp_class(&args[0])? == FpClass::Normal) as i64,
+            ))
+        }
+        "issubnormal" => {
+            require_args(name, 1, args.len())?;
+            Ok(Value::from_int(
+                (fp_class(&args[0])? == FpClass::Subnormal) as i64,
+            ))
+        }
+        "isunordered" => {
+            require_args(name, 2, args.len())?;
+            let a = fp_class(&args[0])?;
+            let b = fp_class(&args[1])?;
+            Ok(Value::from_int(((a == FpClass::Nan) || (b == FpClass::Nan)) as i64))
+        }
+        // signbit：整数负值（含 bignum）按值号；浮点按 IEEE 符号位
+        // （-0.0 是 1；int 的 -0 是 0 — oracle 钉形）。
+        "signbit" => {
+            require_args(name, 1, args.len())?;
+            use super::bignum::IntRep;
+            match super::bignum::int_rep(&args[0]) {
+                Some(IntRep::I64(i)) => Ok(Value::from_int((i < 0) as i64)),
+                Some(IntRep::Big(b)) => Ok(Value::from_int(b.is_negative() as i64)),
+                None => match args[0].as_float() {
+                    Some(d) => Ok(Value::from_int(d.is_sign_negative() as i64)),
+                    None => Err(Error::Msg(format!(
+                        "expected number but got \"{}\"{}",
+                        args[0].as_str(),
+                        octal_hint(&args[0])
+                    ))),
+                },
+            }
+        }
+        _ => Err(Error::Msg(format!(
+            "invalid command name \"tcl::mathfunc::{name}\""
+        ))),
+    }
+}
+
 /// Evaluate a built-in math function by name.
 ///
 /// `rand_seed` is used only for `rand()` — caller provides a unique value.
@@ -511,6 +764,15 @@ pub(crate) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
             "domain error: argument not in valid range",
             crate::error::ErrorCode::Generic,
         )),
+        // C99 全集（TIP 745/521）：acosh/asinh/atanh/cbrt/copysign/dim/
+        // erf/erfc/exp2/expm1/fma/gamma/ldexp/lgamma/log1p/log2/logb/
+        // nextafter/remainder/signbit/trunc + isinf/isnan/isfinite/
+        // isnormal/issubnormal/isunordered — 统一入口见 call_c99_math_func。
+        "acosh" | "asinh" | "atanh" | "cbrt" | "copysign" | "dim" | "erf" | "erfc"
+        | "exp2" | "expm1" | "fma" | "gamma" | "isfinite" | "isinf" | "isnan"
+        | "isnormal" | "issubnormal" | "isunordered" | "ldexp" | "lgamma"
+        | "log1p" | "log2" | "logb" | "nextafter" | "remainder" | "signbit"
+        | "trunc" => call_c99_math_func(name, args),
         // tclsh dispatches unknown functions to ::tcl::mathfunc::<name>
         // — rtcl has no mathfunc namespace, so the dispatch misses with
         // tclsh's exact message (expr-38.12).

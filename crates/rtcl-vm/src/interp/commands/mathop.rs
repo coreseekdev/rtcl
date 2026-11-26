@@ -159,6 +159,22 @@ fn fold(interp: &mut Interp, op: &str, rest: &[Value]) -> Result<Value> {
         }
         return Ok(acc);
     }
+    // C16（9.1 钉形）：折叠从**第一个操作数**起步（0/1 等单位元不作为
+    // 左操作数参与）——首个非法操作数按 9.1 报 left operand
+    // (`+ abc 1` → cannot use non-numeric string "abc" as left operand
+    // of "+"; 单操作数 `+ abc` 同为 left)。
+    if op == "+" || op == "*" {
+        let identity = if op == "+" { Value::from_int(0) } else { Value::from_int(1) };
+        let mut acc = rest[0].clone();
+        if rest.len() == 1 {
+            // 单操作数仍要过数值校验（9.1：`+ abc` 报 left operand 错）
+            return numeric_binop_str(&acc, &identity, ch, op);
+        }
+        for v in &rest[1..] {
+            acc = numeric_binop_str(&acc, v, ch, op)?;
+        }
+        return Ok(acc);
+    }
     for v in rest {
         acc = numeric_binop_str(&acc, v, ch, op)?;
     }

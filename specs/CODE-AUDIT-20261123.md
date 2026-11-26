@@ -107,7 +107,7 @@
 | S36 | `file normalize a/../x` 原样返回 | `commands/io.rs` | 已修（M5）：词法规范化（接上工作目录、消解 `.`/`..`、合并分隔符、`~` 展开），不查文件系统。`~user` 未实现（C33） |
 | S37 | `-async` socket 的 fd 无 `CLOEXEC` | `channel.rs` | 已修（M5）：裸 `socket()` 之后设 `FD_CLOEXEC`（A/B 实测：修复前 `exec` 子进程继承该描述符，修复后不继承） |
 | S38 | HTTP 客户端默认无超时、响应体无上限、无 URL 审查钩子（读码） | `rtcl-native/src/net.rs` | 未修  已修（2026-11-26，task/b2-execfile @ caebf8d）：连接超时默认 30s、总超时 300s（显式化 reqwest 隐式 30s——审计的『无超时』实为该无声值）、响应体 64MiB 上限、URL 宿主校验钩子，env/opts 可覆盖；11/11 测试 |
-| S39 | 变量表无密钥哈希，可预构造冲突键（风险低） | `interp/varmap.rs` | 未修 |
+| S39 | 变量表无密钥哈希，可预构造冲突键（风险低） | `interp/varmap.rs` | 未修  已修（2026-11-26，perf/wave2 @ 6e2154e）：VarHasher.finish() 加进程级随机种子（std RandomState 键派生，零依赖），fmix64 前异或——预构造冲突键不跨运行成立；P6 桶分布保持，迭代序实证不承载输出 |
 | S40 | Tk：畸形 PNG、多字节颜色串、`image put -to` 负坐标 panic（读码，未运行） | `rtcl-tk-runtime/src/lib.rs` | 未修 |
 
 ## 静默出错（不报错，结果是错的）

@@ -944,11 +944,17 @@ mod tests {
 
     #[test]
     fn no_fold_negative_shift() {
-        // Negative shift counts error at runtime — must not mask-fold
+        // Negative shift counts error at runtime — must not mask-fold.
+        // C16：负移位窗口由折叠错误 op 承载（错误原样延迟到运行期，
+        // invoked-from-within 帧），不产生值折叠。
         let ops = compile_expr_with_peephole("1 << -1").unwrap();
-        assert!(ops.iter().any(|o| matches!(o, OpCode::Shl)));
+        assert!(ops
+            .iter()
+            .any(|o| matches!(o, OpCode::ExprFoldError(b'<', _, _))));
         let ops = compile_expr_with_peephole("1 >> -1").unwrap();
-        assert!(ops.iter().any(|o| matches!(o, OpCode::Shr)));
+        assert!(ops
+            .iter()
+            .any(|o| matches!(o, OpCode::ExprFoldError(b'>', _, _))));
     }
 
     #[test]

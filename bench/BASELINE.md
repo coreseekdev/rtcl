@@ -2802,3 +2802,18 @@ judge 88/88、crash-gate 128/128（d28 在内）、sweep 12 既有、probes **31
 - 门禁：judge 58/95（新语料基线持平）、crash-gate 128/128、sweep 12 既有、
   probes 327/118（objsec flake 态）→ 修复后 328/117 口径、workspace exit 0、
   rtcl-native(net) 11/11、wasm32 过、五特性 check 过。
+
+## B3/B2 对齐与加固（task/b3-commands + task/b2-execfile，2026-11-26）
+
+B3（timer/regexp/regsub/lsearch/process/混合包，部分子代理+主会话接手）：
+- tcl::process ensemble（autopurge/list/purge/status，空态钉形）
+- regsub -command（TIP 463 回调替换：前缀+匹配+捕获组按值求值）
+- regexp 编译错误文案 couldn't→cannot（9.1 全族）
+- lsearch 错误清单补 -stride、REG_BADRPT 措辞序 invalid quantifier operand
+- binary f32 字段窄化走最短十进制字符串按 f32 RN 解析（位级 cast 在
+  半点值上与 tclsh 分叉——binary-53.22/53.25 钉形）
+- 事件 id 基 after#1→after#0（9.x 口径）；timer/timerate ensemble
+- case 级：4157→4531/4849（93.4%），gen_lfilter/lpop/lseq/timer/
+  dict/subst/array/const/regexp/lsearch/binary/process 十余文件转绿
+
+B2（exec 宿主路径/file/HTTP/大小守卫）：见 BASELINE 2026-11-26 B2 节。

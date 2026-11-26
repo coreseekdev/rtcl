@@ -46,8 +46,9 @@ judge/probes/extract 的 oracle 已默认指向仓内构建的
 ```bash
 # 构建（内存上限必须带——机器会 OOM）
 bash -c 'ulimit -v 3400000; cargo build --release -j 2'
-# 测试（1481 个，63 套件）
-bash -c 'ulimit -v 6000000; cargo test --workspace -j 2'
+# 测试（1481 个，63 套件；**不加 ulimit**——tk-demo 大链接在 6M 上限
+# 下必失败，2026-11-26 两次实证；内存紧张就 -j 1）
+cargo test --workspace -j 2
 ```
 
 - **门禁脚本已入仓**（原 target/audit/ 下的散件，worktree 相对路径，

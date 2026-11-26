@@ -130,7 +130,18 @@ pub(crate) fn alias_dispatch(interp: &mut Interp, args: &[Value]) -> Result<Valu
     // another alias, each hop one more dispatch, so the call depth bounds
     // a chain on its own.  Probing the proc and builtin tables by the
     // bare key found only the global bare-named ones.
-    interp.dispatch_values(&full_args)
+    // C38（9.1 钉形）：别名目标的 wrong-args 消息命令名 = **别名调用词**
+    // （同 cross_alias_dispatch——9.1 统一别名名，原 rtcl 一律目标名）。
+    // 带前缀实参：名字后不带参数表（should be "b5"）。
+    use super::interp_cmd::rename_wrong_args;
+    let name_only = !info.prefix_args.is_empty();
+    let r = interp.dispatch_values(&full_args);
+    match r {
+        Err(e) if e.message_text().starts_with("wrong # args: should be \"") => {
+            Err(rename_wrong_args(&e, name, name_only))
+        }
+        other => other,
+    }
 }
 
 // ---------- local ----------

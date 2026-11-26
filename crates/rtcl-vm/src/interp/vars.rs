@@ -520,7 +520,8 @@ impl Interp {
             return None;
         }
         let current = cell.as_int()?;
-        // Overflow belongs to the real `incr` (ARITH IOVERFLOW error).
+        // Overflow（含 bignum 现值）属于真 `incr`——cmd_incr 的
+        // BigInt 精确和（D5：9.1 任意精度默认，不回绕）。
         let next = current.checked_add(amount)?;
         cell.set_int_rep(next);
         Some(cell.clone())
@@ -2359,7 +2360,8 @@ impl Interp {
         }
         let slot = self.var_slot_fast(name)?;
         let current = slot.as_int()?;
-        // Overflow belongs to the real `incr` (ARITH IOVERFLOW error).
+        // Overflow（含 bignum 现值）属于真 `incr`——cmd_incr 的
+        // BigInt 精确和（D5：9.1 任意精度默认，不回绕）。
         let next = current.checked_add(amount)?;
         slot.set_int_rep(next);
         Some(slot.clone())

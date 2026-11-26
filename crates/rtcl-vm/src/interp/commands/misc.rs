@@ -455,6 +455,28 @@ fn mathop_add(a: &Value, b: &Value) -> Result<Value> {
     ))
 }
 
+/// `incr` 的整数解析（D5，9.1 口径）：任意精度整数（含 bignum 字符串与
+/// `Big` rep）都收；浮点形值（double 能解析、整数不能）与全非数字都报
+/// `expected integer but got "<值>"`，errorCode 按 9.1 分工——前者
+/// `TCL VALUE INTEGER`，后者 `TCL VALUE NUMBER`（incr_widen 钉形）。
+fn incr_int_of(interp: &mut Interp, v: &Value) -> std::result::Result<num_bigint::BigInt, Error> {
+    match crate::types::bignum::int_rep(v) {
+        Some(crate::types::bignum::IntRep::I64(i)) => Ok(num_bigint::BigInt::from(i)),
+        Some(crate::types::bignum::IntRep::Big(b)) => Ok(b),
+        None => {
+            if v.as_float().is_some() {
+                set_error_code(interp, "TCL VALUE INTEGER");
+            } else {
+                set_error_code(interp, "TCL VALUE NUMBER");
+            }
+            Err(tcl_err(format!(
+                "expected integer but got \"{}\"",
+                v.as_str()
+            )))
+        }
+    }
+}
+
 pub fn cmd_incr(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 || args.len() > 3 {
         return Err(Error::wrong_args("incr", 2, args.len()));
@@ -466,23 +488,7 @@ pub fn cmd_incr(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // 读取走 read_var(Tcl_GetVarFromObj 的 read trace 触发面:
     // incr 读现值 fire read trace——incr_window_p11_trace 钉形)。
     let current = match interp.read_var(var_name) {
-        Ok(v) => {
-            let parsed = v.as_int();
-            let text = v.as_str().to_string();
-            match parsed {
-                Some(n) => n,
-                None => {
-                    // tclsh frames a bad current value as TCL VALUE
-                    // INTEGER (`incr x` with x="abc" → errorCode =
-                    // TCL VALUE INTEGER).
-                    set_error_code(interp, "TCL VALUE INTEGER");
-                    return Err(tcl_err(format!(
-                        "expected integer but got \"{}\"",
-                        text
-                    )));
-                }
-            }
-        }
+        Ok(v) => incr_int_of(interp, &v)?,
         Err(e) => {
             // Tcl: incr on a non-existent variable starts at 0。类型冲突
             // 的方向不同：标量目标实际是数组 → 写路径错误
@@ -503,39 +509,33 @@ pub fn cmd_incr(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             if crate::interp::vars::is_type_conflict(&e) {
                 return Err(e);
             }
-            0
+            num_bigint::BigInt::from(0)
         }
     };
     let amount = if args.len() == 3 {
-        match args[2].as_int() {
-            Some(n) => n,
-            None => {
-                let msg = format!("expected integer but got \"{}\"", args[2].as_str());
+        match incr_int_of(interp, &args[2]) {
+            Ok(n) => n,
+            Err(e) => {
                 // tclsh frames the failed increment parse between the
                 // message and the invoking command's harness frame —
-                // no line number (`incr-old-2.5`).
+                // no line number (`incr-old-2.5`).  帧只进 errorInfo，
+                // catch 面的消息不带（incr_window_p07 钉形）。
+                let msg = e.message_text().to_string();
                 interp.err_info = Some(msg.clone());
                 if let Some(info) = &mut interp.err_info {
                     info.push_str("\n    (reading increment)");
                 }
-                set_error_code(interp, "TCL VALUE INTEGER");
                 return Err(tcl_err(msg));
             }
         }
     } else {
-        1
+        num_bigint::BigInt::from(1)
     };
-    // tclsh widens an overflowing i64 sum to an exact bignum (incr on
-    // i64::MAX grows to 2^63, it does not wrap); expr's `+` already
-    // goes through numeric_binop's BigInt path — same convention here.
-    let new_val = match current.checked_add(amount) {
-        Some(n) => Value::from_int(n),
-        None => {
-            let big = num_bigint::BigInt::from(current) + num_bigint::BigInt::from(amount);
-            crate::types::bignum::to_value(crate::types::bignum::IntRep::Big(big))
-        }
-    };
-    interp.set_var(var_name, new_val)
+    // tclsh widens an overflowing i64 sum to an exact bignum and accepts
+    // bignum current/increment at any width (incr on 2**63 grows, it does
+    // not wrap; 9.1 重钉).  expr's `+` already goes through numeric_binop's
+    // BigInt path — same convention here.
+    interp.set_var(var_name, Value::from_bigint(current + amount))
 }
 
 pub fn cmd_unset(interp: &mut Interp, args: &[Value]) -> Result<Value> {

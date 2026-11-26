@@ -34,8 +34,11 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::ptr::NonNull;
+use std::rc::Rc;
 
 use indexmap::IndexMap;
+use num_bigint::BigInt;
+use num_traits::ToPrimitive as _;
 use smallvec::SmallVec;
 
 // ── dict-key hashing ───────────────────────────────────────────
@@ -119,6 +122,11 @@ const INLINE_SIZE: usize = 23;
 pub enum InternalRep {
     /// Integer representation
     Int(i64),
+    /// 任意精度整数（D5）：i63 立即数与 i64 堆 Int 装不下的精确值。
+    /// `Rc` 让 Clone 摊薄为引用计数加一——bignum 值在列表/字典克隆与
+    /// 栈搬运间转手是常态，深拷 BigInt 的位数开销只配留给真正的运算。
+    /// 字符串形态（canonical 十进制）仍惰性按需生成。
+    Big(Rc<BigInt>),
     /// Floating point representation
     Float(f64),
     /// Boolean representation
@@ -143,6 +151,8 @@ impl Clone for InternalRep {
     fn clone(&self) -> Self {
         match self {
             InternalRep::Int(n) => InternalRep::Int(*n),
+            // Rc 份额复制：引用计数加一，位数不拷。
+            InternalRep::Big(b) => InternalRep::Big(Rc::clone(b)),
             InternalRep::Float(n) => InternalRep::Float(*n),
             InternalRep::Bool(b) => InternalRep::Bool(*b),
             InternalRep::List(v) => InternalRep::List(v.clone()),
@@ -844,6 +854,36 @@ impl Value {
         }))
     }
 
+    /// Create a value from an arbitrary-precision integer (D5).
+    ///
+    /// 三态下沉：i63 内落立即数（快路径零分配），i64 内落堆 Int 箱
+    /// （既有语义不动——`as_int` 等全兼容），超界才落 `Big(Rc<BigInt>)`
+    /// 箱。字符串形态惰性：首次 `as_str` 渲染 canonical 十进制。
+    pub fn from_bigint(b: BigInt) -> Self {
+        if let Some(n) = b.to_i64() {
+            return Value::from_int(n);
+        }
+        Value::from_vptr(VPtr::new(ValueInner {
+            string: OnceCell::new(),
+            rep: InternalRep::Big(Rc::new(b)),
+            rc: Cell::new(1),
+        }))
+    }
+
+    /// Exact integer view of a `Big`-rep value, `None` for every other
+    /// state（含立即数/i64 堆箱——`as_int`/`bignum::int_rep` 才是全谱
+    /// 入口）。借用形态：比较族免去弯路克隆。
+    #[inline]
+    pub fn as_big(&self) -> Option<&BigInt> {
+        if self.is_imm() {
+            return None;
+        }
+        match &unsafe { self.heap_inner() }.rep {
+            InternalRep::Big(b) => Some(b),
+            _ => None,
+        }
+    }
+
     /// Create a value from a float
     pub fn from_float(n: f64) -> Self {
         Value::from_vptr(VPtr::new(ValueInner {
@@ -995,6 +1035,9 @@ impl Value {
                     SmallVec::from_slice(serialize_dict(map).as_bytes())
                 }
                 InternalRep::Int(n) => SmallVec::from_slice(format_int(*n).as_bytes()),
+                // D5：bignum 的 canonical 十进制（num-bigint 的 to_string
+                // 与 tclsh/libtommath 的十进制渲染一致，bnprobe2 钉形）。
+                InternalRep::Big(b) => SmallVec::from_slice(b.to_string().as_bytes()),
                 InternalRep::Float(n) => SmallVec::from_slice(format_float(*n).as_bytes()),
                 InternalRep::Bool(b) => {
                     SmallVec::from_slice(if *b { b"1" } else { b"0" })
@@ -1067,6 +1110,9 @@ impl Value {
         let inner = unsafe { self.heap_inner() };
         match &inner.rep {
             InternalRep::Int(n) => Some(*n),
+            // D5：bignum 超出 i64 视为"非 i64 整数"——不物化字符串、不
+            // 走十进制重解析（精确视图走 `bignum::int_rep`/`as_big`）。
+            InternalRep::Big(_) => None,
             // The cached bool rep's string is exactly "1"/"0" — the fast
             // path every loop condition takes (Tcl_GetBooleanFromObj's
             // numeric arm), not a from-scratch decimal parse.
@@ -1098,6 +1144,9 @@ impl Value {
         match &inner.rep {
             InternalRep::Float(n) => Some(*n),
             InternalRep::Int(n) => Some(*n as f64),
+            // D5：bignum 的最近双精度值（round-to-even，tclsh 的
+            // bignum→double 路径同语义；超界给 ±Inf）。
+            InternalRep::Big(b) => Some(crate::types::bignum::to_f64(b)),
             InternalRep::Bool(b) => Some(u8::from(*b) as f64),
             _ => self.as_float_from_string(),
         }
@@ -1457,7 +1506,7 @@ impl Value {
             InternalRep::None => "string",
             // 宿主串就是 string rep 的宿主原生形态——对外类型名不变。
             InternalRep::HostStr(_) => "string",
-            InternalRep::Int(_) => "int",
+            InternalRep::Int(_) | InternalRep::Big(_) => "int",
             InternalRep::Float(_) => "float",
             InternalRep::Bool(_) => "bool",
             InternalRep::List(_) => "list",

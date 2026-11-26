@@ -48,6 +48,11 @@ pub fn int_rep(v: &Value) -> Option<IntRep> {
     if let Some(i) = v.as_int() {
         return Some(IntRep::I64(i));
     }
+    // D5：Big rep 直接读箱——运算链上的 bignum 不再逐次物化字符串再
+    // 十进制重解析（深拷一份位数给本函数的所有权形态 IntRep::Big）。
+    if let Some(b) = v.as_big() {
+        return Some(IntRep::Big(b.clone()));
+    }
     // `as_int` already took every i64-range literal, so this is a bignum.
     match parse_int(v.as_str().trim())? {
         IntRep::Big(b) => Some(IntRep::Big(b)),
@@ -131,11 +136,12 @@ pub fn parse_literal(s: &str) -> Option<BigInt> {
     })
 }
 
-/// Build a Value from an exact integer (canonical decimal for bignums).
+/// Build a Value from an exact integer (D5：bignum 落 `Big(Rc<BigInt>)`
+/// 堆箱——此前是字符串箱，每次运算链都要物化+重解析）。
 pub fn to_value(r: IntRep) -> Value {
     match r {
         IntRep::I64(i) => Value::from_int(i),
-        IntRep::Big(b) => Value::from_str(&b.to_string()),
+        IntRep::Big(b) => Value::from_bigint(b),
     }
 }
 

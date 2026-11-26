@@ -976,11 +976,12 @@ fn test_format_strict_errors() {
         r.as_str(),
         "{\"%n$\" argument index out of range} {TCL FORMAT INDEXRANGE}"
     );
-    // strict integer grammar: 08 is invalid octal
+    // 9.1 重钉（digits91 批，oracle 实测 `format %d 08`）：0NNN 按十进制，
+    // 08 是合法整数 8——invalid-octal 拒绝随 legacy octal 一并废除。
     let r = interp
         .eval("catch {format %d 08} m; set m")
         .unwrap();
-    assert_eq!(r.as_str(), "expected integer but got \"08\"");
+    assert_eq!(r.as_str(), "8");
 }
 
 #[test]
@@ -1052,8 +1053,9 @@ fn test_format_wrap_and_padding() {
             .as_str(),
         "-9223372036854775808"
     );
-    // Tcl integer grammar
-    assert_eq!(interp.eval("format %d 017").unwrap().as_str(), "15");
+    // Tcl integer grammar（9.1 重钉：017 是十进制 17——oracle 实测；
+    // %d 的 32 位截断规则是另一批次，i64 回绕两行保持原钉）
+    assert_eq!(interp.eval("format %d 017").unwrap().as_str(), "17");
     assert_eq!(interp.eval("format %d 0b101").unwrap().as_str(), "5");
     assert_eq!(interp.eval("format %d 0o17").unwrap().as_str(), "15");
     assert_eq!(interp.eval("format %d { 12}").unwrap().as_str(), "12");

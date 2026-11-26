@@ -659,163 +659,144 @@ impl<'a> ExprParser<'a> {
     // -- Number / string / identifier parsing --------------------------------
 
     fn parse_number(&mut self) -> Result<Value> {
-        let mut s = String::new();
+        // The 9.1 literal grammar — one scanner with `string is`, lsort,
+        // incr and index parsing (bignum::scan_number): 0x/0b/0o/0d
+        // prefixes, bare leading zero = DECIMAL (legacy octal abolished,
+        // `017` is 17), `_` separators between digits of any radix.
+        // Syntax errors here are defensive: the expr pre-parser
+        // (expr_check) reports them first, with tclsh's byte-exact
+        // bareword texts.
+        let start = self.pos;
+        let rest: String = self.chars[start..].iter().collect();
+        let Some(scan) = super::bignum::scan_number(&rest, false) else {
+            // No numeric prefix at all. Digit-led runs (`1_`, `1_x`) are
+            // invalid barewords; dot-led junk (".", "._5") is tclsh's
+            // invalid character error at the dot.
+            if self.peek() == '.' {
+                let whole: String = self.chars.iter().collect();
+                return Err(Error::Msg(format!(
+                    "invalid character \".\"\nin expression \"{whole}\""
+                )));
+            }
+            let run = self.bareword_run();
+            return Err(self.bareword_error(&run));
+        };
+        // The scanned region is pure ASCII, so the byte stop is a char
+        // position too.
+        let stop = scan.stop;
+        let tail_is_bareword = self
+            .chars
+            .get(start + stop)
+            .map(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .unwrap_or(false);
+        let number_text: String = self.chars[start..start + stop].iter().collect();
+        let value = self.number_value(&number_text, stop, &scan);
+        self.pos = start + stop;
+        if tail_is_bareword {
+            // A bareword tail on a number (`3eq2` glues into the word
+            // operator; anything else is one bareword token). Only
+            // reachable when the pre-parser passed a float tail (`1.5x`
+            // lexes `1.5` + bareword `x`) — the int form errors there.
+            self.check_number_trail(&number_text)?;
+        }
+        value
+    }
 
-        // Handle hex / binary / octal (0x / 0b / 0o) and legacy octal.
-        // In-range radix literals keep their original text (expr's `eq`
-        // compares the raw string: `01eq1` is false, expr-8.17) while the
-        // top-level result canonicalizes to decimal; oversized literals
-        // widen to exact bignums rendered in decimal (expr-43.11).
-        if self.peek() == '0' && self.pos + 1 < self.chars.len() {
-            let next = self.chars[self.pos + 1];
-            if next == 'x' || next == 'X' {
-                s.push(self.advance());
-                s.push(self.advance());
-                while self.is_hex_digit() {
-                    s.push(self.advance());
-                }
-                return self.radix_literal(&s, 16, &s[2..]);
-            }
-            if next == 'b' || next == 'B' {
-                s.push(self.advance());
-                s.push(self.advance());
-                while self.peek() == '0' || self.peek() == '1' {
-                    s.push(self.advance());
-                }
-                return self.radix_literal(&s, 2, &s[2..]);
-            }
-            if next == 'o' || next == 'O' {
-                s.push(self.advance());
-                s.push(self.advance());
-                while self.peek() >= '0' && self.peek() <= '7' {
-                    s.push(self.advance());
-                }
-                return self.radix_literal(&s, 8, &s[2..]);
-            }
-            if next.is_ascii_digit() {
-                // Legacy octal: `017` is 15; a digit 8/9 makes the whole
-                // token an invalid bareword with tclsh's octal hint —
-                // unless a decimal continuation follows (`028.1` is 28.1,
-                // `08e2` is 800.0, `085.` is 85.0), in which case the
-                // whole token is a double.
-                let octal_start = self.pos;
-                s.push(self.advance());
-                while self.peek() >= '0' && self.peek() <= '7' {
-                    s.push(self.advance());
-                }
-                let hit89 = self.peek() == '8' || self.peek() == '9';
-                // Lookahead without consuming: digits, optional `.`+digits,
-                // optional exponent.  A decimal continuation makes the
-                // whole token a double regardless of a valid octal prefix
-                // (`077.5` is 77.5, `028.1` is 28.1, `08e2` is 800.0,
-                // `085.` is 85.0).
-                let mut j = self.pos;
-                let mut saw_dot = false;
-                let mut saw_exp = false;
-                while j < self.chars.len() && self.chars[j].is_ascii_digit() {
-                    j += 1;
-                }
-                if j < self.chars.len() && self.chars[j] == '.' {
-                    saw_dot = true;
-                    j += 1;
-                    while j < self.chars.len() && self.chars[j].is_ascii_digit() {
-                        j += 1;
-                    }
-                }
-                if j < self.chars.len() && (self.chars[j] == 'e' || self.chars[j] == 'E') {
-                    let mut k = j + 1;
-                    if k < self.chars.len() && (self.chars[k] == '+' || self.chars[k] == '-') {
-                        k += 1;
-                    }
-                    if k < self.chars.len() && self.chars[k].is_ascii_digit() {
-                        saw_exp = true;
-                    }
-                }
-                if saw_dot || saw_exp {
-                    // Fall through to the decimal scanner below, from the
-                    // token start.
-                    self.pos = octal_start;
-                    s.clear();
-                } else if hit89 {
-                    // The whole digit run belongs to the offending token.
-                    while self.is_digit() {
-                        s.push(self.advance());
-                    }
-                    return Err(self.invalid_octal_error(&s));
-                } else {
-                    return self.radix_literal(&s, 8, &s[1..]);
-                }
-            }
-        }
 
-        while self.is_digit() {
-            s.push(self.advance());
-        }
-        if self.peek() == '.' {
-            s.push(self.advance());
-            while self.is_digit() {
-                s.push(self.advance());
-            }
-        }
-        if self.peek() == 'e' || self.peek() == 'E' {
-            // Lookahead: `e` only belongs to the number when digits (or a
-            // sign then digits) follow — `3eq2` must stop at `3`.
-            let save = self.pos;
+    /// The digit region of a scanned literal with `_` separators stripped.
+    fn strip_digit_separators(raw: &str, run: usize, stop: usize) -> String {
+        raw.as_bytes()[run..stop]
+            .iter()
+            .filter(|&&b| b != b'_')
+            .map(|&b| b as char)
+            .collect()
+    }
+
+    /// The alnum/underscore run at the cursor (a bareword token body).
+    fn bareword_run(&mut self) -> String {
+        let run_start = self.pos;
+        while self.peek().is_ascii_alphanumeric() || self.peek() == '_' {
             self.advance();
-            let mut exp = String::new();
-            exp.push(self.chars[self.pos - 1]);
-            if self.peek() == '+' || self.peek() == '-' {
-                exp.push(self.advance());
-            }
-            if self.is_digit() {
-                s.push_str(&exp);
-                while self.is_digit() {
-                    s.push(self.advance());
-                }
+        }
+        self.chars[run_start..self.pos].iter().collect()
+    }
+
+    /// The value of a scanned literal. In-range integers keep their raw
+    /// text (`expr {017 eq 17}` is false — tclsh compares the literal as
+    /// written; the top-level result still canonicalizes); oversized
+    /// digits widen to an exact bignum in decimal form.
+    fn number_value(
+        &self,
+        raw: &str,
+        stop: usize,
+        scan: &super::bignum::NumScan,
+    ) -> Result<Value> {
+        // tclsh keeps the literal's own text as the int's string rep until
+        // the top-level result canonicalizes: `expr {017 eq 17}`,
+        // `{1_000 eq 1000}`, `{0x10 eq 16}` are all false (the raw form
+        // never equals the decimal rendering), while an oversized literal
+        // widens to a bignum whose canonical decimal replaces the text.
+        // A literal already spelled in canonical decimal takes the
+        // allocation-free int rep (every hot loop constant).
+        let in_range_rep = |n: i64, raw: &str| {
+            if raw.as_bytes() == n.to_string().as_bytes() {
+                Value::from_int(n)
             } else {
-                self.pos = save;
+                Value::from_str(raw)
             }
-        }
-
-        self.check_number_trail(&s)?;
-
-        if s.contains('.') || s.contains('e') || s.contains('E') {
-            Ok(super::expr_funcs::float_value(s.parse().unwrap_or(0.0)))
-        } else {
-            match s.parse::<i64>() {
-                Ok(n) => Ok(Value::from_int(n)),
-                // Tcl widens oversized integer literals to exact bignums.
-                Err(_) => match num_bigint::BigInt::parse_bytes(s.as_bytes(), 10) {
-                    // Bignum values carry the canonical decimal string.
-                    Some(_) => Ok(Value::from_str(&s)),
-                    None => Ok(super::expr_funcs::float_value(f64::INFINITY)),
-                },
+        };
+        Ok(match &scan.payload {
+            super::bignum::NumPayload::Int { radix, run } => {
+                // Accumulate the magnitude in u64, zero allocation; only
+                // past-u64 widths join the digits for a bignum.
+                let mut mag: u64 = 0;
+                let mut overflow = false;
+                for &b in raw.as_bytes()[*run..stop].iter() {
+                    if b == b'_' {
+                        continue;
+                    }
+                    mag = match mag
+                        .checked_mul(*radix as u64)
+                        .and_then(|m| m.checked_add(super::bignum::digit_value(b) as u64))
+                    {
+                        Some(v) => v,
+                        None => {
+                            overflow = true;
+                            break;
+                        }
+                    };
+                }
+                if !overflow && mag <= i64::MAX as u64 {
+                    let n = if scan.neg {
+                        -(mag as i64)
+                    } else {
+                        mag as i64
+                    };
+                    return Ok(in_range_rep(n, raw));
+                }
+                if !overflow && scan.neg && mag == (i64::MAX as u64) + 1 {
+                    return Ok(in_range_rep(i64::MIN, raw));
+                }
+                // Oversized: the canonical decimal bignum replaces the
+                // text (int() widens silently).
+                let digits = Self::strip_digit_separators(raw, *run, stop);
+                match num_bigint::BigInt::parse_bytes(digits.as_bytes(), *radix) {
+                    Some(big) => {
+                        let big = if scan.neg { -big } else { big };
+                        Value::from_str(&big.to_string())
+                    }
+                    None => super::expr_funcs::float_value(f64::INFINITY),
+                }
             }
-        }
-    }
-
-    /// Resolve a radix literal (`0x…`/`0b…`/`0o…`/legacy octal) of the
-    /// given text whose digits start at `body`.  In-range values keep the
-    /// raw text (string rep is preserved for `eq`; the top-level result
-    /// still canonicalizes); oversized values widen to an exact bignum in
-    /// decimal form.
-    fn radix_literal(&mut self, s: &str, radix: u32, body: &str) -> Result<Value> {
-        if i64::from_str_radix(body, radix).is_ok() {
-            return Ok(Value::from_str(s));
-        }
-        match num_bigint::BigInt::parse_bytes(body.as_bytes(), radix) {
-            Some(big) => Ok(Value::from_str(&big.to_string())),
-            None => Ok(super::expr_funcs::float_value(f64::INFINITY)),
-        }
-    }
-
-    /// tclsh's invalid-octal bareword error, e.g. for `expr 018`:
-    /// `invalid bareword "018" ... or ... (invalid octal number?)`.
-    fn invalid_octal_error(&self, token: &str) -> Error {
-        let expr: String = self.chars.iter().collect();
-        Error::Msg(format!(
-            "invalid bareword \"{token}\"\nin expression \"{expr}\";\nshould be \"${token}\" or \"{{{token}}}\" or \"{token}(...)\" or ... (invalid octal number?)"
-        ))
+            super::bignum::NumPayload::Float { .. } => {
+                match super::bignum::float_text_from(raw, stop, &scan.payload, scan.neg)
+                    .and_then(|text| text.parse::<f64>().ok())
+                {
+                    Some(v) => super::expr_funcs::float_value(v),
+                    None => super::expr_funcs::float_value(f64::INFINITY),
+                }
+            }
+        })
     }
 
     /// tclsh: letters glued to a number are only legal as the word
@@ -843,16 +824,21 @@ impl<'a> ExprParser<'a> {
             self.pos = run_start;
             return Ok(());
         }
-        let whole: String = self.chars.iter().collect();
         let bare = format!("{}{}", prefix, run);
-        Err(Error::runtime(
+        Err(self.bareword_error(&bare))
+    }
+
+    /// The invalid-bareword error with tclsh 9.1's radix hint (0b →
+    /// binary, 0o/0NN → octal; computed on the whole token).
+    fn bareword_error(&self, bw: &str) -> Error {
+        let whole: String = self.chars.iter().collect();
+        let hint = super::bignum::bareword_hint(bw);
+        Error::runtime(
             format!(
-                "invalid bareword \"{bw}\"\nin expression \"{w}\";\nshould be \"${bw}\" or \"{{{bw}}}\" or \"{bw}(...)\" or ...",
-                bw = bare,
-                w = whole
+                "invalid bareword \"{bw}\"\nin expression \"{whole}\";\nshould be \"${bw}\" or \"{{{bw}}}\" or \"{bw}(...)\" or ...{hint}"
             ),
             crate::error::ErrorCode::Generic,
-        ))
+        )
     }
 
     /// Collect the body of a `[...]` command substitution (the leading `[`

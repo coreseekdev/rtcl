@@ -6,8 +6,10 @@
 //! — while this module supplies parsing, arithmetic and conversions on
 //! `num_bigint::BigInt`.
 //!
-//! Semantics probed against tclsh 8.6.17 (see judge/probes/pbn*.tcl):
-//! - integer literals (dec / 0x / 0o / 0b, legacy octal) widen silently
+//! Semantics probed against tclsh 8.6.17 and re-probed against 9.1.0
+//! (judge/probes/pbn*.tcl, digits91.tcl):
+//! - integer literals (dec / 0x / 0o / 0b / 0d; 9.1 grammar — the bare
+//!   leading-0 octal of 8.6 is gone) widen silently
 //! - `int()`/`wide()` wrap to the low 64 bits of the exact integer
 //! - `entier()`/`round()` produce bignums for out-of-range doubles
 //! - `/` and `%` are floor division / modulo
@@ -65,68 +67,657 @@ pub fn int_rep(v: &Value) -> Option<IntRep> {
 /// (they used to carry four private copies that disagreed about legacy
 /// octal: one read `0777…` past 64 bits as decimal, another `018` as 18).
 ///
-/// Optional sign; decimal; `0x`/`0X`, `0o`/`0O`, `0b`/`0B` prefixes; a
-/// leading `0` followed by more octal digits is legacy octal (`017` is
-/// 15), at any width. A leading `0` followed by a digit 8 or 9 is not a
-/// number at all (see [`is_invalid_octal`]).
+/// 9.1 grammar (TIP … / tclStrToD.c TclParseNumber, oracle-probed
+/// 2026-11-26, judge/probes/digits91.tcl): optional sign; decimal;
+/// `0x`/`0X`, `0o`/`0O`, `0b`/`0B` prefixes; `0d`/`0D` to compel decimal;
+/// a bare leading `0` is DECIMAL (`017` is 17 — legacy octal abolished,
+/// `09` is 9, `018` is 18, no invalid-octal error anywhere); `_`
+/// separators between digits of any radix (`1_000`, `0_1`, `1__0`,
+/// `0xf_f`) but never at either end or adjacent to a radix prefix
+/// (`1_`, `100_`, `0x_f` are not numbers).
 pub fn parse_int(s: &str) -> Option<IntRep> {
-    let (neg, body) = match s.strip_prefix('-') {
-        Some(r) => (true, r),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    if body.is_empty() {
+    let scan = scan_number(s, true)?;
+    if !scan.full {
         return None;
     }
-    // The prefixes are ASCII, so dispatch on leading bytes: slicing the
-    // `&str` at a fixed byte offset panics when the offset falls inside a
-    // multi-byte character (`expr {"中a" + 1}` reached the old copy with
-    // any non-ASCII operand).
-    let b = body.as_bytes();
-    let (radix, digits) = match b {
-        [b'0', b'x' | b'X', rest @ ..] => (16u32, rest),
-        [b'0', b'o' | b'O', rest @ ..] => (8, rest),
-        [b'0', b'b' | b'B', rest @ ..] => (2, rest),
-        // Legacy octal: `017` is 15, at any width (a bare `0` is decimal).
-        [b'0', rest @ ..] if !rest.is_empty() && rest.iter().all(|d| (b'0'..=b'7').contains(d)) => (8, rest),
-        // `018` is an invalid octal number, never the decimal 18.
-        [b'0', rest @ ..] if !rest.is_empty() && rest.iter().all(|d| d.is_ascii_digit()) => return None,
-        _ => (10, b),
-    };
-    // Only an all-digit remainder can be a number at this point; the
-    // slice is ASCII then, so the view back to `&str` is unchecked-free.
-    let digits = core::str::from_utf8(digits).ok()?;
-    if digits.is_empty() || !digits.bytes().all(|d| (d as char).is_digit(radix)) {
-        return None;
+    let (radix, run) = scan.into_int()?;
+    // Accumulate in u64 (covers every i64 magnitude plus the -2^63
+    // boundary) with zero allocation; only past-u64 widths join the
+    // digit region for a bignum.
+    let mut mag: u64 = 0;
+    let mut overflow = false;
+    for &b in s[run..scan.stop].as_bytes() {
+        if b == b'_' {
+            continue;
+        }
+        mag = match mag
+            .checked_mul(radix as u64)
+            .and_then(|m| m.checked_add(digit_value(b) as u64))
+        {
+            Some(v) => v,
+            None => {
+                overflow = true;
+                break;
+            }
+        };
     }
-    // i64 first; the magnitude is non-negative so the signed form cannot
-    // overflow. Past i64 the same digits widen to a bignum.
-    if let Ok(mag) = i64::from_str_radix(digits, radix) {
-        return Some(IntRep::I64(if neg { -mag } else { mag }));
-    }
-    // `-9223372036854775808`: the magnitude is one past i64::MAX while the
-    // signed value fits (only this boundary takes the allocation).
-    if neg {
-        // from_str_radix, not a decimal parse — the `-0x8000000000000000`
-        // boundary used to read the hex digits as decimal (-8e15).
-        if let Ok(v) = i64::from_str_radix(&format!("-{digits}"), radix) {
-            return Some(IntRep::I64(v));
+    if !overflow {
+        if mag <= i64::MAX as u64 {
+            return Some(IntRep::I64(if scan.neg { -(mag as i64) } else { mag as i64 }));
+        }
+        // `-9223372036854775808`: the magnitude is one past i64::MAX
+        // while the signed value fits.
+        if scan.neg && mag == (i64::MAX as u64) + 1 {
+            return Some(IntRep::I64(i64::MIN));
         }
     }
-    let mag = BigInt::parse_bytes(digits.as_bytes(), radix)?;
-    Some(IntRep::Big(if neg { -mag } else { mag }))
+    let digits = strip_separators(&s[run..scan.stop]);
+    let big = BigInt::parse_bytes(digits.as_bytes(), radix)?;
+    Some(IntRep::Big(if scan.neg { -big } else { big }))
 }
 
-/// A leading `0` followed by more decimal digits among which is an 8 or a
-/// 9: Tcl treats the text as an *invalid octal number* everywhere, never
-/// as the decimal it looks like (`expr {"018" + 0}` errors, `expr {"018"}`
-/// stays the string "018").
-pub fn is_invalid_octal(s: &str) -> bool {
-    let body = s.strip_prefix('-').or_else(|| s.strip_prefix('+')).unwrap_or(s);
-    let b = body.as_bytes();
-    b.len() > 1
-        && b[0] == b'0'
-        && b.iter().all(|d| d.is_ascii_digit())
-        && b.iter().any(|d| *d == b'8' || *d == b'9')
+/// Strip `_` separators from a validated digit region.
+fn strip_separators(digits: &str) -> String {
+    digits.bytes().filter(|&b| b != b'_').map(|b| b as char).collect()
+}
+
+/// Numeric value of a validated digit byte in the scan's radix (the
+/// scanner only admits digits of its radix, so `a-f` in radix 16 — the
+/// only letter case — is safe).
+pub fn digit_value(b: u8) -> u32 {
+    match b {
+        b'0'..=b'9' => (b - b'0') as u32,
+        b'a'..=b'f' => (b - b'a' + 10) as u32,
+        b'A'..=b'F' => (b - b'A' + 10) as u32,
+        _ => 0,
+    }
+}
+
+/// Integer-region magnitude as f64 (prefixed radixes convert exactly via
+/// u64, widening to a bignum conversion past that).
+fn int_span_to_f64(s: &str, neg: bool, radix: u32, run: usize, stop: usize) -> Option<f64> {
+    let mut mag: u64 = 0;
+    let mut overflow = false;
+    for &b in s[run..stop].as_bytes() {
+        if b == b'_' {
+            continue;
+        }
+        mag = match mag
+            .checked_mul(radix as u64)
+            .and_then(|m| m.checked_add(digit_value(b) as u64))
+        {
+            Some(v) => v,
+            None => {
+                overflow = true;
+                break;
+            }
+        };
+    }
+    let v = if overflow {
+        let digits = strip_separators(&s[run..stop]);
+        BigInt::parse_bytes(digits.as_bytes(), radix)?.to_f64()?
+    } else {
+        mag as f64
+    };
+    Some(if neg { -v } else { v })
+}
+
+/// The full-number float view of a string (9.1 grammar — underscores in
+/// mantissa/fraction/exponent, `0d` prefixes, decimal leading zeros;
+/// `1_0.5` is 10.5). `Inf`/`-Inf`/`NaN` are the caller's arm here.
+pub fn parse_float_str(s: &str) -> Option<f64> {
+    let scan = scan_number(s, false)?;
+    if !scan.full {
+        return None;
+    }
+    match &scan.payload {
+        NumPayload::Float { .. } => {
+            let text = float_text_from(s, scan.stop, &scan.payload, scan.neg)?;
+            text.parse().ok()
+        }
+        // Integer forms coerce to floats: `"0x10" + 0.5` is 16.5.
+        NumPayload::Int { radix, run } => {
+            int_span_to_f64(s, scan.neg, *radix, *run, scan.stop)
+        }
+    }
+}
+
+/// The 9.1 Tcl number grammar scanner — the acceptPoint mirror of
+/// tclStrToD.c `TclParseNumber` (without the scan-command legacy-octal
+/// flag, which rtcl's `scan` keeps separately in io.rs). Shared by
+/// `parse_int`/`parse_float_str`, `string is integer/wideinteger/entier/
+/// double` (failindex = stop), the index scanners (`scan_tcl_int`) and
+/// the expression lexer's bareword/hint decisions.
+///
+/// Returns `None` when no numeric prefix exists at all (TclParseNumber's
+/// TCL_ERROR arm: the first character never reached an accepting state —
+/// `_1`, `abc`, `1_x` where the misplaced `_` kills the whole token).
+///
+/// `stop` is the acceptPoint: the input length for a full parse; for a
+/// prefix parse the index of the first rejected character when its
+/// lexing state was accepting (`42x` stops at the `x`), or of the last
+/// accepted character when it was not (`12_` stops at the `2`, `1_x`
+/// fails outright). Characters in `s[..stop]` are all ASCII, so byte and
+/// char offsets agree. `full` additionally accepts trailing whitespace.
+pub struct NumScan {
+    pub stop: usize,
+    pub full: bool,
+    /// A leading `-` was consumed (always in the accepted region).
+    pub neg: bool,
+    pub payload: NumPayload,
+}
+
+/// Number pieces as spans of the scanned input — the scanner never
+/// allocates; value builders join the digit runs only when a value is
+/// actually materialised (separators are skipped while accumulating).
+pub enum NumPayload {
+    /// Integer: radix + the digit region `s[run..stop)` (digits and `_`
+    /// separators, contiguous — prefixes excluded; sign is `scan.neg`).
+    Int { radix: u32, run: usize },
+    /// Float piece positions (byte indices): mantissa digits `s[f0..dot
+    /// or e or stop)`, fraction `s[dot+1..e or stop)`, exponent digits
+    /// `s[exp0..stop)` (sign in `exp_neg`); `f0 == dot` marks an empty
+    /// mantissa (".5").
+    Float {
+        f0: usize,
+        dot: Option<usize>,
+        e_at: Option<usize>,
+        exp0: Option<usize>,
+        exp_neg: bool,
+    },
+}
+
+impl NumScan {
+    /// The integer parts of the payload, or `None` for a float:
+    /// `(radix, digit-run start)`.
+    pub fn into_int(&self) -> Option<(u32, usize)> {
+        match self.payload {
+            NumPayload::Int { radix, run } => Some((radix, run)),
+            NumPayload::Float { .. } => None,
+        }
+    }
+
+    /// The integer digit region `s[run..stop)` — digits and `_`
+    /// separators, contiguous. Empty for a prefix without digits (`0x`).
+    pub fn int_digits<'a>(&self, s: &'a str) -> &'a str {
+        let run = match &self.payload {
+            NumPayload::Int { run, .. } => *run,
+            _ => self.stop,
+        };
+        &s[run..self.stop]
+    }
+}
+
+/// The float's Rust-parseable text (separators stripped; mantissa "0"
+/// supplied where absent; dot-exponent junctions normalized — Rust
+/// rejects "3.e2", tclsh accepts it as 300.0).
+pub fn float_text_from(s: &str, stop: usize, p: &NumPayload, neg: bool) -> Option<String> {
+    let NumPayload::Float { f0, dot, e_at, exp0, exp_neg } = p else {
+        return None;
+    };
+    let e_end = e_at.unwrap_or(stop);
+    let mut text = String::with_capacity(stop + 8);
+    if neg {
+        text.push('-');
+    }
+    // Mantissa: empty only for a leading-dot float (".5") — f0 == dot.
+    if matches!(dot, Some(d) if *f0 == *d) {
+        text.push('0');
+    } else {
+        text.push_str(&s[*f0..dot.unwrap_or(e_end)].replace('_', ""));
+    }
+    if let Some(d) = dot {
+        text.push('.');
+        let frac = &s[d + 1..e_end];
+        if frac.is_empty() && e_at.is_some() {
+            // "3.e2" → "3.0e2" (a trailing dot alone parses in Rust).
+            text.push('0');
+        } else {
+            text.push_str(&frac.replace('_', ""));
+        }
+    }
+    if let (Some(_), Some(x0)) = (e_at, exp0) {
+        text.push('e');
+        if *exp_neg {
+            text.push('-');
+        }
+        text.push_str(&s[*x0..stop].replace('_', ""));
+    }
+    Some(text)
+}
+
+/// Tcl's whitespace set (`TclIsSpaceProc`).
+fn is_tcl_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c')
+}
+
+/// Scan a Tcl number per the 9.1 grammar. `integer_only` rejects `.`/`e`
+/// (string is integer's TCL_PARSE_INTEGER_ONLY); the flag is also latched
+/// after a `0d` prefix, whose forms are integers only.
+///
+/// State machine mirroring tclStrToD.c: accepting states (Zero after the
+/// leading 0, and each radix body, decimal digit, fraction and exponent
+/// state) record an accept point before rejecting a character; prefix
+/// states (the radix specifier itself, exponent sign states) do not. The
+/// `_` separator filter runs before the state machine and kills the whole
+/// token when misplaced (no numeric prefix). End-of-input fails the same
+/// way as any rejected character, so a full parse stops exactly at the
+/// input length.
+pub fn scan_number(s: &str, integer_only: bool) -> Option<NumScan> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum St {
+        /// INITIAL: optional sign, then the number proper.
+        Initial,
+        /// SIGNUM: a sign was seen.
+        Signum,
+        Zero,
+        Hex0,
+        Hex,
+        Oct0,
+        Oct,
+        Bin0,
+        Bin,
+        Dec0,
+        Dec,
+        Frac,
+        Lrp,
+        ExpStart,
+        ExpSign,
+        Exp,
+    }
+    use St::*;
+
+    let b = s.as_bytes();
+    let mut i = 0;
+    // Leading whitespace is consumed without ever setting an accept
+    // point (a whitespace-only string scans to None).
+    while i < b.len() && is_tcl_ws(b[i]) {
+        i += 1;
+    }
+    let mut int_only = integer_only;
+    let mut state = Initial;
+    // Accept point: the index of the last character dispatched through an
+    // accepting state (None = nothing accepted yet). One past the last
+    // digit of the number when the parse is complete.
+    let mut accept: Option<usize> = None;
+    let mut neg = false;
+    // Digit regions as positions (zero-allocation payload): the integer
+    // run start, the float piece positions. `d0` follows the current
+    // digit cursor — prefixes reset it, digits only ever extend to the
+    // cursor, so each region is contiguous to `stop`.
+    let mut d0: Option<usize> = None;
+    let mut f0: Option<usize> = None;
+    let mut dot: Option<usize> = None;
+    let mut e_at: Option<usize> = None;
+    let mut exp0: Option<usize> = None;
+    let mut exp_neg = false;
+    // Position of the first float-making character ('.'/'e') consumed by
+    // the scanner. A rejection rewinds to the accept point, and the form
+    // is float only when the accepted region reaches past this mark
+    // (`3e` accepts just the int `3`; `3e2x` accepts the double `3e2`).
+    let mut float_at: Option<usize> = None;
+    let mut radix = 10u32;
+
+    // Valid `_` neighbours for the current state family (tclStrToD.c's
+    // switch: binary/octal/hex/decimal each pin their own digit set;
+    // decimal separators may additionally not hug a `.`).
+    fn sep_ok(state: St, before: Option<u8>, after: Option<u8>) -> bool {
+        fn digit(c: u8) -> bool {
+            c.is_ascii_digit()
+        }
+        fn xdigit(c: u8) -> bool {
+            c.is_ascii_digit() || matches!(c, b'a'..=b'f' | b'A'..=b'F')
+        }
+        match state {
+            Bin0 | Bin => {
+                before.map(|c| c == b'0' || c == b'1').unwrap_or(false)
+                    && after.map(|c| c == b'0' || c == b'1').unwrap_or(false)
+            }
+            Oct0 | Oct => {
+                before.map(|c| (b'0'..=b'7').contains(&c)).unwrap_or(false)
+                    && after.map(|c| (b'0'..=b'7').contains(&c)).unwrap_or(false)
+            }
+            Hex0 | Hex => {
+                before.map(xdigit).unwrap_or(false) && after.map(xdigit).unwrap_or(false)
+            }
+            _ => before.map(digit).unwrap_or(false) && after.map(digit).unwrap_or(false),
+        }
+    }
+    // Nearest non-separator characters either side of a `_`.
+    fn nearest(mut p: usize, b: &[u8], forward: bool) -> Option<u8> {
+        loop {
+            if forward {
+                if p >= b.len() {
+                    return None;
+                }
+                let c = b[p];
+                if c != b'_' {
+                    return Some(c);
+                }
+                p += 1;
+            } else {
+                if p == 0 {
+                    return None;
+                }
+                p -= 1;
+                let c = b[p];
+                if c != b'_' {
+                    return Some(c);
+                }
+            }
+        }
+    }
+
+    // Reject the character at `i` (or end-of-input at `b.len()`).
+    macro_rules! reject {
+        () => {{
+            // The NUL dispatch of end-of-input sets the accept point in
+            // accepting states, exactly like a rejected character.
+            if i >= b.len() && matches!(state, Zero | Hex | Oct | Bin | Dec | Frac | Exp) {
+                accept = Some(b.len());
+            }
+            let stop = accept?;
+            let is_float = matches!(float_at, Some(p) if accept.is_some_and(|a| a > p));
+            let full = b[stop..].iter().all(|&c| is_tcl_ws(c));
+            // A prefix rewinds past its digits (`0x` → stop 1, digit run
+            // from 2) — clamp the spans to the accepted region.
+            let payload = if is_float {
+                NumPayload::Float {
+                    f0: f0.unwrap_or(stop).min(stop),
+                    dot: dot.map(|d| d.min(stop)),
+                    e_at: e_at.map(|e| e.min(stop)),
+                    exp0: exp0.map(|e| e.min(stop)),
+                    exp_neg,
+                }
+            } else {
+                NumPayload::Int {
+                    radix,
+                    run: d0.unwrap_or(stop).min(stop),
+                }
+            };
+            return Some(NumScan {
+                stop,
+                full,
+                neg,
+                payload,
+            });
+        }};
+    }
+
+    while i < b.len() {
+        let c = b[i];
+        // `_` numeric whitespace: validated against the state's digit
+        // family before the state machine sees it (a valid separator is
+        // consumed without touching the state).
+        if c == b'_' {
+            let before = nearest(i, b, false);
+            let after = nearest(i + 1, b, true).filter(|&c| c != 0 && c.is_ascii());
+            if !sep_ok(state, before, after) {
+                reject!();
+            }
+            i += 1;
+            continue;
+        }
+        match state {
+            Initial => match c {
+                b'+' => state = Signum,
+                b'-' => {
+                    neg = true;
+                    state = Signum;
+                }
+                b'0' => {
+                    accept = Some(i);
+                    d0 = Some(i);
+                    f0 = Some(i);
+                    state = Zero;
+                }
+                b'.' => {
+                    // LEADING_RADIX_POINT never accepts; the fraction
+                    // digits that may follow do.
+                    float_at = Some(i);
+                    dot = Some(i);
+                    f0 = Some(i); // empty mantissa: f0 == dot
+                    state = Lrp;
+                }
+                c if c.is_ascii_digit() => {
+                    accept = Some(i);
+                    d0 = Some(i);
+                    f0 = Some(i);
+                    state = Dec;
+                }
+                _ => reject!(),
+            },
+            Signum => match c {
+                b'0' => {
+                    accept = Some(i);
+                    d0 = Some(i);
+                    f0 = Some(i);
+                    state = Zero;
+                }
+                b'.' if !int_only => {
+                    float_at = Some(i);
+                    dot = Some(i);
+                    f0 = Some(i);
+                    state = Lrp;
+                }
+                c if c.is_ascii_digit() => {
+                    accept = Some(i);
+                    d0 = Some(i);
+                    f0 = Some(i);
+                    state = Dec;
+                }
+                _ => reject!(),
+            },
+            Zero => {
+                accept = Some(i);
+                match c {
+                    b'x' | b'X' => {
+                        radix = 16;
+                        d0 = Some(i + 1);
+                        f0 = Some(i + 1);
+                        state = Hex0;
+                    }
+                    b'b' | b'B' => {
+                        radix = 2;
+                        d0 = Some(i + 1);
+                        f0 = Some(i + 1);
+                        state = Bin0;
+                    }
+                    b'o' | b'O' => {
+                        radix = 8;
+                        d0 = Some(i + 1);
+                        f0 = Some(i + 1);
+                        state = Oct0;
+                    }
+                    b'd' | b'D' => {
+                        radix = 10;
+                        int_only = true;
+                        d0 = Some(i + 1);
+                        f0 = Some(i + 1);
+                        // ZERO_D: the prefix character itself was never
+                        // accepted (`0d` alone stops at index 1); the
+                        // first digit falls straight through into DECIMAL
+                        // (the Dec0 → Dec arm below).
+                        state = Dec0;
+                    }
+                    b'.' if !int_only => {
+                        float_at = Some(i);
+                        dot = Some(i);
+                        state = Frac;
+                    }
+                    b'e' | b'E' if !int_only => {
+                        float_at = Some(i);
+                        e_at = Some(i);
+                        state = ExpStart;
+                    }
+                    c if c.is_ascii_digit() => {
+                        state = Dec;
+                    }
+                    _ => reject!(),
+                }
+            }
+            Hex0 | Hex => {
+                if state == Hex {
+                    accept = Some(i);
+                }
+                match c {
+                    c if c.is_ascii_digit() || matches!(c, b'a'..=b'f' | b'A'..=b'F') => {
+                        state = Hex;
+                    }
+                    _ => reject!(),
+                }
+            }
+            Oct0 | Oct => {
+                if state == Oct {
+                    accept = Some(i);
+                }
+                match c {
+                    c if (b'0'..=b'7').contains(&c) => {
+                        state = Oct;
+                    }
+                    _ => reject!(),
+                }
+            }
+            Bin0 | Bin => {
+                if state == Bin {
+                    accept = Some(i);
+                }
+                match c {
+                    b'0' | b'1' => {
+                        state = Bin;
+                    }
+                    _ => reject!(),
+                }
+            }
+            Dec0 | Dec => {
+                // Dec0 (the `0d` digit) accepts: ZERO_D falls through to
+                // DECIMAL, which sets the accept point.
+                if state == Dec {
+                    accept = Some(i);
+                } else {
+                    state = Dec;
+                }
+                match c {
+                    c if c.is_ascii_digit() => {}
+                    b'.' if !int_only => {
+                        float_at = Some(i);
+                        dot = Some(i);
+                        state = Frac;
+                    }
+                    b'e' | b'E' if !int_only => {
+                        float_at = Some(i);
+                        e_at = Some(i);
+                        state = ExpStart;
+                    }
+                    _ => reject!(),
+                }
+            }
+            Frac => {
+                accept = Some(i);
+                match c {
+                    c if c.is_ascii_digit() => {}
+                    b'e' | b'E' => {
+                        float_at = Some(i);
+                        e_at = Some(i);
+                        state = ExpStart;
+                    }
+                    _ => reject!(),
+                }
+            }
+            Lrp => match c {
+                // LEADING_RADIX_POINT never sets an accept point: ".5_"
+                // fails as a whole, not as the prefix ".5".
+                c if c.is_ascii_digit() => {
+                    state = Frac;
+                }
+                _ => reject!(),
+            },
+            ExpStart => match c {
+                b'+' | b'-' => {
+                    exp_neg = c == b'-';
+                    state = ExpSign;
+                }
+                // EXPONENT_START/EXPONENT_SIGNUM set no accept point:
+                // "1e2x" fails at the 'e' (index 1), not at the 'x'.
+                c if c.is_ascii_digit() => {
+                    exp0 = Some(i);
+                    state = Exp;
+                }
+                _ => reject!(),
+            },
+            ExpSign => match c {
+                c if c.is_ascii_digit() => {
+                    exp0 = Some(i);
+                    state = Exp;
+                }
+                _ => reject!(),
+            },
+            Exp => {
+                accept = Some(i);
+                match c {
+                    c if c.is_ascii_digit() => {}
+                    _ => reject!(),
+                }
+            }
+        }
+        i += 1;
+    }
+    // End-of-input: the NUL dispatch fails like any rejected character.
+    if matches!(state, Zero | Hex | Oct | Bin | Dec | Frac | Exp) {
+        accept = Some(b.len());
+    }
+    let stop = accept?;
+    let is_float = matches!(float_at, Some(p) if accept.is_some_and(|a| a > p));
+    let full = b[stop..].iter().all(|&c| is_tcl_ws(c));
+    let payload = if is_float {
+        NumPayload::Float {
+            f0: f0.unwrap_or(stop).min(stop),
+            dot: dot.map(|d| d.min(stop)),
+            e_at: e_at.map(|e| e.min(stop)),
+            exp0: exp0.map(|e| e.min(stop)),
+            exp_neg,
+        }
+    } else {
+        NumPayload::Int {
+            radix,
+            run: d0.unwrap_or(stop).min(stop),
+        }
+    };
+    Some(NumScan {
+        stop,
+        full,
+        neg,
+        payload,
+    })
+}
+
+/// tclCompExpr.c's radix hint on an invalid bareword: a token led by `0`
+/// whose number scan stops at a digit or right after the leading zero is
+/// tagged by its second character — `0b` → binary, `0o` (or a bare
+/// `0`-digit attempt like `08x` where the scan stops at the offending
+/// digit) → octal; `0d`/`0x` and everything else carry no hint. Oracle
+/// pins (digits91): `0b12`/`0b`/`0o8`/`0o_1` are hinted, `0b1x`/`0x_f`/
+/// `0d_1`/`08g`/`1_` are not.
+pub fn bareword_hint(token: &str) -> &'static str {
+    let b = token.as_bytes();
+    if b.first() != Some(&b'0') || b.len() < 2 {
+        return "";
+    }
+    let Some(scan) = scan_number(token, false) else {
+        return "";
+    };
+    if scan.stop >= token.len() || scan.stop == 0 {
+        return "";
+    }
+    if !b[scan.stop].is_ascii_digit() && scan.stop != 1 {
+        return "";
+    }
+    match b[1] {
+        b'b' | b'B' => " (invalid binary number?)",
+        b'o' | b'O' => " (invalid octal number?)",
+        c if c.is_ascii_digit() => " (invalid octal number?)",
+        _ => "",
+    }
 }
 
 /// Parse a Tcl integer literal at arbitrary width (bignum form; an

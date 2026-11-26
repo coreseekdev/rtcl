@@ -506,7 +506,10 @@ impl<'a> Checker<'a> {
         } else {
             (word.as_str(), "")
         };
-        let post = format!("should be \"${w}{d}\" or \"{{{w}{d}}}\" or \"{w}{d}(...)\" or ...");
+        let post = format!(
+            "should be \"${w}{d}\" or \"{{{w}{d}}}\" or \"{w}{d}(...)\" or ...{}",
+            crate::types::bignum::bareword_hint(&word)
+        );
         let reason = format!("invalid bareword \"{w}{d}\"");
         BarewordResolve::Error(self.build(&reason, start, scanned, false, Some(&post)))
     }
@@ -887,68 +890,22 @@ fn scan_number(s: &[u8]) -> Option<(usize, bool)> {
             return Some((word.len(), true));
         }
     }
-    let mut i = 0usize;
-    let mut dbl = false;
-    if s[0] == b'.' {
-        dbl = true;
-        i += 1;
-        let d = i;
-        while i < s.len() && (s[i].is_ascii_digit() || s[i] == b'_') {
-            i += 1;
-        }
-        if i == d {
-            return None;
-        }
-    } else if s[0].is_ascii_digit() {
-        if s.len() > 1 && s[0] == b'0' && matches!(s[1] | 0x20, b'x' | b'b' | b'o' | b'd') {
-            let kind = s[1] | 0x20;
-            i += 2;
-            let d = i;
-            let ok = |ch: u8| match kind {
-                b'x' => ch.is_ascii_hexdigit() || ch == b'_',
-                b'b' => ch == b'0' || ch == b'1' || ch == b'_',
-                _ => ch.is_ascii_digit() || ch == b'_',
-            };
-            while i < s.len() && ok(s[i]) {
-                i += 1;
-            }
-            if i == d {
-                return None;
-            }
-            return Some((i, false));
-        }
-        while i < s.len() && (s[i].is_ascii_digit() || s[i] == b'_') {
-            i += 1;
-        }
-        if i < s.len() && s[i] == b'.' {
-            dbl = true;
-            i += 1;
-            while i < s.len() && (s[i].is_ascii_digit() || s[i] == b'_') {
-                i += 1;
-            }
-        }
-        if i < s.len() && (s[i] | 0x20) == b'e' {
-            let mut j = i + 1;
-            if j < s.len() && (s[j] == b'+' || s[j] == b'-') {
-                j += 1;
-            }
-            let d = j;
-            while j < s.len() && (s[j].is_ascii_digit() || s[j] == b'_') {
-                j += 1;
-            }
-            if j > d {
-                dbl = true;
-                i = j;
-            }
-        }
-    } else {
-        return None;
-    }
-    if i == 0 {
-        None
-    } else {
-        Some((i, dbl))
-    }
+    // The shared 9.1 grammar scanner (bignum::scan_number): bare leading
+    // zeros are decimal, 0d compels decimal, `_` separators are validated
+    // between digits (misplaced ones — `1_`, `1_x` — kill the whole
+    // token, so the lexeme falls through to the bareword branch and
+    // tclsh's invalid-bareword error). The returned stop is
+    // TclParseNumber's acceptPoint, i.e. exactly the lexeme length the C
+    // lexer uses.
+    let text = core::str::from_utf8(s).ok()?;
+    let scan = crate::types::bignum::scan_number(text, false)?;
+    Some((
+        scan.stop,
+        matches!(
+            scan.payload,
+            crate::types::bignum::NumPayload::Float { .. }
+        ),
+    ))
 }
 
 /// The `(parsing expression "...")` errorInfo frame body (limit 25).

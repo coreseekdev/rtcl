@@ -1664,36 +1664,32 @@ fn inf_text(_neg: bool, upper: bool) -> String {
 /// bits (tclsh wraps); the sign is applied in u64 space before the
 /// i64 reinterpret, so -0xffffffffffffffff formats as +1.
 fn parse_tcl_int_strict(s: &str) -> Option<i64> {
-    let s = s.trim();
-    let (neg, body) = match s.strip_prefix('-') {
-        Some(r) => (true, r),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    if body.is_empty() {
+    // 9.1 grammar via the shared scanner (digits91 批): bare leading
+    // zeros are DECIMAL (`format %d 017` is 17), `0d` compels decimal,
+    // `_` separators are legal between digits. The magnitude still
+    // accumulates with wrapping — the format-side truncation rules are a
+    // separate batch.
+    let scan = crate::types::bignum::scan_number(s.trim(), true)?;
+    if !scan.full {
         return None;
     }
-    let (digits, radix): (&str, u32) =
-        if let Some(r) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
-            if r.is_empty() { return None; }
-            (r, 16)
-        } else if let Some(r) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
-            if r.is_empty() { return None; }
-            (r, 2)
-        } else if let Some(r) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
-            if r.is_empty() { return None; }
-            (r, 8)
-        } else if body.len() > 1 && body.starts_with('0') {
-            // Legacy leading-0 octal: "017"; "08" fails the digit check.
-            (&body[1..], 8)
-        } else {
-            (body, 10)
-        };
-    let mut mag: u64 = 0;
-    for c in digits.bytes() {
-        let d = (c as char).to_digit(radix)?;
-        mag = mag.wrapping_mul(radix as u64).wrapping_add(d as u64);
+    let crate::types::bignum::NumPayload::Int { radix, run } = scan.payload else {
+        return None;
+    };
+    let digits = scan.int_digits(s.trim());
+    if digits.is_empty() || digits.bytes().all(|b| b == b'_') {
+        return None;
     }
-    Some(if neg {
+    let mut mag: u64 = 0;
+    for &c in digits.as_bytes() {
+        if c == b'_' {
+            continue;
+        }
+        mag = mag
+            .wrapping_mul(radix as u64)
+            .wrapping_add(crate::types::bignum::digit_value(c) as u64);
+    }
+    Some(if scan.neg {
         (mag.wrapping_neg()) as i64
     } else {
         mag as i64
@@ -1705,35 +1701,28 @@ fn parse_tcl_int_strict(s: &str) -> Option<i64> {
 /// beyond 64 bits (which tclsh holds as bignums) survive.  Returns the sign
 /// and magnitude; values wider than 128 bits wrap.
 fn parse_tcl_int_ext(s: &str) -> Option<(bool, u128)> {
-    let s = s.trim();
-    let (neg, body) = match s.strip_prefix('-') {
-        Some(r) => (true, r),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    if body.is_empty() {
+    // Same 9.1 grammar as parse_tcl_int_strict (shared scanner).
+    let scan = crate::types::bignum::scan_number(s.trim(), true)?;
+    if !scan.full {
         return None;
     }
-    let (digits, radix): (&str, u32) =
-        if let Some(r) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
-            if r.is_empty() { return None; }
-            (r, 16)
-        } else if let Some(r) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
-            if r.is_empty() { return None; }
-            (r, 2)
-        } else if let Some(r) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
-            if r.is_empty() { return None; }
-            (r, 8)
-        } else if body.len() > 1 && body.starts_with('0') {
-            (&body[1..], 8)
-        } else {
-            (body, 10)
-        };
-    let mut mag: u128 = 0;
-    for c in digits.bytes() {
-        let d = (c as char).to_digit(radix)?;
-        mag = mag.wrapping_mul(radix as u128).wrapping_add(d as u128);
+    let crate::types::bignum::NumPayload::Int { radix, run } = scan.payload else {
+        return None;
+    };
+    let digits = scan.int_digits(s.trim());
+    if digits.is_empty() || digits.bytes().all(|b| b == b'_') {
+        return None;
     }
-    Some((neg, mag))
+    let mut mag: u128 = 0;
+    for &c in digits.as_bytes() {
+        if c == b'_' {
+            continue;
+        }
+        mag = mag
+            .wrapping_mul(radix as u128)
+            .wrapping_add(crate::types::bignum::digit_value(c) as u128);
+    }
+    Some((scan.neg, mag))
 }
 
 /// Format an integer conversion (`l` size) whose magnitude does not fit in

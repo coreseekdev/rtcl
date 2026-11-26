@@ -1164,14 +1164,12 @@ impl Value {
             "nan" => return Some(f64::NAN),
             _ => {}
         }
-        // `018` is an invalid octal number, not the double 18.0.
-        if crate::types::bignum::is_invalid_octal(s) {
-            return None;
-        }
-        // A wide integer literal is its exact value as a double: the
-        // digits of `0o777…` are not the decimal they look like.
-        if let Some(crate::types::bignum::IntRep::Big(b)) = crate::types::bignum::parse_int(s) {
-            return num_traits::ToPrimitive::to_f64(&b);
+        // The 9.1 number grammar: prefixed/wide integers coerce exactly
+        // (the digits of `0o777…` are not the decimal they look like);
+        // underscores in mantissa/fraction/exponent are separators
+        // (`"1_0.5" + 0` is 10.5). No invalid-octal arm — 9.1 has none.
+        if let Some(f) = crate::types::bignum::parse_float_str(s) {
+            return Some(f);
         }
         f64::from_str(s).ok()
     }

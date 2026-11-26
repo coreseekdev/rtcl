@@ -49,31 +49,15 @@ pub(crate) fn strict_list_cow<'a>(interp: &mut Interp, v: &'a Value) -> Result<C
     }
 }
 
-/// Tcl's bad-index error (`TCL VALUE INDEX`), including the
-/// "(looks like invalid octal number)" hint Tcl appends when the index
-/// resembles a malformed legacy octal literal (TclCheckBadOctal).
+/// Tcl's bad-index error (`TCL VALUE INDEX`). 9.1 dropped the
+/// "(looks like invalid octal number)" hint (TclCheckBadOctal) — oracle:
+/// `string index abc 0o8` is the plain message.
 pub(crate) fn bad_index(interp: &mut Interp, idx: &str) -> Error {
     set_error_code(interp, "TCL VALUE INDEX");
-    let mut msg = format!(
+    tcl_err(format!(
         "bad index \"{}\": must be integer?[+-]integer? or end?[+-]integer?",
         idx
-    );
-    let check = idx.strip_prefix("end-").unwrap_or(idx);
-    if looks_like_bad_octal(check) {
-        msg.push_str(" (looks like invalid octal number)");
-    }
-    tcl_err(msg)
-}
-
-/// TclCheckBadOctal: optional whitespace/sign, then `0` (or `0o`) followed
-/// by nothing but decimal digits — i.e. a plausible legacy-octal attempt.
-fn looks_like_bad_octal(s: &str) -> bool {
-    let t = trim_tcl_space(s);
-    let t = t.strip_prefix(['+', '-']).unwrap_or(t);
-    let Some(t) = t.strip_prefix('0') else { return false };
-    let t = t.strip_prefix(['o', 'O']).unwrap_or(t);
-    let t = t.trim_end_matches(|c: char| is_tcl_space(c as u8));
-    !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit())
+    ))
 }
 
 /// Tcl's whitespace set (also the list element separators).
@@ -81,41 +65,38 @@ pub(crate) fn trim_tcl_space(s: &str) -> &str {
     s.trim_matches(|c: char| is_tcl_space(c as u8))
 }
 
-/// Scan a Tcl integer at the start of `s` (TclParseNumber integer rules:
-/// optional sign; `0x`/`0b`/`0o` radix prefixes; a leading `0` followed by
-/// more characters selects legacy octal). Returns (value, bytes consumed).
+/// Scan a Tcl integer at the start of `s` (9.1 TclParseNumber integer
+/// rules: optional sign; `0x`/`0b`/`0o`/`0d` radix prefixes; a bare
+/// leading `0` is DECIMAL — legacy octal is gone; `_` separators between
+/// digits). Returns (value, bytes consumed) for prefix positions such as
+/// index terms; a partial scan yields the accepted prefix.
 pub(crate) fn scan_tcl_int(s: &str) -> Option<(i64, usize)> {
-    let b = s.as_bytes();
-    let mut i = 0;
-    let mut neg = false;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        neg = b[i] == b'-';
-        i += 1;
-    }
-    let (radix, start) = if b.len() - i >= 2 && b[i] == b'0' && matches!(b[i + 1], b'x' | b'X') {
-        (16, i + 2)
-    } else if b.len() - i >= 2 && b[i] == b'0' && matches!(b[i + 1], b'b' | b'B') {
-        (2, i + 2)
-    } else if b.len() - i >= 2 && b[i] == b'0' && matches!(b[i + 1], b'o' | b'O') {
-        (8, i + 2)
-    } else if i < b.len() && b[i] == b'0' && i + 1 < b.len() {
-        (8, i + 1)
-    } else {
-        (10, i)
+    let scan = crate::types::bignum::scan_number(s, true)?;
+    let crate::types::bignum::NumPayload::Int { radix, run } = scan.payload else {
+        return None;
     };
-    let mut n = start;
-    while n < b.len() && (b[n] as char).is_digit(radix) {
-        n += 1;
-    }
-    if n == start {
-        // A bare leading `0` is the value zero, even in octal position.
-        if radix == 8 && start == i + 1 {
-            return Some((0, i + 1));
-        }
+    let digits = scan.int_digits(s);
+    if digits.is_empty() || digits.bytes().all(|b| b == b'_') {
+        // Prefix without digits (`0x`) — not a value; the caller reports
+        // a bad index for the partial text.
         return None;
     }
-    let val = i64::from_str_radix(&s[start..n], radix).ok()?;
-    Some((if neg { -val } else { val }, n))
+    // Accumulate with checked math: an index magnitude past i64 is not a
+    // value here (from_str_radix overflowed the same way before).
+    let mut mag: u64 = 0;
+    for &b in digits.as_bytes() {
+        if b == b'_' {
+            continue;
+        }
+        mag = mag
+            .checked_mul(radix as u64)
+            .and_then(|m| m.checked_add(crate::types::bignum::digit_value(b) as u64))?;
+    }
+    if mag > i64::MAX as u64 {
+        return None;
+    }
+    let val = mag as i64;
+    Some((if scan.neg { -val } else { val }, scan.stop))
 }
 
 /// Tcl_GetInt semantics: the whole (whitespace-trimmed) string is an integer.
@@ -1599,13 +1580,19 @@ mod tests {
 
     #[test]
     fn index_malformed_octal() {
-        // These still parse nothing; the caller's bad_index() adds the
-        // "(looks like invalid octal number)" hint for them.
-        assert_eq!(idx("008", 8), None);
-        assert_eq!(idx("08", 8), None);
-        assert_eq!(idx("+008", 8), None);
+        // 9.1 重钉（digits91 批，oracle 实测）：0NNN 是十进制，`008`/
+        // `08`/`+008` 都是合法索引 8；真正残缺的前缀（`0x`、`0b2`）与
+        // 非数（`1.5`）仍解析不出。bad_index() 的 octal hint 已随 9.1
+        // 取消（TclCheckBadOctal 移除）。
+        assert_eq!(idx("008", 8), Some(8));
+        assert_eq!(idx("08", 8), Some(8));
+        assert_eq!(idx("+008", 8), Some(8));
+        assert_eq!(idx("009", 8), Some(9));
+        assert_eq!(idx("0d1", 8), Some(1));
+        assert_eq!(idx("1_0", 8), Some(10));
         assert_eq!(idx("0x", 8), None);
         assert_eq!(idx("0b2", 8), None);
+        assert_eq!(idx("0o8", 8), None);
         assert_eq!(idx("1.5", 8), None);
     }
 

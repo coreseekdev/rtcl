@@ -3577,9 +3577,11 @@ mod tests {
 
     #[test]
     fn test_errorcode_from_strict_list_error() {
+        // 9.1 重钉（digits91 批）：`09` 已是合法整数，换一个真正非数的
+        // 元素来钉 strict 整数比较的 TCL VALUE NUMBER。
         let mut interp = Interp::new();
         let r = interp
-            .eval("catch {lsort -integer {09 8}} m; set ::errorCode")
+            .eval("catch {lsort -integer {09x 8}} m; set ::errorCode")
             .unwrap();
         assert_eq!(r.as_str(), "TCL VALUE NUMBER");
     }

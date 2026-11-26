@@ -518,7 +518,7 @@ fn call_inner_hint(
     let word = |i: usize| words.get(i).map(|v| v.as_str()).unwrap_or("");
     match cmd_name {
         "regexp" => {
-            if msg.starts_with("couldn't compile regular expression pattern") {
+            if msg.starts_with("cannot compile regular expression pattern") {
                 Some(super::eval::INNER_RAW_WORDS)
             } else {
                 None

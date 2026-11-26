@@ -2,6 +2,7 @@
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::interp::Interp;
+use super::list::strict_list;
 use crate::value::Value;
 
 #[cfg(feature = "regexp")]
@@ -586,7 +587,7 @@ fn compile_real(
                     &format!("REGEXP {} {{{}}}", e.code, e.message),
                 );
                 Err(format!(
-                    "couldn't compile regular expression pattern: {}",
+                    "cannot compile regular expression pattern: {}",
                     e.message
                 ))
             }
@@ -595,7 +596,7 @@ fn compile_real(
     if let Some((code, msg)) = validate_are(pattern) {
         super::list::set_error_code(interp, &format!("REGEXP {} {{{}}}", code, msg));
         return Err(format!(
-            "couldn't compile regular expression pattern: {}",
+            "cannot compile regular expression pattern: {}",
             msg
         ));
     }
@@ -893,7 +894,7 @@ pub(crate) fn compile_engine(
         )
         .map(|prog| Engine::Spencer(Box::new(prog)))
         .map_err(|e| {
-            format!("couldn't compile regular expression pattern: {}", e.message)
+            format!("cannot compile regular expression pattern: {}", e.message)
         });
     }
     let (expanded_pattern, needs_bt) = expand_unicode_escapes(pattern);
@@ -2466,12 +2467,17 @@ pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let mut expanded = false;
     let mut lineanchor = false;
     let mut linestop = false;
+    // TIP 463 (9.1)：-command 的 subSpec 是命令前缀（非空 list），每次
+    // 匹配把「匹配串 + 各捕获组串（未参与 = 空元素）」追加到前缀后按值
+    // 求值，结果作为替换串；& 与 \n 不再是模板。
+    let mut command = false;
     let mut start_offset: Option<String> = None;
 
     while i < args.len() && args[i].as_str().starts_with('-') {
         match args[i].as_str() {
             "-nocase" => { nocase = true; i += 1; }
             "-all" => { all = true; i += 1; }
+            "-command" => { command = true; i += 1; }
             "-expanded" => { expanded = true; i += 1; }
             "-line" => { lineanchor = true; linestop = true; i += 1; }
             "-lineanchor" => { lineanchor = true; i += 1; }
@@ -2494,8 +2500,8 @@ pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     &format!("TCL LOOKUP INDEX option {}", s),
                 );
                 return Err(Error::Msg(format!(
-                    "bad option \"{}\": must be -all, -nocase, -expanded, -line, \
-                     -linestop, -lineanchor, -start, or --", s
+                    "bad option \"{}\": must be -all, -command, -expanded, -line, \
+                     -linestop, -lineanchor, -nocase, -start, or --", s
                 )));
             }
         }
@@ -2526,7 +2532,9 @@ pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // string-map path — and for an empty pattern that path puts the
     // substitution between the characters only, nothing after the last.
     // The engine matches once more at the end (`XaXbX` for `ab`).
+    // -command 模式不走该快路径（回调逐匹配求值）。
     if all
+        && !command
         && char_start == 0
         && pattern_str.is_empty()
         && !sub_spec.contains('&')
@@ -2559,6 +2567,47 @@ pub fn cmd_regsub(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     };
     let matches = collect_matches(full_string, attempt, char_len, char_start, all, true);
     check_match_finished(interp)?;
+
+    // TIP 463 command 模式：subSpec 必须是非空 list；每次匹配把
+    // 「匹配串 + 各捕获组串」追加到前缀后按值求值（dispatch_values
+    // 直接吃值列表，不做字符串回转），错误/异常原样上抛；& 与 \n
+    // 失去模板含义。
+    if command {
+        let prefix = strict_list(interp, &args[i + 2])?;
+        if prefix.is_empty() {
+            super::list::set_error_code(interp, "TCL OPERATION REGSUB CMDEMPTY");
+            return Err(Error::runtime(
+                "command prefix must be a list of at least one element",
+                ErrorCode::Generic,
+            ));
+        }
+        let mut result = String::from(&full_string[..byte_start]);
+        let mut last = byte_start;
+        let mut count = 0i64;
+        for groups in &matches {
+            if let Some((bs, be)) = groups[0] {
+                result.push_str(&full_string[last..bs]);
+                let mut cmdv = prefix.clone();
+                for g in groups.iter() {
+                    match *g {
+                        Some((s, e)) => cmdv.push(Value::from_str(&full_string[s..e])),
+                        None => cmdv.push(Value::empty()),
+                    }
+                }
+                let sub = interp.dispatch_values(&cmdv)?;
+                result.push_str(sub.as_str());
+                last = be;
+                count += 1;
+            }
+        }
+        result.push_str(&full_string[last..]);
+
+        if let Some(var) = var_name {
+            interp.set_var(var, Value::from_str(&result))?;
+            return Ok(Value::from_int(count));
+        }
+        return Ok(Value::from_str(&result));
+    }
 
     let mut result = String::from(&full_string[..byte_start]);
     let mut last = byte_start;

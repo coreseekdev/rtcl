@@ -2151,7 +2151,7 @@ fn command_inner_hint(
     let literal = |i: usize| words_ast.get(i).map(ast_word_literal).unwrap_or(false);
     match cmd_name {
         "regexp" => {
-            if msg.starts_with("couldn't compile regular expression pattern") {
+            if msg.starts_with("cannot compile regular expression pattern") {
                 Some(INNER_RAW_WORDS)
             } else {
                 None

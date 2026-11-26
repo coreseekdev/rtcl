@@ -14,7 +14,7 @@ pub mod nfa;
 pub mod parser;
 
 /// 编译错误：`code` 为 tclsh 的 `REG_*` 名，`message` 为
-/// "couldn't compile regular expression pattern: " 之后的文本。
+/// "cannot compile regular expression pattern: " 之后的文本。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Error {
     pub code: &'static str,

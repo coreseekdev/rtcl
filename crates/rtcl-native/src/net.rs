@@ -14,6 +14,23 @@
 //! 取消：`__rtcl_http_cancel <id>` 置协作标记，读取循环在下一块边界中止，
 //! 以 `(status 0, error "cancelled")` 收尾。
 //!
+//! S38 安全加固（嵌入/脚本不可信场景的兜底，显式参数始终优先）：
+//! - **默认超时**：连接 30 s + 请求总超时 300 s。reqwest blocking 客户端
+//!   本来就有一个**隐式 30 s 总超时**（builder 默认）——比它更糟的是它是
+//!   无声的：>30 s 的 SSE 流在流中途以 "operation timed out" 断掉。这里
+//!   把两个值都显式化：连接超时 30 s（`RTCL_HTTP_CONNECT_TIMEOUT_MS`
+//!   可覆盖），总超时 300 s（`RTCL_HTTP_TIMEOUT_MS` 可覆盖，0 = 关闭，
+//!   长流场景用它放开）。调用方的 `-timeout ms` 仍逐请求优先。
+//!   读空闲超时 reqwest blocking 面尚未暴露（async 的 read_timeout 没有
+//!   forwarding），总超时兼作读挂死的兜底。
+//! - **响应体上限**：默认 64 MiB（`RTCL_HTTP_MAX_BODY_BYTES` 可覆盖，
+//!   0 = 不限），逐请求 opts 字段 `"maxbody"` 再优先。超出按
+//!   `(status 0, error "http response body exceeded …")` 收尾。
+//! - **URL 宿主校验钩子**：[`set_url_guard`] 注册一个
+//!   `Fn(&str) -> Result<(), String>`（url → Err(原因)），默认无；
+//!   嵌入方（rogo 等）在 install 之后注入 SSRF/策略审查。http/https
+//!   之外的 scheme 一律拒绝。
+//!
 //! opts 线格式是 http.tcl 手搓的固定 JSON 形状
 //! `{"timeout":N,"ctype":"…","stream":true?}`——R0 用最小字段扫描，
 //! 正式化时再换成结构化边界（不在此处引入完整 JSON 解析器）。
@@ -21,8 +38,75 @@
 use rtcl_core::host::{HostHttp, HttpRequest, HttpResponse};
 use rtcl_core::{Interp, Value};
 use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
+
+/// 连接超时默认值（秒级兜底：DNS + TCP + TLS 握手）。
+pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 30_000;
+/// 请求总超时默认值（含读取；长流用 `-timeout 0`/环境变量放开）。
+pub const DEFAULT_TIMEOUT_MS: u64 = 300_000;
+/// 响应体上限默认值（0 = 不限）。SSE/JSON API 的正常响应远小于此。
+pub const DEFAULT_MAX_BODY_BYTES: u64 = 64 * 1024 * 1024;
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+/// 生效的连接超时（环境可覆盖，0 = 关闭）。
+pub fn connect_timeout() -> Option<Duration> {
+    let ms = env_u64("RTCL_HTTP_CONNECT_TIMEOUT_MS", DEFAULT_CONNECT_TIMEOUT_MS);
+    (ms > 0).then(|| Duration::from_millis(ms))
+}
+
+/// 生效的请求总超时（环境可覆盖，0 = 关闭）。
+pub fn total_timeout() -> Option<Duration> {
+    let ms = env_u64("RTCL_HTTP_TIMEOUT_MS", DEFAULT_TIMEOUT_MS);
+    (ms > 0).then(|| Duration::from_millis(ms))
+}
+
+/// 生效的响应体上限（逐请求 opts "maxbody" 优先，其次环境，最后默认）；
+/// 0 = 不限。
+fn max_body_bytes(requested: Option<u64>) -> u64 {
+    match requested {
+        Some(v) => v,
+        None => env_u64("RTCL_HTTP_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES),
+    }
+}
+
+/// URL 宿主校验钩子：`Fn(&str) -> Result<(), String>`，Err = 拒绝（原因
+/// 进 `::http_error`）。默认无钩子（全放行）。
+pub type UrlGuard = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+fn url_guard() -> &'static RwLock<Option<UrlGuard>> {
+    static GUARD: OnceLock<RwLock<Option<UrlGuard>>> = OnceLock::new();
+    GUARD.get_or_init(|| RwLock::new(None))
+}
+
+/// 注册/清除 URL 宿主校验钩子（`None` = 清除）。嵌入方在 install 之后
+/// 调用；钩子在请求发出之前跑，拒绝时以 `(status 0, error <原因>)`
+/// 收尾。
+pub fn set_url_guard(guard: Option<UrlGuard>) {
+    *url_guard().write().expect("url guard lock") = guard;
+}
+
+fn check_url(url: &str) -> Result<(), String> {
+    // scheme 白名单：reqwest 虽也拒绝其它 scheme，但这里给出确定的错误
+    // 文本，且 file: 之类的探测不进连接层。
+    let scheme_ok = url
+        .split_once("://")
+        .is_some_and(|(s, _)| s.eq_ignore_ascii_case("http") || s.eq_ignore_ascii_case("https"));
+    if !scheme_ok {
+        return Err(format!("http: unsupported url scheme (http/https only): {url}"));
+    }
+    let guard = url_guard().read().expect("url guard lock");
+    if let Some(g) = guard.as_ref() {
+        g(url)?;
+    }
+    Ok(())
+}
 
 /// 装载 native HTTP 宿主：注入 `NativeHttp` + 注册桥命令 + 加载 `http.tcl` 词表。
 pub fn install(interp: &mut Interp) {
@@ -39,12 +123,19 @@ pub struct NativeHttp;
 
 impl HostHttp for NativeHttp {
     fn request(&self, req: &HttpRequest) -> Result<Box<dyn HttpResponse>, String> {
-        let client = reqwest::blocking::Client::builder()
+        check_url(&req.url)?;
+        let mut client = reqwest::blocking::Client::builder()
             .redirect(if req.follow_redirects {
                 reqwest::redirect::Policy::limited(10)
             } else {
                 reqwest::redirect::Policy::none()
             })
+            // 关掉 reqwest 的隐式 30 s 总默认，换成显式的 S38 值。
+            .timeout(total_timeout());
+        if let Some(t) = connect_timeout() {
+            client = client.connect_timeout(t);
+        }
+        let client = client
             .build()
             .map_err(|e| format!("http client build failed: {e}"))?;
         let method = reqwest::Method::from_bytes(req.method.as_bytes())
@@ -163,6 +254,8 @@ pub fn bridge(interp: &mut Interp, args: &[Value]) -> rtcl_core::error::Result<V
     let timeout = opt_u64(&opts, "timeout").unwrap_or(0);
     let stream = opt_bool(&opts, "stream").unwrap_or(false);
     let ctype = opt_str(&opts, "ctype").unwrap_or_else(|| "application/json".to_string());
+    // S38：逐请求响应体上限（opts "maxbody"，0 = 不限）；缺省走环境/默认。
+    let max_body = max_body_bytes(opt_u64(&opts, "maxbody"));
 
     // 调用方请求头（Tcl dict → k/v 对）；content-type 仅在调用方未提供时补默认。
     let mut headers: Vec<(String, String)> = Vec::new();
@@ -221,6 +314,13 @@ pub fn bridge(interp: &mut Interp, args: &[Value]) -> rtcl_core::error::Result<V
         }
         match resp.read_chunk() {
             Ok(Some(chunk)) => {
+                if max_body > 0 && acc.len().saturating_add(chunk.len()) as u64 > max_body {
+                    error = Some(format!(
+                        "http response body exceeded the {} byte limit",
+                        max_body
+                    ));
+                    break;
+                }
                 acc.extend_from_slice(&chunk);
                 if stream {
                     let text = String::from_utf8_lossy(&chunk).to_string();
@@ -571,6 +671,86 @@ http::get $::u -stream {incr ::n; if {$::n == 1} {http::cancel $::http_id}} -com
         assert!(
             get(&mut interp, "lindex $::final 1").contains("cancel"),
             "cancel must surface as error"
+        );
+    }
+
+    // ── S38 安全加固：默认超时参数、响应体上限、URL 宿主校验钩子 ────────
+
+    #[test]
+    fn s38_defaults_and_config_helpers() {
+        assert_eq!(DEFAULT_CONNECT_TIMEOUT_MS, 30_000);
+        assert_eq!(DEFAULT_TIMEOUT_MS, 300_000);
+        assert_eq!(DEFAULT_MAX_BODY_BYTES, 64 * 1024 * 1024);
+        // 无环境变量时取默认（Some = 生效）。
+        assert_eq!(connect_timeout().map(|d| d.as_millis() as u64), Some(30_000));
+        assert_eq!(total_timeout().map(|d| d.as_millis() as u64), Some(300_000));
+        assert_eq!(max_body_bytes(None), 64 * 1024 * 1024);
+        // 逐请求字段优先于默认。
+        assert_eq!(max_body_bytes(Some(0)), 0);
+        assert_eq!(max_body_bytes(Some(1)), 1);
+    }
+
+    #[test]
+    fn s38_url_scheme_is_whitelisted() {
+        let mut interp = test_interp();
+        // 直接驱动裸桥：finish 会 eval ::http::_done_vars（http.tcl 的原
+        // 版收尾后清变量），先换成捕获版拿收尾三元组。
+        interp
+            .eval(r#"proc ::http::_done_vars {} { set ::final [list $::http_status $::http_error $::http_body] }"#)
+            .unwrap();
+        interp.eval("__rtcl_http s38sch GET file:///etc/passwd {} {}").unwrap();
+        let err = get(&mut interp, "lindex $::final 1");
+        assert!(
+            err.contains("http/https only"),
+            "non-http scheme must be refused by the bridge: {err}"
+        );
+    }
+
+    #[test]
+    fn s38_url_guard_hook_rejects_before_request() {
+        // 只拒绝标记 URL：与其余测试的 127.0.0.1 请求互不干扰（并行安全）。
+        set_url_guard(Some(Arc::new(|url: &str| {
+            if url.contains("guard-marker.invalid") {
+                Err("host rejected by url guard".to_string())
+            } else {
+                Ok(())
+            }
+        })));
+        let mut interp = test_interp();
+        interp
+            .eval(r#"proc ::http::_done_vars {} { set ::final [list $::http_status $::http_error $::http_body] }"#)
+            .unwrap();
+        interp
+            .eval("__rtcl_http s38g GET http://guard-marker.invalid/x {} {}")
+            .unwrap();
+        assert_eq!(get(&mut interp, "lindex $::final 0"), "0");
+        let err = get(&mut interp, "lindex $::final 1");
+        assert!(
+            err.contains("host rejected by url guard"),
+            "guard reason must surface in ::http_error: {err}"
+        );
+        set_url_guard(None);
+    }
+
+    #[test]
+    fn s38_per_request_body_limit_caps_the_stream() {
+        let big = "x".repeat(4096);
+        let chunks = vec![(0u64, big), (20, "tail".to_string())];
+        let mock = spawn_mock(200, 0, chunks);
+        let mut interp = test_interp();
+        set_url(&mut interp, &mock);
+        interp
+            .eval(r#"proc ::http::_done_vars {} { set ::final [list $::http_status $::http_error $::http_body] }"#)
+            .unwrap();
+        // opts "maxbody":2048 —— 4096 字节的第一块即超限。
+        interp
+            .eval(r#"__rtcl_http s38cap GET $::u {} {"maxbody":2048}"#)
+            .unwrap();
+        assert_eq!(get(&mut interp, "lindex $::final 0"), "0");
+        let err = get(&mut interp, "lindex $::final 1");
+        assert!(
+            err.contains("2048 byte limit"),
+            "body limit must surface with the configured number: {err}"
         );
     }
 }

@@ -303,7 +303,7 @@ pub enum Instr {
     CallSite {
         dst: Reg,
         cmd_id: u16,
-        argc: u16,
+        argc: u32,
         fail: u32,
         /// 站点索引（宿主 eval 路由/错误帧用——静态正确，见 fail 表）。
         site: u32,

@@ -23,6 +23,22 @@ pub(crate) fn tcl_log_excerpt(text: &str) -> String {
     }
 }
 
+/// 大单元回落门（TREE-FALLBACK F5，码表第二步后的唯一回落门）：
+/// 超过该长度的顶层 eval 不走 parse-cache/bytecode 快路径。默认 1MiB
+/// （256KB 旧值是 C55 的触发门）；env `RTCL_PARSE_CACHE_MAX_SCRIPT`
+/// 显式字节值优先（OnceLock 一次读——进程内 env 语义不变，同
+/// RTCL_NO_BYTECODE 口径）。
+fn parse_cache_max_script() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RTCL_PARSE_CACHE_MAX_SCRIPT")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(1_048_576)
+    })
+}
+
 impl Interp {
     pub fn eval(&mut self, script: &str) -> Result<Value> {
         self.eval_depth += 1;
@@ -148,7 +164,11 @@ impl Interp {
         // Entries are bounded: wasm32 is a target and one-shot scripts
         // (source files, trace callbacks) must not grow it unboundedly.
         const PARSE_CACHE_MAX: usize = 1024;
-        const PARSE_CACHE_MAX_SCRIPT: usize = 262_144;
+        // D2 第二步：大单元回落门（F5）从 256KB 提到 1MiB（256KB 是
+        // C55 的触发门：big-unit 12000-loop ≈ 528KB 单元整段落树），
+        // env `RTCL_PARSE_CACHE_MAX_SCRIPT` 可配（字节）。F1 的 u16 操
+        // 作数上限已由宽操作数关闭，这是唯一的回落门。
+        let parse_cache_max_script = parse_cache_max_script();
         let cached = self.parse_cache.get(script).cloned();
         let unit = match cached {
             Some(rc) => rc,
@@ -181,7 +201,7 @@ impl Interp {
                         return Err(self.seed_parse_error(script, &pe));
                     }
                 };
-                if script.len() <= PARSE_CACHE_MAX_SCRIPT {
+                if script.len() <= parse_cache_max_script {
                     let parse_cost = script.len().saturating_mul(2) + 128;
                     if self.parse_cache.len() >= PARSE_CACHE_MAX
                         || self.parse_cache_bytes + parse_cost > PARSE_CACHE_BYTE_BUDGET
@@ -238,7 +258,7 @@ impl Interp {
             }
         };
         // Bytecode fast path — the same gate as proc bodies (Site A).
-        if script.len() <= PARSE_CACHE_MAX_SCRIPT {
+        if script.len() <= parse_cache_max_script {
             if let Some(code) = self.bytecode_cache.get(script) {
                 if !code.fallback
                     && code.epoch == self.tier1_epoch
@@ -281,7 +301,11 @@ impl Interp {
         let saved_file_ctx = self.in_file_script;
         self.in_file_script = false;
         const PARSE_CACHE_MAX: usize = 1024;
-        const PARSE_CACHE_MAX_SCRIPT: usize = 262_144;
+        // D2 第二步：大单元回落门（F5）从 256KB 提到 1MiB（256KB 是
+        // C55 的触发门：big-unit 12000-loop ≈ 528KB 单元整段落树），
+        // env `RTCL_PARSE_CACHE_MAX_SCRIPT` 可配（字节）。F1 的 u16 操
+        // 作数上限已由宽操作数关闭，这是唯一的回落门。
+        let parse_cache_max_script = parse_cache_max_script();
         let cached = self.parse_cache.get(script).cloned();
         let unit = match cached {
             Some(rc) => rc,
@@ -295,7 +319,7 @@ impl Interp {
                         return Err(self.seed_parse_error(script, &pe));
                     }
                 };
-                if script.len() <= PARSE_CACHE_MAX_SCRIPT {
+                if script.len() <= parse_cache_max_script {
                     let parse_cost = script.len().saturating_mul(2) + 128;
                     if self.parse_cache.len() >= PARSE_CACHE_MAX
                         || self.parse_cache_bytes + parse_cost > PARSE_CACHE_BYTE_BUDGET

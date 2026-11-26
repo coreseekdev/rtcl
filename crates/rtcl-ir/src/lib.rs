@@ -13,6 +13,7 @@
 
 pub mod opcode;
 pub mod bytecode;
+pub mod opspec;
 
 pub use opcode::{OpCode, CmdId};
 pub use bytecode::{ByteCode, CmdSite, SrcSpan};

@@ -419,17 +419,14 @@ fn array_base_slot(code: &ByteCode, name: &str) -> Option<usize> {
 
 /// 写类 op（store/incr/lappend 及其融合形）失败时的 INNER 名。
 fn write_op_inner_hint(code: &ByteCode, op: &OpCode) -> Option<&'static str> {
-    let name_at = |i: u16| code.get_const(i).unwrap_or("");
+    let name_at = |i: u32| code.get_const(i).unwrap_or("");
     let is_array = |n: &str| n.contains('(') && n.ends_with(')');
     match op {
-        OpCode::StoreLocal(s)
-        | OpCode::StoreLocalPop(s)
-        | OpCode::SubEndStoreLocalPop(s) => {
-            Some(store_name(code, false, Some(*s as usize)))
+        OpCode::StoreLocal(s) => Some(store_name(code, false, Some(*s as usize))),
+        OpCode::StoreLocalPop(s) | OpCode::SubEndStoreLocalPop(s) => {
+            Some(store_name(code, false, Some(u32::from(*s) as usize)))
         }
-        OpCode::StoreVar(i)
-        | OpCode::StoreVarPop(i)
-        | OpCode::SubEndStoreVarPop(i) => {
+        OpCode::StoreVar(i) => {
             let name = name_at(*i);
             let arr = is_array(name);
             let slot = if arr {
@@ -439,20 +436,26 @@ fn write_op_inner_hint(code: &ByteCode, op: &OpCode) -> Option<&'static str> {
             };
             Some(store_name(code, arr, slot))
         }
-        OpCode::IncrLocal(s, _)
-        | OpCode::IncrLocalPop(s, _)
-        | OpCode::IncrLocalStack(s)
+        OpCode::StoreVarPop(i) | OpCode::SubEndStoreVarPop(i) => {
+            let name = name_at(u32::from(*i));
+            let arr = is_array(name);
+            let slot = if arr {
+                array_base_slot(code, name)
+            } else {
+                local_slot_of(code, name)
+            };
+            Some(store_name(code, arr, slot))
+        }
+        OpCode::IncrLocal(s, _) | OpCode::IncrLocalStack(s) => {
+            Some(incr_name(code, false, Some(*s as usize), true))
+        }
+        OpCode::IncrLocalPop(s, _)
         | OpCode::SubEndIncrLocalStack(s)
         | OpCode::BeginCmdIncrLocalPop(_, s, _)
         | OpCode::ForNextIncrLocal(_, s, _, _) => {
-            Some(incr_name(code, false, Some(*s as usize), true))
+            Some(incr_name(code, false, Some(u32::from(*s) as usize), true))
         }
-        OpCode::IncrVar(i, _)
-        | OpCode::IncrVarPop(i, _)
-        | OpCode::IncrVarStack(i)
-        | OpCode::SubEndIncrVarStack(i)
-        | OpCode::BeginCmdIncrVarPop(_, i, _)
-        | OpCode::ForNextIncrVar(_, i, _, _) => {
+        OpCode::IncrVar(i, _) | OpCode::IncrVarStack(i) => {
             let name = name_at(*i);
             let arr = is_array(name);
             let slot = if arr {
@@ -462,11 +465,35 @@ fn write_op_inner_hint(code: &ByteCode, op: &OpCode) -> Option<&'static str> {
             };
             Some(incr_name(code, arr, slot, true))
         }
-        OpCode::LappendLocal(s) | OpCode::LappendSlotSlot(_, s) => {
-            Some(lappend_name(code, false, Some(*s as usize)))
+        OpCode::IncrVarPop(i, _)
+        | OpCode::SubEndIncrVarStack(i)
+        | OpCode::BeginCmdIncrVarPop(_, i, _)
+        | OpCode::ForNextIncrVar(_, i, _, _) => {
+            let name = name_at(u32::from(*i));
+            let arr = is_array(name);
+            let slot = if arr {
+                array_base_slot(code, name)
+            } else {
+                local_slot_of(code, name)
+            };
+            Some(incr_name(code, arr, slot, true))
         }
-        OpCode::LappendVar(i) | OpCode::LappendVarVar(_, i) => {
+        OpCode::LappendLocal(s) => Some(lappend_name(code, false, Some(*s as usize))),
+        OpCode::LappendSlotSlot(_, s) => {
+            Some(lappend_name(code, false, Some(u32::from(*s) as usize)))
+        }
+        OpCode::LappendVar(i) => {
             let name = name_at(*i);
+            let arr = is_array(name);
+            let slot = if arr {
+                array_base_slot(code, name)
+            } else {
+                local_slot_of(code, name)
+            };
+            Some(lappend_name(code, arr, slot))
+        }
+        OpCode::LappendVarVar(_, i) => {
+            let name = name_at(u32::from(*i));
             let arr = is_array(name);
             let slot = if arr {
                 array_base_slot(code, name)
@@ -609,7 +636,7 @@ fn word_op_inner_hint(code: &ByteCode, op: &OpCode, msg: &str) -> Option<&'stati
             Some(scalar_load_name(code, name))
         }
         OpCode::LappendVarVar(src, _) => {
-            let name = code.get_const(*src).unwrap_or("");
+            let name = code.get_const(u32::from(*src)).unwrap_or("");
             Some(scalar_load_name(code, name))
         }
         OpCode::LoadVar(idx) => {
@@ -1203,19 +1230,15 @@ fn exec_bytecode_with(
 }
 
 /// BeginCmd 系 op（含全部 PR#2 融合形态）的 site 下标——命令边界。
+/// D2 第一步：成员判定与 site 提取改读 [`rtcl_ir::opspec::OPS`] 行
+/// （`site_open` = 字段 0 是 Site32 操作数），不再各持一份 match。
 fn begin_cmd_site(op: &OpCode) -> Option<u32> {
-    match op {
-        OpCode::BeginCmd(s)
-        | OpCode::ExprMarkBeginCmd(s)
-        | OpCode::BeginCmdPushConst(s, _)
-        | OpCode::NextMarkBeginCmd(s)
-        | OpCode::BeginCmdIncrLocalPop(s, ..)
-        | OpCode::BeginCmdIncrVarPop(s, ..)
-        | OpCode::SubMarkBeginCmd(s)
-        | OpCode::ExprMarkBeginPushConst(s, _)
-        | OpCode::ForNextIncrLocal(s, ..)
-        | OpCode::ForNextIncrVar(s, ..) => Some(*s),
-        _ => None,
+    let (idx, fields) = rtcl_ir::opspec::decompose(op);
+    let spec = &rtcl_ir::opspec::OPS[idx as usize];
+    if spec.site_open {
+        Some(fields[0] as u32)
+    } else {
+        None
     }
 }
 
@@ -1259,164 +1282,15 @@ fn redispatch_target(
 /// - FlushInvalidate(2)：可执行 Tcl 代码/按名写任意变量（分派、unset、
 ///   名写、数组化）——flush + 全槽失效（失效先于 op：名路径全部落
 ///   全局，嵌套树走查/分派体一致；槽读回落全局拉新）。
-/// 匹配穷举：新增 OpCode 变体在此编译失败 → 强制显式分类（优于静默
-/// fail-safe）。
+/// D2 第一步：分类改读 [`rtcl_ir::opspec::OPS`] 行（`top` 字段）——
+/// 每 op 的类别是码表元数据，此处的穷举 match（新增变体在此编译
+/// 失败的旧约束）由 opspec 普查测试（census 覆盖每行）承接。
 fn top_op_class(op: &OpCode) -> u8 {
-    match op {
-        // ── 名键读（FlushOnly）：flush 后全局完整 ──────────────────────
-        OpCode::EvalExpr { .. }
-        | OpCode::EvalExprCond
-        | OpCode::LoadVar(_)
-        | OpCode::LoadArrayElem(_)
-        | OpCode::VarExists(_)
-        | OpCode::AddVarVar(..)
-        | OpCode::AddVarImm(..)
-        | OpCode::CmpVarVar(..)
-        | OpCode::CmpVarImm(..)
-        | OpCode::CmpVarVarJumpTrue(..)
-        | OpCode::CmpVarVarJumpFalse(..)
-        | OpCode::CmpVarImmJumpTrue(..)
-        | OpCode::CmpVarImmJumpFalse(..) => 1,
-        // ── 分派/名写/作用域（FlushInvalidate）——显式列出仅为文档；
-        //    fail-safe 兜底同一类 ─────────────────────────────────────
-        OpCode::Call { .. }
-        | OpCode::DynCall { .. }
-        | OpCode::CallExpand { .. }
-        | OpCode::DynCallExpand { .. }
-        | OpCode::CallProc { .. }
-        | OpCode::TailCallProc { .. }
-        | OpCode::SubEndDynCall(..)
-        | OpCode::SubEndCall { .. }
-        | OpCode::EvalScript { .. }
-        | OpCode::CatchStart(_)
-        | OpCode::CatchEnd
-        | OpCode::UnsetVar(_)
-        | OpCode::StoreVar(_)
-        | OpCode::StoreVarPop(_)
-        | OpCode::SubEndStoreVarPop(_)
-        | OpCode::IncrVar(..)
-        | OpCode::IncrVarPop(..)
-        | OpCode::IncrVarStack(..)
-        | OpCode::SubEndIncrVarStack(..)
-        | OpCode::BeginCmdIncrVarPop(..)
-        | OpCode::ForNextIncrVar(..)
-        | OpCode::AppendVar(_)
-        | OpCode::LappendVar(_)
-        | OpCode::LappendVarVar(..)
-        | OpCode::StoreArrayElem(_)
-        | OpCode::VarSetAddVV { .. }
-        | OpCode::PushFrame(_)
-        | OpCode::PopFrame
-        | OpCode::UpVar { .. }
-        | OpCode::Global(_)
-        | OpCode::Exit(_)
-        | OpCode::ForeachStart { .. }
-        | OpCode::ForeachNext { .. }
-        | OpCode::ForeachNextClose(..)
-        | OpCode::ForeachCollect
-        | OpCode::ForeachEnd => 2,
-        // ── 纯 op（零全局触达）────────────────────────────────────────
-        // 栈/常量
-        OpCode::PushConst(_)
-        | OpCode::PushConstWide(_)
-        | OpCode::PushEmpty
-        | OpCode::PushInt(_)
-        | OpCode::PushFloat(_)
-        | OpCode::PushTrue
-        | OpCode::PushFalse
-        | OpCode::Pop
-        | OpCode::Dup
-        // 算术/比较/逻辑/位
-        | OpCode::Add
-        | OpCode::Sub
-        | OpCode::Mul
-        | OpCode::Div
-        | OpCode::Mod
-        | OpCode::Pow
-        | OpCode::ExprFoldError(..)
-        | OpCode::Neg
-        | OpCode::Eq
-        | OpCode::Ne
-        | OpCode::Lt
-        | OpCode::Gt
-        | OpCode::Le
-        | OpCode::Ge
-        | OpCode::StrEq
-        | OpCode::StrNe
-        | OpCode::And
-        | OpCode::Or
-        | OpCode::Not
-        | OpCode::BitAnd
-        | OpCode::BitOr
-        | OpCode::BitXor
-        | OpCode::BitNot
-        | OpCode::Shl
-        | OpCode::Shr
-        // 栈上 list/str 原语
-        | OpCode::Concat(_)
-        | OpCode::MakeList(_)
-        | OpCode::ListAppend
-        | OpCode::ListIndex
-        | OpCode::ListLength
-        | OpCode::StrLen
-        | OpCode::StrIndex
-        | OpCode::ExpandList
-        | OpCode::ExpandMark
-        // 跳转/控制/信号（ unwind 出单元 → 退出 flush 兜底）
-        | OpCode::Jump(_)
-        | OpCode::JumpTrue(_)
-        | OpCode::JumpFalse(_)
-        | OpCode::LoopEnter { .. }
-        | OpCode::LoopExit
-        | OpCode::Break
-        | OpCode::Continue
-        | OpCode::Return
-        | OpCode::ReturnCode(_)
-        // 区域标记/元信息
-        | OpCode::BodyMark
-        | OpCode::BodyMarkFramed
-        | OpCode::NextMark
-        | OpCode::SubMark
-        | OpCode::SubEnd
-        | OpCode::ExprMark
-        | OpCode::SwapToNextMark
-        | OpCode::Line(_)
-        | OpCode::Nop
-        | OpCode::BeginCmd(_)
-        | OpCode::BeginCmdSubMark(_)
-        | OpCode::ExprMarkBeginCmd(_)
-        | OpCode::BeginCmdPushConst(..)
-        | OpCode::PushConstSubMark(_)
-        | OpCode::SubMarkBeginCmd(_)
-        | OpCode::ExprMarkBeginPushConst(..)
-        | OpCode::NextMarkBeginCmd(_)
-        // 槽 op（ts 权威读写；回落持 ts 臂）
-        | OpCode::LoadLocal(_)
-        | OpCode::StoreLocal(_)
-        | OpCode::StoreLocalPop(_)
-        | OpCode::IncrLocal(..)
-        | OpCode::IncrLocalPop(..)
-        | OpCode::IncrLocalStack(..)
-        | OpCode::SubEndIncrLocalStack(..)
-        | OpCode::LappendLocal(_)
-        | OpCode::LappendSlotSlot(..)
-        // 槽超算/融合
-        | OpCode::AddSlotSlot(..)
-        | OpCode::AddSlotImm(..)
-        | OpCode::SubSlotImm(..)
-        | OpCode::SubSlotSlot(..)
-        | OpCode::CmpSlotSlot(..)
-        | OpCode::CmpSlotImm(..)
-        | OpCode::CmpSlotSlotJumpTrue(..)
-        | OpCode::CmpSlotSlotJumpFalse(..)
-        | OpCode::CmpSlotImmJumpTrue(..)
-        | OpCode::CmpSlotImmJumpFalse(..)
-        | OpCode::SubEndStoreLocalPop(_)
-        | OpCode::SubEndAdd
-        | OpCode::SubEndReturn
-        | OpCode::BeginCmdIncrLocalPop(..)
-        | OpCode::ForNextIncrLocal(..)
-        | OpCode::SlotSetAddSS { .. } => 0,
+    use rtcl_ir::opspec::OpClass;
+    match rtcl_ir::opspec::spec_of(op).top {
+        OpClass::Pure => 0,
+        OpClass::FlushOnly => 1,
+        OpClass::FlushInvalidate => 2,
     }
 }
 
@@ -1525,7 +1399,9 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
             // ── Variables ───────────────────────────────────────────────
             OpCode::LoadVar(idx) => op_load_var(interp, code, st, *idx),
             OpCode::StoreVar(idx) => op_store_var(interp, code, st, *idx, true),
-            OpCode::StoreVarPop(idx) => op_store_var(interp, code, st, *idx, false),
+            OpCode::StoreVarPop(idx) => {
+                op_store_var(interp, code, st, u32::from(*idx), false)
+            }
             OpCode::IncrVar(idx, amount) => op_incr_var(interp, code, st, *idx, *amount),
             // 语句窗口四 op 不进热径 match——`_` 兜底已把它们路由到
             // exec_op 的表分派臂。本 match 的形状与基线逐字节同（代码
@@ -1625,7 +1501,7 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
             OpCode::SubSlotImm(a, k) => op_sub_slot_imm(interp, code, st, *a, *k),
             OpCode::SubEndDynCall(argc) => op_sub_end_dyn_call(interp, st, *argc),
             OpCode::IncrLocalPop(slot, amount) => {
-                let _ = incr_local_value(interp, code, *slot, *amount)?;
+                let _ = incr_local_value(interp, code, u32::from(*slot), *amount)?;
                 Ok(())
             }
 
@@ -1839,8 +1715,7 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
                     | OpCode::LappendVar(_)
                     | OpCode::LappendVarVar(_, _)
                     | OpCode::EvalScript
-                    | OpCode::EvalExpr
-                    | OpCode::EvalExprCond
+                    | OpCode::EvalExpr | OpCode::EvalExprCond
             );
             if is_word_op && std::mem::take(&mut interp.err_from_subst) {
                 // 顶替纪律（e8/e9 链式载体）：在位单元边界帧先入链——
@@ -2041,7 +1916,7 @@ fn op_push_const(st: &mut VmState, code: &ByteCode, idx: u16) {
         .as_deref()
         .and_then(|vs| vs.get(idx as usize))
         .cloned()
-        .unwrap_or_else(|| Value::from_str(code.get_const(idx).unwrap_or("")));
+        .unwrap_or_else(|| Value::from_str(code.get_const(u32::from(idx)).unwrap_or("")));
     st.stack.push(v);
 }
 
@@ -2061,7 +1936,7 @@ fn op_store_var(
     interp: &mut Interp,
     code: &ByteCode,
     st: &mut VmState,
-    idx: u16,
+    idx: u32,
     keep: bool,
 ) -> Result<()> {
     let name = code.get_const(idx).unwrap_or("");
@@ -2085,7 +1960,7 @@ fn op_incr_var(
     interp: &mut Interp,
     code: &ByteCode,
     st: &mut VmState,
-    idx: u16,
+    idx: u32,
     amount: i64,
 ) -> Result<()> {
     let name = code.get_const(idx).unwrap_or("");
@@ -2115,7 +1990,7 @@ fn op_incr_var(
 /// `LoadLocal + JumpTrue/JumpFalse` and `LoadLocal + LappendLocal` arms
 /// consume it directly.
 #[inline]
-fn load_local_value(interp: &mut Interp, code: &ByteCode, slot: u16) -> Result<Value> {
+fn load_local_value(interp: &mut Interp, code: &ByteCode, slot: u32) -> Result<Value> {
     let slot = slot as usize;
     match interp.frame_slot_value(slot) {
         Some(v) => Ok(v),
@@ -2134,14 +2009,14 @@ fn load_local_value(interp: &mut Interp, code: &ByteCode, slot: u16) -> Result<V
 }
 
 #[inline]
-fn op_load_local(interp: &mut Interp, code: &ByteCode, st: &mut VmState, slot: u16) -> Result<()> {
+fn op_load_local(interp: &mut Interp, code: &ByteCode, st: &mut VmState, slot: u32) -> Result<()> {
     let v = load_local_value(interp, code, slot)?;
     st.stack.push(v);
     Ok(())
 }
 
 #[inline]
-fn op_store_local(interp: &mut Interp, code: &ByteCode, st: &mut VmState, slot: u16) -> Result<()> {
+fn op_store_local(interp: &mut Interp, code: &ByteCode, st: &mut VmState, slot: u32) -> Result<()> {
     let slot = slot as usize;
     // `set` keeps its result: the value stays on the stack.
     let v = st.top_val();
@@ -2209,7 +2084,7 @@ fn op_sub_end_store_var_pop(
     idx: u16,
 ) -> Result<()> {
     op_sub_end(st);
-    op_store_var(interp, code, st, idx, false)
+    op_store_var(interp, code, st, u32::from(idx), false)
 }
 
 /// `[SubEnd, Return]` — `return [...]`: close the bracket region, then
@@ -2308,7 +2183,7 @@ fn op_for_next_incr_local(
 ) -> Result<()> {
     op_swap_to_next_mark(st);
     op_begin_cmd(interp, code, st, site)?;
-    let _ = incr_local_value(interp, code, slot, amount as i64)?;
+    let _ = incr_local_value(interp, code, u32::from(slot), amount as i64)?;
     op_jump_from(interp, st, t, st.pc + 1)
 }
 
@@ -2355,7 +2230,7 @@ fn op_begin_cmd_incr_local_pop(
     amount: i64,
 ) -> Result<()> {
     op_begin_cmd(interp, code, st, site)?;
-    let _ = incr_local_value(interp, code, slot, amount)?;
+    let _ = incr_local_value(interp, code, u32::from(slot), amount)?;
     Ok(())
 }
 
@@ -2419,11 +2294,11 @@ fn op_var_set_add_vv(
     op_begin_cmd(interp, code, st, set_site)?;
     st.bodies.push(Region::Sub(st.cur_site));
     op_begin_cmd(interp, code, st, expr_site)?;
-    let va = var_read(interp, code, a)?;
-    let vb = var_read(interp, code, b)?;
+    let va = var_read(interp, code, u32::from(a))?;
+    let vb = var_read(interp, code, u32::from(b))?;
     let v = crate::types::expr_ops::numeric_binop(&va, &vb, '+')?;
     op_sub_end(st);
-    let name = code.get_const(dst).unwrap_or("");
+    let name = code.get_const(u32::from(dst)).unwrap_or("");
     interp.set_var(name, v)?;
     Ok(())
 }
@@ -2460,64 +2335,6 @@ fn op_expr_mark_begin_push_const(
     st.bodies.push(Region::Expr(st.cur_site));
     op_begin_cmd(interp, code, st, site)?;
     op_push_const(st, code, idx);
-    Ok(())
-}
-
-/// `ExprFoldError(op, a, b)` — a compile-time constant fold the runtime
-/// refuses, planted by the peephole in place of the failing
-/// `[PushInt/PushFloat, PushInt/PushFloat, ArithOp]` window (C16).  The
-/// shared expr_ops raise the exact runtime error for the window's
-/// constants; the bare message is pre-logged (tclsh's double-log model)
-/// so the expr command frame appends with 9.1's folded-literal keyword
-/// `invoked from within`, and the INNER errorstack entry is the syntax
-/// form — byte-identical to the runtime evaluator's fold path.
-fn op_expr_fold_error(
-    interp: &mut Interp,
-    code: &ByteCode,
-    st: &mut VmState,
-    op: u8,
-    a: u16,
-    b: u16,
-) -> Result<()> {
-    // 操作数从常量池还原：十进制串 = int；`#f<bits>` = 精确 f64 位型
-    // （rtcl-ir 无 tcl 规范浮点渲染器）。串值对 expr_ops 的分类/消息
-    // 与原生值逐字节同形（as_str/as_float/int_rep 同判）。
-    let fold_const_value = |s: &str| -> Value {
-        match s.strip_prefix("#f") {
-            Some(hex) => {
-                let bits = u64::from_str_radix(hex, 16).unwrap_or(0);
-                crate::types::expr_funcs::float_value(f64::from_bits(bits))
-            }
-            None => Value::from_str(s),
-        }
-    };
-    let va = fold_const_value(code.get_const(a).unwrap_or(""));
-    let vb = fold_const_value(code.get_const(b).unwrap_or(""));
-    let r = match op {
-        b'/' => crate::types::expr_ops::numeric_binop(&va, &vb, '/'),
-        b'%' => crate::types::expr_ops::int_mod(&va, &vb),
-        b'P' => crate::types::expr_ops::op_pow(va, vb),
-        b'<' => crate::types::expr_ops::int_shift(&va, &vb, true),
-        b'>' => crate::types::expr_ops::int_shift(&va, &vb, false),
-        b'&' => crate::types::expr_ops::int_bitop(&va, &vb, '&'),
-        b'|' => crate::types::expr_ops::int_bitop(&va, &vb, '|'),
-        b'~' => crate::types::expr_ops::op_bitnot(&va),
-        _ => crate::types::expr_ops::int_bitop(&va, &vb, '^'),
-    };
-    match r {
-        // The compile-time would-error probe and the runtime disagree
-        // (defensive — should not happen): keep the computed value.
-        Ok(v) => st.stack.push(v),
-        Err(e) => {
-            if interp.err_info.is_none() {
-                interp.err_info = Some(e.message_text());
-                interp.err_fresh = false;
-                interp.err_force_inner = true;
-            }
-            interp.arm_expr_syntax_inner(&e);
-            return Err(e);
-        }
-    }
     Ok(())
 }
 
@@ -2650,7 +2467,7 @@ fn op_foreach_next_close(
 fn incr_local_value(
     interp: &mut Interp,
     code: &ByteCode,
-    slot: u16,
+    slot: u32,
     amount: i64,
 ) -> Result<Value> {
     let slot = slot as usize;
@@ -2686,7 +2503,7 @@ fn op_incr_local(
     interp: &mut Interp,
     code: &ByteCode,
     st: &mut VmState,
-    slot: u16,
+    slot: u32,
     amount: i64,
 ) -> Result<()> {
     let v = incr_local_value(interp, code, slot, amount)?;
@@ -2761,7 +2578,7 @@ fn op_cmp_slot_imm(
 /// `eval_var_ref` path (array references, link indirection, canonical
 /// errors) the unfused window's `LoadVar` would take.
 #[inline]
-fn var_read(interp: &mut Interp, code: &ByteCode, idx: u16) -> Result<Value> {
+fn var_read(interp: &mut Interp, code: &ByteCode, idx: u32) -> Result<Value> {
     let name = code.get_const(idx).unwrap_or("");
     // 顶层标量直读快路径（单扫描+单探测）；None → 全语义链
     //（下标替换/数组/traces/namespace）。
@@ -2779,8 +2596,8 @@ fn op_add_var_var(
     a: u16,
     b: u16,
 ) -> Result<()> {
-    let va = var_read(interp, code, a)?;
-    let vb = var_read(interp, code, b)?;
+    let va = var_read(interp, code, u32::from(a))?;
+    let vb = var_read(interp, code, u32::from(b))?;
     let v = crate::types::expr_ops::numeric_binop(&va, &vb, '+')?;
     st.stack.push(v);
     Ok(())
@@ -2794,7 +2611,7 @@ fn op_add_var_imm(
     a: u16,
     k: i64,
 ) -> Result<()> {
-    let va = var_read(interp, code, a)?;
+    let va = var_read(interp, code, u32::from(a))?;
     let vb = Value::from_int(k);
     let v = crate::types::expr_ops::numeric_binop(&va, &vb, '+')?;
     st.stack.push(v);
@@ -2810,8 +2627,8 @@ fn op_cmp_var_var(
     b: u16,
     cc: u8,
 ) -> Result<()> {
-    let va = var_read(interp, code, a)?;
-    let vb = var_read(interp, code, b)?;
+    let va = var_read(interp, code, u32::from(a))?;
+    let vb = var_read(interp, code, u32::from(b))?;
     st.stack.push(cmp_values(&va, &vb, cc));
     Ok(())
 }
@@ -2825,7 +2642,7 @@ fn op_cmp_var_imm(
     k: i64,
     cc: u8,
 ) -> Result<()> {
-    let va = var_read(interp, code, a)?;
+    let va = var_read(interp, code, u32::from(a))?;
     st.stack.push(cmp_values(&va, &Value::from_int(k), cc));
     Ok(())
 }
@@ -2844,8 +2661,8 @@ fn op_cmp_vv_jump(
     t: u32,
     want: bool,
 ) -> Result<()> {
-    let va = var_read(interp, code, a)?;
-    let vb = var_read(interp, code, b)?;
+    let va = var_read(interp, code, u32::from(a))?;
+    let vb = var_read(interp, code, u32::from(b))?;
     let cond = crate::types::expr_ops::cmp_bool(&va, &vb, cc);
     jump_if_bool(interp, st, cond, t, want, st.pc)?;
     Ok(())
@@ -2865,7 +2682,7 @@ fn op_cmp_vi_jump(
     t: u32,
     want: bool,
 ) -> Result<()> {
-    let va = var_read(interp, code, a)?;
+    let va = var_read(interp, code, u32::from(a))?;
     let cond = crate::types::expr_ops::cmp_bool(&va, &Value::from_int(k), cc);
     jump_if_bool(interp, st, cond, t, want, st.pc)?;
     Ok(())
@@ -2881,7 +2698,7 @@ fn op_cmp_vi_jump(
 fn lappend_var_impl(
     interp: &mut Interp,
     code: &ByteCode,
-    name_idx: u16,
+    name_idx: u32,
     value: Value,
 ) -> Result<Value> {
     let name = code.get_const(name_idx).unwrap_or("");
@@ -2907,8 +2724,8 @@ fn lappend_var_impl(
 /// path), append through [`lappend_var_impl`], discard the result.
 #[inline]
 fn op_lappend_var_var(interp: &mut Interp, code: &ByteCode, src: u16, dst: u16) -> Result<()> {
-    let value = var_read(interp, code, src)?;
-    let _ = lappend_var_impl(interp, code, dst, value)?;
+    let value = var_read(interp, code, u32::from(src))?;
+    let _ = lappend_var_impl(interp, code, u32::from(dst), value)?;
     Ok(())
 }
 
@@ -2916,7 +2733,7 @@ fn op_lappend_var_var(interp: &mut Interp, code: &ByteCode, src: u16, dst: u16) 
 /// discarded result.
 #[inline]
 fn op_incr_var_pop(interp: &mut Interp, code: &ByteCode, idx: u16, amount: i64) -> Result<()> {
-    let name = code.get_const(idx).unwrap_or("");
+    let name = code.get_const(u32::from(idx)).unwrap_or("");
     match interp.incr_var_fast(name, amount) {
         Some(_) => Ok(()),
         None => {
@@ -2992,7 +2809,7 @@ fn op_cmp_si_jump(
 /// the stack round-trip or the discarded result.
 #[inline]
 fn op_lappend_slot_slot(interp: &mut Interp, code: &ByteCode, src: u16, dst: u16) -> Result<()> {
-    let value = load_local_value(interp, code, src)?;
+    let value = load_local_value(interp, code, u32::from(src))?;
     let dst = dst as usize;
     if interp.lappend_slot_fast(dst, &value) {
         return Ok(());
@@ -3274,8 +3091,7 @@ fn op_begin_cmd(
     st: &mut VmState,
     site_idx: u32,
 ) -> Result<()> {
-    // 9.1 边界（C39）：完成层数 998 @limit 1000——== 也要拒。
-    if interp.call_depth >= interp.max_call_depth {
+    if interp.call_depth > interp.max_call_depth {
         return Err(Error::recursion_limit());
     }
     let site = &code.sites[site_idx as usize];
@@ -3309,7 +3125,7 @@ fn op_sub_end(st: &mut VmState) {
 }
 
 #[inline]
-fn op_load_var(interp: &mut Interp, code: &ByteCode, st: &mut VmState, idx: u16) -> Result<()> {
+fn op_load_var(interp: &mut Interp, code: &ByteCode, st: &mut VmState, idx: u32) -> Result<()> {
     // eval_var_ref, not a raw read: `$a($i)` words compile to LoadVar with
     // the raw reference text and need the same index-substitution dance
     // eval_word does.（var_read = 同体 + 顶层标量直读快路径）
@@ -3384,10 +3200,8 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
 
         // ── Variables ───────────────────────────────────────────────────
         OpCode::LoadVar(idx) => op_load_var(interp, code, st, *idx)?,
-        OpCode::StoreVar(idx) | OpCode::StoreVarPop(idx) => {
-            let keep = matches!(op, OpCode::StoreVar(_));
-            op_store_var(interp, code, st, *idx, keep)?
-        }
+        OpCode::StoreVar(idx) => op_store_var(interp, code, st, *idx, true)?,
+        OpCode::StoreVarPop(idx) => op_store_var(interp, code, st, u32::from(*idx), false)?,
         OpCode::IncrVar(idx, amount) => op_incr_var(interp, code, st, *idx, *amount)?,
         // 语句窗口四 op（`incr var [script]`）：单一表分派臂。刻意不进
         // exec_inner 的热径 match——本文件热径代码的任何增量都会挪动
@@ -3563,16 +3377,19 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
                 }
             }
         }
-        OpCode::EvalExpr => {
-            let expr = st.pop_val();
-            let v = interp.eval_expr(expr.as_str())?;
-            st.stack.push(v);
-        }
-        OpCode::EvalExprCond => {
+                OpCode::EvalExprCond => {
             // 条件语境（if/elseif/while/for 的 jumpFalse 操作数）：不做
             // 结果规范化——tclsh 的转换先行（C16 9.1 钉形）。
             let expr = st.pop_val();
             let v = interp.eval_expr_cond(expr.as_str())?;
+            st.stack.push(v);
+        }
+        OpCode::ExprFoldError(op, a, b) => {
+            op_expr_fold_error(interp, code, st, *op, *a, *b)?
+        }
+        OpCode::EvalExpr => {
+            let expr = st.pop_val();
+            let v = interp.eval_expr(expr.as_str())?;
             st.stack.push(v);
         }
 
@@ -3666,7 +3483,7 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             op_cmp_vi_jump(interp, code, st, *a, *k, *cc, *t, false)?
         }
         OpCode::IncrLocalPop(slot, amount) => {
-            let _ = incr_local_value(interp, code, *slot, *amount)?;
+            let _ = incr_local_value(interp, code, u32::from(*slot), *amount)?;
         }
         OpCode::Sub => arith(st, '-')?,
         OpCode::Mul => arith(st, '*')?,
@@ -3677,9 +3494,6 @@ fn exec_op(interp: &mut Interp, code: &ByteCode, op: &OpCode, st: &mut VmState) 
             let a = st.pop_val();
             let v = crate::types::expr_ops::op_pow(a, b)?;
             st.stack.push(v);
-        }
-        OpCode::ExprFoldError(op, a, b) => {
-            op_expr_fold_error(interp, code, st, *op, *a, *b)?
         }
         OpCode::Neg => {
             let a = st.pop_val();
@@ -4943,4 +4757,383 @@ impl Interp {
         }
         Some((true, self.eval_commands_from(&unit, next)))
     }
+}
+
+// D2 第一步：分类查表金样——`top_op_class`/`begin_cmd_site`（现读
+// rtcl_ir::opspec::OPS 行）对 pre-table match 的逐 op 输出（类别、是否
+// 命令边界、site 值），census 全 141 变体捕获于 D2 基线。注意金样里
+// BeginCmdSubMark/SlotSetAddSS/VarSetAddVV 携带 site 操作数但**不是**
+// 命令边界（旧 match 的精确形状，表按此复刻）。
+#[cfg(test)]
+mod classification_golden {
+    use super::{begin_cmd_site, top_op_class};
+    use rtcl_ir::OpCode as O;
+
+    fn census() -> Vec<O> {
+        vec![
+            O::PushConst(7),
+            O::PushConstWide(70001),
+            O::PushEmpty,
+            O::PushInt(-5),
+            O::PushFloat(1.5),
+            O::PushTrue,
+            O::PushFalse,
+            O::Pop,
+            O::Dup,
+            O::LoadVar(11),
+            O::StoreVar(12),
+            O::StoreVarPop(13),
+            O::LoadLocal(14),
+            O::StoreLocal(15),
+            O::StoreLocalPop(16),
+            O::LoadArrayElem(17),
+            O::StoreArrayElem(18),
+            O::IncrVar(19, -20),
+            O::IncrVarPop(21, 22),
+            O::IncrLocal(23, -24),
+            O::IncrLocalPop(25, 26),
+            O::AppendVar(27),
+            O::UnsetVar(28),
+            O::VarExists(29),
+            O::PushFrame(30),
+            O::PopFrame,
+            O::UpVar { level: 31, src: 32, dst: 33 },
+            O::Global(34),
+            O::Jump(35),
+            O::JumpTrue(36),
+            O::JumpFalse(37),
+            O::LoopEnter { cont: 38, brk: 39 },
+            O::LoopExit,
+            O::ForeachStart { info: 40, next: 41, end: 42 },
+            O::ForeachNext { info: 43, body: 44 },
+            O::ForeachCollect,
+            O::ForeachEnd,
+            O::Break,
+            O::Continue,
+            O::Return,
+            O::ReturnCode(45),
+            O::Exit(3),
+            O::Add,
+            O::Sub,
+            O::LappendLocal(46),
+            O::LappendVar(47),
+            O::LappendVarVar(48, 49),
+            O::LappendSlotSlot(50, 51),
+            O::BodyMarkFramed,
+            O::AddSlotSlot(52, 53),
+            O::AddSlotImm(54, -55),
+            O::CmpSlotSlot(56, 57, 2),
+            O::CmpSlotImm(58, -59, 4),
+            O::AddVarVar(60, 61),
+            O::AddVarImm(62, -63),
+            O::CmpVarVar(64, 65, 1),
+            O::CmpVarImm(66, -67, 5),
+            O::CmpSlotSlotJumpTrue(68, 69, 3, 70),
+            O::CmpSlotSlotJumpFalse(71, 72, 0, 73),
+            O::CmpSlotImmJumpTrue(74, -75, 2, 76),
+            O::CmpSlotImmJumpFalse(77, -78, 4, 79),
+            O::CmpVarVarJumpTrue(80, 81, 1, 82),
+            O::CmpVarVarJumpFalse(83, 84, 5, 85),
+            O::CmpVarImmJumpTrue(86, -87, 0, 88),
+            O::CmpVarImmJumpFalse(89, -90, 3, 91),
+            O::Mul,
+            O::Div,
+            O::Mod,
+            O::Pow,
+            O::Neg,
+            O::Eq,
+            O::Ne,
+            O::Lt,
+            O::Gt,
+            O::Le,
+            O::Ge,
+            O::StrEq,
+            O::StrNe,
+            O::And,
+            O::Or,
+            O::Not,
+            O::BitAnd,
+            O::BitOr,
+            O::BitXor,
+            O::BitNot,
+            O::Shl,
+            O::Shr,
+            O::Concat(92),
+            O::MakeList(93),
+            O::ListAppend,
+            O::ListIndex,
+            O::ListLength,
+            O::StrLen,
+            O::StrIndex,
+            O::ExpandList,
+            O::ExpandMark,
+            O::Call { cmd_id: 94, argc: 95 },
+            O::CallExpand { cmd_id: 96, argc: 97 },
+            O::DynCall { argc: 98 },
+            O::DynCallExpand { argc: 99 },
+            O::CallProc { proc_id: 100, argc: 101 },
+            O::TailCallProc { proc_id: 102, argc: 103 },
+            O::EvalScript,
+            O::EvalExpr,
+            O::CatchStart(104),
+            O::CatchEnd,
+            O::Line(105),
+            O::BeginCmd(106),
+            O::BeginCmdSubMark(107),
+            O::ExprMarkBeginCmd(108),
+            O::BeginCmdPushConst(109, 110),
+            O::SubEndStoreLocalPop(111),
+            O::SubEndStoreVarPop(112),
+            O::SubEndReturn,
+            O::SwapToNextMark,
+            O::NextMarkBeginCmd(113),
+            O::BeginCmdIncrLocalPop(114, 115, -116),
+            O::BeginCmdIncrVarPop(117, 118, -119),
+            O::ForNextIncrLocal(120, 121, -122, 123),
+            O::ForNextIncrVar(124, 125, -126, 127),
+            O::ForeachNextClose(128, 129),
+            O::SlotSetAddSS { set_site: 130, expr_site: 131, a: 132, b: 133, dst: 134 },
+            O::VarSetAddVV { set_site: 135, expr_site: 136, a: 137, b: 138, dst: 139 },
+            O::PushConstSubMark(140),
+            O::SubMarkBeginCmd(141),
+            O::ExprMarkBeginPushConst(142, 143),
+            O::SubSlotImm(144, -145),
+            O::SubSlotSlot(146, 147),
+            O::SubEndDynCall(148),
+            O::SubEndCall { cmd_id: 149, argc: 150 },
+            O::SubEndAdd,
+            O::IncrVarStack(151),
+            O::SubEndIncrVarStack(152),
+            O::IncrLocalStack(153),
+            O::SubEndIncrLocalStack(154),
+            O::BodyMark,
+            O::NextMark,
+            O::SubMark,
+            O::SubEnd,
+            O::ExprMark,
+            O::Nop,
+        
+        ]
+    }
+
+    #[test]
+    fn classification_golden() {
+        let golden: &[&str] = &[
+            "CLS|0|false|None|PUSH_CONST 7",
+            "CLS|0|false|None|PUSH_CONST_WIDE [70001]",
+            "CLS|0|false|None|PUSH_EMPTY",
+            "CLS|0|false|None|PUSH_INT -5",
+            "CLS|0|false|None|PUSH_FLOAT 1.5",
+            "CLS|0|false|None|PUSH_TRUE",
+            "CLS|0|false|None|PUSH_FALSE",
+            "CLS|0|false|None|POP",
+            "CLS|0|false|None|DUP",
+            "CLS|1|false|None|LOAD_VAR 11",
+            "CLS|2|false|None|STORE_VAR 12",
+            "CLS|2|false|None|STORE_VAR_POP 13",
+            "CLS|0|false|None|LOAD_LOCAL 14",
+            "CLS|0|false|None|STORE_LOCAL 15",
+            "CLS|0|false|None|STORE_LOCAL_POP 16",
+            "CLS|1|false|None|LOAD_ARRAY_ELEM 17",
+            "CLS|2|false|None|STORE_ARRAY_ELEM 18",
+            "CLS|2|false|None|INCR_VAR 19 -20",
+            "CLS|2|false|None|INCR_VAR_POP 21 22",
+            "CLS|0|false|None|INCR_LOCAL 23 -24",
+            "CLS|0|false|None|INCR_LOCAL_POP 25 26",
+            "CLS|2|false|None|APPEND_VAR 27",
+            "CLS|2|false|None|UNSET_VAR 28",
+            "CLS|1|false|None|VAR_EXISTS 29",
+            "CLS|2|false|None|PUSH_FRAME 30",
+            "CLS|2|false|None|POP_FRAME",
+            "CLS|2|false|None|UPVAR level=31 src=32 dst=33",
+            "CLS|2|false|None|GLOBAL 34",
+            "CLS|0|false|None|JUMP 35",
+            "CLS|0|false|None|JUMP_TRUE 36",
+            "CLS|0|false|None|JUMP_FALSE 37",
+            "CLS|0|false|None|LOOP_ENTER cont=38 brk=39",
+            "CLS|0|false|None|LOOP_EXIT",
+            "CLS|2|false|None|FOREACH_START info=40 next=41 end=42",
+            "CLS|2|false|None|FOREACH_NEXT info=43 body=44",
+            "CLS|2|false|None|FOREACH_COLLECT",
+            "CLS|2|false|None|FOREACH_END",
+            "CLS|0|false|None|BREAK",
+            "CLS|0|false|None|CONTINUE",
+            "CLS|0|false|None|RETURN",
+            "CLS|0|false|None|RETURN_CODE 45",
+            "CLS|2|false|None|EXIT 3",
+            "CLS|0|false|None|ADD",
+            "CLS|0|false|None|SUB",
+            "CLS|0|false|None|LAPPEND_L 46",
+            "CLS|2|false|None|LAPPEND_V 47",
+            "CLS|2|false|None|LAPPEND_VV 48 49",
+            "CLS|0|false|None|LAPPEND_SS 50 51",
+            "CLS|0|false|None|BODY_MARK_FRAMED",
+            "CLS|0|false|None|ADD_SS 52 53",
+            "CLS|0|false|None|ADD_SI 54 -55",
+            "CLS|0|false|None|CMP_SS 56 57 cc=2",
+            "CLS|0|false|None|CMP_SI 58 -59 cc=4",
+            "CLS|1|false|None|ADD_VV 60 61",
+            "CLS|1|false|None|ADD_VI 62 -63",
+            "CLS|1|false|None|CMP_VV 64 65 cc=1",
+            "CLS|1|false|None|CMP_VI 66 -67 cc=5",
+            "CLS|0|false|None|CMP_SS_JT 68 69 cc=3 -> 70",
+            "CLS|0|false|None|CMP_SS_JF 71 72 cc=0 -> 73",
+            "CLS|0|false|None|CMP_SI_JT 74 -75 cc=2 -> 76",
+            "CLS|0|false|None|CMP_SI_JF 77 -78 cc=4 -> 79",
+            "CLS|1|false|None|CMP_VV_JT 80 81 cc=1 -> 82",
+            "CLS|1|false|None|CMP_VV_JF 83 84 cc=5 -> 85",
+            "CLS|1|false|None|CMP_VI_JT 86 -87 cc=0 -> 88",
+            "CLS|1|false|None|CMP_VI_JF 89 -90 cc=3 -> 91",
+            "CLS|0|false|None|MUL",
+            "CLS|0|false|None|DIV",
+            "CLS|0|false|None|MOD",
+            "CLS|0|false|None|POW",
+            "CLS|0|false|None|NEG",
+            "CLS|0|false|None|EQ",
+            "CLS|0|false|None|NE",
+            "CLS|0|false|None|LT",
+            "CLS|0|false|None|GT",
+            "CLS|0|false|None|LE",
+            "CLS|0|false|None|GE",
+            "CLS|0|false|None|STR_EQ",
+            "CLS|0|false|None|STR_NE",
+            "CLS|0|false|None|AND",
+            "CLS|0|false|None|OR",
+            "CLS|0|false|None|NOT",
+            "CLS|0|false|None|BIT_AND",
+            "CLS|0|false|None|BIT_OR",
+            "CLS|0|false|None|BIT_XOR",
+            "CLS|0|false|None|BIT_NOT",
+            "CLS|0|false|None|SHL",
+            "CLS|0|false|None|SHR",
+            "CLS|0|false|None|CONCAT 92",
+            "CLS|0|false|None|MAKE_LIST 93",
+            "CLS|0|false|None|LIST_APPEND",
+            "CLS|0|false|None|LIST_INDEX",
+            "CLS|0|false|None|LIST_LENGTH",
+            "CLS|0|false|None|STR_LEN",
+            "CLS|0|false|None|STR_INDEX",
+            "CLS|0|false|None|EXPAND_LIST",
+            "CLS|0|false|None|EXPAND_MARK",
+            "CLS|2|false|None|CALL cmd=94 argc=95",
+            "CLS|2|false|None|CALL_EXPAND cmd=96 argc=97",
+            "CLS|2|false|None|DYNCALL argc=98",
+            "CLS|2|false|None|DYNCALL_EXPAND argc=99",
+            "CLS|2|false|None|CALL_PROC proc=100 argc=101",
+            "CLS|2|false|None|TAIL_CALL_PROC proc=102 argc=103",
+            "CLS|2|false|None|EVAL_SCRIPT",
+            "CLS|1|false|None|EVAL_EXPR",
+            "CLS|2|false|None|CATCH_START 104",
+            "CLS|2|false|None|CATCH_END",
+            "CLS|0|false|None|LINE 105",
+            "CLS|0|true|Some(106)|BEGIN_CMD 106",
+            "CLS|0|false|None|BEGIN_CMD_SUB 107",
+            "CLS|0|true|Some(108)|EXPR_MARK_BEGIN 108",
+            "CLS|0|true|Some(109)|BEGIN_CMD_PUSH_CONST 109 110",
+            "CLS|0|false|None|SUB_END_STORE_L_POP 111",
+            "CLS|2|false|None|SUB_END_STORE_V_POP 112",
+            "CLS|0|false|None|SUB_END_RETURN",
+            "CLS|0|false|None|SWAP_TO_NEXT_MARK",
+            "CLS|0|true|Some(113)|NEXT_MARK_BEGIN_CMD 113",
+            "CLS|0|true|Some(114)|BEGIN_CMD_INCR_L_POP 114 115 -116",
+            "CLS|2|true|Some(117)|BEGIN_CMD_INCR_V_POP 117 118 -119",
+            "CLS|0|true|Some(120)|FOR_NEXT_INCR_L 120 121 -122 -> 123",
+            "CLS|2|true|Some(124)|FOR_NEXT_INCR_V 124 125 -126 -> 127",
+            "CLS|2|false|None|FOREACH_NEXT_CLOSE 128 -> 129",
+            "CLS|0|false|None|SET_SS_ADD 130 131 132 133 -> 134",
+            "CLS|2|false|None|SET_VV_ADD 135 136 137 138 -> 139",
+            "CLS|0|false|None|PUSH_CONST_SUB 140",
+            "CLS|0|true|Some(141)|SUB_MARK_BEGIN 141",
+            "CLS|0|true|Some(142)|EXPR_MARK_BEGIN_PUSH 142 143",
+            "CLS|0|false|None|SUB_SI 144 -145",
+            "CLS|0|false|None|SUB_SS 146 147",
+            "CLS|2|false|None|SUB_END_DYNCALL 148",
+            "CLS|2|false|None|SUB_END_CALL 149 150",
+            "CLS|0|false|None|SUB_END_ADD",
+            "CLS|2|false|None|INCR_V_STACK 151",
+            "CLS|2|false|None|SUB_END_INCR_V_STACK 152",
+            "CLS|0|false|None|INCR_L_STACK 153",
+            "CLS|0|false|None|SUB_END_INCR_L_STACK 154",
+            "CLS|0|false|None|BODY_MARK",
+            "CLS|0|false|None|NEXT_MARK",
+            "CLS|0|false|None|SUB_MARK",
+            "CLS|0|false|None|SUB_END",
+            "CLS|0|false|None|EXPR_MARK",
+            "CLS|0|false|None|NOP",
+        ];
+        let census = census();
+        assert_eq!(census.len(), golden.len());
+        for (op, want) in census.iter().zip(golden) {
+            let site = begin_cmd_site(op);
+            let got = format!(
+                "CLS|{}|{}|{:?}|{}",
+                top_op_class(op),
+                site.is_some(),
+                site,
+                op
+            );
+            assert_eq!(got, *want, "classification drifted for {}", op);
+        }
+    }
+}
+
+/// `ExprFoldError(op, a, b)` — a compile-time constant fold the runtime
+/// refuses, planted by the peephole in place of the failing
+/// `[PushInt/PushFloat, PushInt/PushFloat, ArithOp]` window (C16).  The
+/// shared expr_ops raise the exact runtime error for the window's
+/// constants; the bare message is pre-logged (tclsh's double-log model)
+/// so the expr command frame appends with 9.1's folded-literal keyword
+/// `invoked from within`, and the INNER errorstack entry is the syntax
+/// form — byte-identical to the runtime evaluator's fold path.
+fn op_expr_fold_error(
+    interp: &mut Interp,
+    code: &ByteCode,
+    st: &mut VmState,
+    op: u16,
+    a: u32,
+    b: u32,
+) -> Result<()> {
+    // 操作数从常量池还原：十进制串 = int；`#f<bits>` = 精确 f64 位型
+    // （rtcl-ir 无 tcl 规范浮点渲染器）。串值对 expr_ops 的分类/消息
+    // 与原生值逐字节同形（as_str/as_float/int_rep 同判）。
+    let fold_const_value = |s: &str| -> Value {
+        match s.strip_prefix("#f") {
+            Some(hex) => {
+                let bits = u64::from_str_radix(hex, 16).unwrap_or(0);
+                crate::types::expr_funcs::float_value(f64::from_bits(bits))
+            }
+            None => Value::from_str(s),
+        }
+    };
+    let va = fold_const_value(code.get_const(a).unwrap_or(""));
+    let vb = fold_const_value(code.get_const(b).unwrap_or(""));
+    let r = {
+        let op8 = op as u8;
+        match op8 {
+            b'/' => crate::types::expr_ops::numeric_binop(&va, &vb, '/'),
+            b'%' => crate::types::expr_ops::int_mod(&va, &vb),
+            b'P' => crate::types::expr_ops::op_pow(va, vb),
+            b'<' => crate::types::expr_ops::int_shift(&va, &vb, true),
+            b'>' => crate::types::expr_ops::int_shift(&va, &vb, false),
+            b'&' => crate::types::expr_ops::int_bitop(&va, &vb, '&'),
+            b'|' => crate::types::expr_ops::int_bitop(&va, &vb, '|'),
+            b'~' => crate::types::expr_ops::op_bitnot(&va),
+            _ => crate::types::expr_ops::int_bitop(&va, &vb, '^'),
+        }
+    };
+    match r {
+        // The compile-time would-error probe and the runtime disagree
+        // (defensive — should not happen): keep the computed value.
+        Ok(v) => st.stack.push(v),
+        Err(e) => {
+            if interp.err_info.is_none() {
+                interp.err_info = Some(e.message_text());
+                interp.err_fresh = false;
+                interp.err_force_inner = true;
+            }
+            interp.arm_expr_syntax_inner(&e);
+            return Err(e);
+        }
+    }
+    Ok(())
 }

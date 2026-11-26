@@ -115,7 +115,7 @@ pub(crate) struct PrelinkEntry {
     /// (precomputed with the list; the installing frame IS that body's, so
     /// the per-call link install skips the table scan).  `None` when the
     /// body has no slot for it (name-keyed frames fall back).
-    pub(crate) slot: Option<u16>,
+    pub(crate) slot: Option<u32>,
 }
 #[cfg(feature = "embedded")]
 pub(crate) type UpvarMap = alloc::collections::BTreeMap<Rc<str>, UpvarLink>;

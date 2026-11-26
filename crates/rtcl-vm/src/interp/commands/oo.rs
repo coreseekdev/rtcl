@@ -1361,7 +1361,7 @@ fn memoised_proc_def(
                     c.locals()
                         .iter()
                         .position(|l| l == v.as_str())
-                        .map(|i| i as u16)
+                        .map(|i| i as u32)
                 });
                 crate::interp::PrelinkEntry {
                     name: Rc::from(v.as_str()),

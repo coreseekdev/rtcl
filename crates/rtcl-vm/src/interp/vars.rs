@@ -599,7 +599,7 @@ impl Interp {
         &mut self,
         frame_idx: usize,
         name: &str,
-        slot: Option<u16>,
+        slot: Option<u32>,
         link: &crate::interp::UpvarLink,
     ) {
         let base = super::util::strip_paren(name);
@@ -2340,12 +2340,19 @@ impl Interp {
         }
         let amount = st.stack.pop().unwrap_or_else(Value::empty);
         let v = match op {
-            IncrVarStack(idx) | SubEndIncrVarStack(idx) => {
+            IncrVarStack(idx) => {
                 let name = code.get_const(*idx).unwrap_or("");
                 self.incr_var_fast_stack(name, amount)?
             }
-            IncrLocalStack(slot) | SubEndIncrLocalStack(slot) => {
+            SubEndIncrVarStack(idx) => {
+                let name = code.get_const(u32::from(*idx)).unwrap_or("");
+                self.incr_var_fast_stack(name, amount)?
+            }
+            IncrLocalStack(slot) => {
                 self.incr_local_slot_stack(*slot as usize, amount, code)?
+            }
+            SubEndIncrLocalStack(slot) => {
+                self.incr_local_slot_stack(u32::from(*slot) as usize, amount, code)?
             }
             _ => unreachable!("exec_window_stmt"),
         };

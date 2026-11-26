@@ -215,13 +215,6 @@ pub enum OpCode {
     /// Push the empty string.
     PushEmpty,
 
-    /// Evaluate TOS as an expression in a CONDITION context
-    /// (`if`/`elseif`/`while`/`for`): result canonicalization is skipped
-    /// (tclsh's jumpFalse conversion precedes it — `while {NaN}` reports
-    /// the conversion error, not the expr command's domain error, C16).
-    /// Evaluated through `Interp::eval_expr_cond`.
-    EvalExprCond,
-
     /// Push a small integer literal.
     PushInt(i64),
 
@@ -245,12 +238,13 @@ pub enum OpCode {
     // Name indices point into the constant pool.  At runtime the VM resolves
     // through the scope chain: local frame → upvar links → namespace → global.
 
-    /// Load a variable by name (constant-pool index).
+    /// Load a variable by name (constant-pool index; u32 — the pool
+    /// wide path, D2 第二步消 C55).
     /// Resolves through the current scope chain.
-    LoadVar(u16),
+    LoadVar(u32),
 
     /// Store TOS into a variable by name.  Leaves the value on the stack.
-    StoreVar(u16),
+    StoreVar(u32),
 
     /// Store TOS into a variable by name and **pop** the value (discard).
     /// Used when the result of `set` is not needed.
@@ -261,12 +255,12 @@ pub enum OpCode {
     /// unset slot or a frame that degraded back to the name-keyed store
     /// (upvar/trace/array restructure) falls back to the ordinary
     /// scope-chain read of that name.
-    LoadLocal(u16),
+    LoadLocal(u32),
 
     /// Store TOS into a call-frame slot.  Leaves the value on the stack.
     /// Operand/naming contract as [`OpCode::LoadLocal`]; a degraded frame
     /// falls back to `set_var` of the name.
-    StoreLocal(u16),
+    StoreLocal(u32),
 
     /// Fusion of `[StoreLocal slot, Pop]` — the `set <var> <value>`
     /// statement shape: the value is moved into the slot, and the
@@ -283,7 +277,7 @@ pub enum OpCode {
     StoreArrayElem(u16),
 
     /// Increment a variable by a signed immediate and push the new value.
-    IncrVar(u16, i64),
+    IncrVar(u32, i64),
     /// Fusion of `[IncrVar idx, Pop]` — the increment's result is
     /// discarded (the bare-`incr` statement shape).  Same fast path and
     /// fallback ladder as [`OpCode::IncrVar`]; only the stack round-trip
@@ -293,7 +287,7 @@ pub enum OpCode {
     /// Increment a call-frame slot by a signed immediate (naming contract
     /// as [`OpCode::LoadLocal`]); a degraded frame or non-integer value
     /// falls back to the real `incr`, which owns the exact errors.
-    IncrLocal(u16, i64),
+    IncrLocal(u32, i64),
 
     /// Fusion of `[IncrLocal slot, Pop]` — the increment's result is
     /// discarded (the `for`-next / bare-`incr` statement shape).  Same
@@ -414,9 +408,9 @@ pub enum OpCode {
     /// list rep needing the strict parse, creation) falls back to
     /// dispatching `cmd_lappend` with the assembled arguments — same
     /// errors, same frames.
-    LappendLocal(u16),
+    LappendLocal(u32),
     /// The name-keyed twin of [`OpCode::LappendLocal`] (top-level units).
-    LappendVar(u16),
+    LappendVar(u32),
     /// Fusion of `[LoadVar src, LappendVar dst, Pop]` — the name-keyed
     /// `lappend <var> $value` statement shape: read the source variable
     /// (both operands are constant-pool name indices; the read replicates
@@ -484,17 +478,9 @@ pub enum OpCode {
     Div,
     Mod,
     Pow,
-
-    /// A compile-time constant-fold attempt that the runtime would
-    /// refuse, planted by the peephole in place of the failing
-    /// `[PushInt/PushFloat, PushInt/PushFloat, ArithOp]` window (C16).
-    /// At execution the shared expr_ops raise the exact runtime error
-    /// (identical text/errorCode), and the expr command frame appends
-    /// with tclsh 9.1's folded-literal keyword `invoked from within`.
-    /// Payload: the operator char and the two operands as constant-pool
-    /// indices — decimals for ints; float bits hex under a `#f` marker
-    /// (the executor reconstructs the exact f64; op size budget ≤16B).
-    ExprFoldError(u8, u16, u16),
+    /// 折叠必败窗口（C16）：peephole 植入，执行器复用 expr_ops 的
+    /// 运行期错误路径（9.1 双日志模型）。
+    ExprFoldError(u16, u32, u32),
     Neg,
 
     // ── Comparison ──────────────────────────────────────────────────────────
@@ -558,22 +544,23 @@ pub enum OpCode {
     /// **Call** — invoke a built-in command by numeric [`CmdId`].
     ///
     /// `cmd_id` indexes the interpreter's unified command table.
-    /// `argc` arguments (including the command name itself) are on the stack.
-    Call { cmd_id: u16, argc: u16 },
+    /// `argc` arguments (including the command name itself) are on the
+    /// stack (u32 — wide argc, D2 第二步消 C55).
+    Call { cmd_id: u16, argc: u32 },
 
     /// **CallExpand** — like `Call`, but the argument list may contain
     /// `{*}` expanded elements.  `argc` is the *compile-time* word count;
     /// the actual argument count is determined at runtime by tracking
     /// preceding `ExpandList` ops.
-    CallExpand { cmd_id: u16, argc: u16 },
+    CallExpand { cmd_id: u16, argc: u32 },
 
     /// **DynCall** — dynamic command invocation.
     ///
     /// The command name is the *first* of `argc` values on the stack.
-    DynCall { argc: u16 },
+    DynCall { argc: u32 },
 
     /// **DynCallExpand** — dynamic call with `{*}` expansion.
-    DynCallExpand { argc: u16 },
+    DynCallExpand { argc: u32 },
 
     /// Call a user-defined proc by ID.
     CallProc { proc_id: u16, argc: u16 },
@@ -589,6 +576,8 @@ pub enum OpCode {
 
     /// Evaluate TOS as a Tcl expression (like `expr {...}`).
     EvalExpr,
+    /// 条件语境孪生（C16 9.1：无结果规范化——tclsh 的转换先行）。
+    EvalExprCond,
 
     /// Begin a `catch` block — operand is the error-handler PC.
     CatchStart(u32),
@@ -782,7 +771,7 @@ pub enum OpCode {
     /// `IncrVar`'s fallback ladder verbatim — a non-int amount or any
     /// fast-path guard failure delegates to the real `incr`, which owns
     /// creation, bignum promotion, traces and the exact errors.
-    IncrVarStack(u16),
+    IncrVarStack(u32),
 
     /// Fusion of `[SubEnd, IncrVarStack i]` — the `incr var [script]`
     /// statement tail in one dispatch.
@@ -790,242 +779,46 @@ pub enum OpCode {
 
     /// The slot twin of [`OpCode::IncrVarStack`]: pop the amount, increment
     /// the slot, push the new value.
-    IncrLocalStack(u16),
+    IncrLocalStack(u32),
 
     /// Fusion of `[SubEnd, IncrLocalStack s]` — the slot twin.
     SubEndIncrLocalStack(u16),
 }
 
 impl fmt::Display for OpCode {
+    /// Table-driven disassembly: the mnemonic and per-operand decoration
+    /// come from the op's [`crate::opspec::OpSpec`] row (the single source;
+    /// byte-exactness against the per-variant formatting is pinned by the
+    /// `opspec::tests::display_golden` test).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            // Stack
-            OpCode::PushConst(idx) => write!(f, "PUSH_CONST {}", idx),
-            OpCode::PushConstWide(idx) => write!(f, "PUSH_CONST_WIDE [{}]", idx),
-            OpCode::PushEmpty => write!(f, "PUSH_EMPTY"),
-            OpCode::EvalExprCond => write!(f, "EVAL_EXPR_COND"),
-            OpCode::PushInt(n) => write!(f, "PUSH_INT {}", n),
-            OpCode::PushFloat(n) => write!(f, "PUSH_FLOAT {}", n),
-            OpCode::PushTrue => write!(f, "PUSH_TRUE"),
-            OpCode::PushFalse => write!(f, "PUSH_FALSE"),
-            OpCode::Pop => write!(f, "POP"),
-            OpCode::Dup => write!(f, "DUP"),
-
-            // Variables
-            OpCode::LoadVar(idx) => write!(f, "LOAD_VAR {}", idx),
-            OpCode::StoreVar(idx) => write!(f, "STORE_VAR {}", idx),
-            OpCode::StoreVarPop(idx) => write!(f, "STORE_VAR_POP {}", idx),
-            OpCode::LoadLocal(slot) => write!(f, "LOAD_LOCAL {}", slot),
-            OpCode::StoreLocal(slot) => write!(f, "STORE_LOCAL {}", slot),
-            OpCode::StoreLocalPop(slot) => write!(f, "STORE_LOCAL_POP {}", slot),
-            OpCode::LoadArrayElem(idx) => write!(f, "LOAD_ARRAY_ELEM {}", idx),
-            OpCode::StoreArrayElem(idx) => write!(f, "STORE_ARRAY_ELEM {}", idx),
-            OpCode::IncrVar(idx, n) => write!(f, "INCR_VAR {} {}", idx, n),
-            OpCode::IncrVarPop(idx, n) => write!(f, "INCR_VAR_POP {} {}", idx, n),
-            OpCode::IncrLocal(slot, n) => write!(f, "INCR_LOCAL {} {}", slot, n),
-            OpCode::IncrLocalPop(slot, n) => write!(f, "INCR_LOCAL_POP {} {}", slot, n),
-            OpCode::AppendVar(idx) => write!(f, "APPEND_VAR {}", idx),
-            OpCode::UnsetVar(idx) => write!(f, "UNSET_VAR {}", idx),
-            OpCode::VarExists(idx) => write!(f, "VAR_EXISTS {}", idx),
-
-            // Scope
-            OpCode::PushFrame(n) => write!(f, "PUSH_FRAME {}", n),
-            OpCode::PopFrame => write!(f, "POP_FRAME"),
-            OpCode::UpVar { level, src, dst } => {
-                write!(f, "UPVAR level={} src={} dst={}", level, src, dst)
+        let (idx, fields) = crate::opspec::decompose(self);
+        let spec = &crate::opspec::OPS[idx as usize];
+        f.write_str(spec.name)?;
+        for (arg, raw) in spec.args.iter().zip(fields.iter()) {
+            f.write_str(" ")?;
+            f.write_str(arg.pre)?;
+            match arg.kind {
+                crate::opspec::Opnd::Const16
+                | crate::opspec::Opnd::Slot16
+                | crate::opspec::Opnd::Count16
+                | crate::opspec::Opnd::Level16 => write!(f, "{}", *raw as u16)?,
+                crate::opspec::Opnd::Const32
+                | crate::opspec::Opnd::Slot32
+                | crate::opspec::Opnd::Count32
+                | crate::opspec::Opnd::Target32
+                | crate::opspec::Opnd::Site32
+                | crate::opspec::Opnd::Info32
+                | crate::opspec::Opnd::Note32 => write!(f, "{}", *raw as u32)?,
+                crate::opspec::Opnd::Imm32 | crate::opspec::Opnd::Code32 => {
+                    write!(f, "{}", *raw as u32 as i32)?
+                }
+                crate::opspec::Opnd::Imm64 => write!(f, "{}", *raw as i64)?,
+                crate::opspec::Opnd::Cc8 => write!(f, "{}", *raw as u8)?,
+                crate::opspec::Opnd::F64 => write!(f, "{}", f64::from_bits(*raw))?,
             }
-            OpCode::Global(idx) => write!(f, "GLOBAL {}", idx),
-
-            // Control flow
-            OpCode::Jump(off) => write!(f, "JUMP {}", off),
-            OpCode::JumpTrue(off) => write!(f, "JUMP_TRUE {}", off),
-            OpCode::JumpFalse(off) => write!(f, "JUMP_FALSE {}", off),
-
-            // Loop management
-            OpCode::LoopEnter { cont, brk } => {
-                write!(f, "LOOP_ENTER cont={} brk={}", cont, brk)
-            }
-            OpCode::LoopExit => write!(f, "LOOP_EXIT"),
-            OpCode::ForeachStart { info, next, end } => {
-                write!(f, "FOREACH_START info={} next={} end={}", info, next, end)
-            }
-            OpCode::ForeachNext { info, body } => {
-                write!(f, "FOREACH_NEXT info={} body={}", info, body)
-            }
-            OpCode::ForeachCollect => write!(f, "FOREACH_COLLECT"),
-            OpCode::ForeachEnd => write!(f, "FOREACH_END"),
-            OpCode::Break => write!(f, "BREAK"),
-            OpCode::Continue => write!(f, "CONTINUE"),
-
-            // Return / exit
-            OpCode::Return => write!(f, "RETURN"),
-            OpCode::ReturnCode(c) => write!(f, "RETURN_CODE {}", c),
-            OpCode::Exit(c) => write!(f, "EXIT {}", c),
-
-            // Arithmetic
-            OpCode::Add => write!(f, "ADD"),
-            OpCode::LappendLocal(s) => write!(f, "LAPPEND_L {}", s),
-            OpCode::LappendVar(n) => write!(f, "LAPPEND_V {}", n),
-            OpCode::LappendVarVar(src, dst) => write!(f, "LAPPEND_VV {} {}", src, dst),
-            OpCode::LappendSlotSlot(src, dst) => write!(f, "LAPPEND_SS {} {}", src, dst),
-            OpCode::BodyMarkFramed => write!(f, "BODY_MARK_FRAMED"),
-            OpCode::AddSlotSlot(a, b) => write!(f, "ADD_SS {} {}", a, b),
-            OpCode::AddSlotImm(a, k) => write!(f, "ADD_SI {} {}", a, k),
-            OpCode::CmpSlotSlot(a, b, cc) => write!(f, "CMP_SS {} {} cc={}", a, b, cc),
-            OpCode::CmpSlotImm(a, k, cc) => write!(f, "CMP_SI {} {} cc={}", a, k, cc),
-            OpCode::AddVarVar(a, b) => write!(f, "ADD_VV {} {}", a, b),
-            OpCode::AddVarImm(a, k) => write!(f, "ADD_VI {} {}", a, k),
-            OpCode::CmpVarVar(a, b, cc) => write!(f, "CMP_VV {} {} cc={}", a, b, cc),
-            OpCode::CmpVarImm(a, k, cc) => write!(f, "CMP_VI {} {} cc={}", a, k, cc),
-            OpCode::CmpSlotSlotJumpTrue(a, b, cc, t) => {
-                write!(f, "CMP_SS_JT {} {} cc={} -> {}", a, b, cc, t)
-            }
-            OpCode::CmpSlotSlotJumpFalse(a, b, cc, t) => {
-                write!(f, "CMP_SS_JF {} {} cc={} -> {}", a, b, cc, t)
-            }
-            OpCode::CmpSlotImmJumpTrue(a, k, cc, t) => {
-                write!(f, "CMP_SI_JT {} {} cc={} -> {}", a, k, cc, t)
-            }
-            OpCode::CmpSlotImmJumpFalse(a, k, cc, t) => {
-                write!(f, "CMP_SI_JF {} {} cc={} -> {}", a, k, cc, t)
-            }
-            OpCode::CmpVarVarJumpTrue(a, b, cc, t) => {
-                write!(f, "CMP_VV_JT {} {} cc={} -> {}", a, b, cc, t)
-            }
-            OpCode::CmpVarVarJumpFalse(a, b, cc, t) => {
-                write!(f, "CMP_VV_JF {} {} cc={} -> {}", a, b, cc, t)
-            }
-            OpCode::CmpVarImmJumpTrue(a, k, cc, t) => {
-                write!(f, "CMP_VI_JT {} {} cc={} -> {}", a, k, cc, t)
-            }
-            OpCode::CmpVarImmJumpFalse(a, k, cc, t) => {
-                write!(f, "CMP_VI_JF {} {} cc={} -> {}", a, k, cc, t)
-            }
-            OpCode::Sub => write!(f, "SUB"),
-            OpCode::Mul => write!(f, "MUL"),
-            OpCode::Div => write!(f, "DIV"),
-            OpCode::Mod => write!(f, "MOD"),
-            OpCode::Pow => write!(f, "POW"),
-            OpCode::ExprFoldError(op, a, b) => {
-                write!(f, "EXPR_FOLD_ERROR {} c{} c{}", *op as char, a, b)
-            }
-            OpCode::Neg => write!(f, "NEG"),
-
-            // Comparison
-            OpCode::Eq => write!(f, "EQ"),
-            OpCode::Ne => write!(f, "NE"),
-            OpCode::Lt => write!(f, "LT"),
-            OpCode::Gt => write!(f, "GT"),
-            OpCode::Le => write!(f, "LE"),
-            OpCode::Ge => write!(f, "GE"),
-            OpCode::StrEq => write!(f, "STR_EQ"),
-            OpCode::StrNe => write!(f, "STR_NE"),
-
-            // Logical
-            OpCode::And => write!(f, "AND"),
-            OpCode::Or => write!(f, "OR"),
-            OpCode::Not => write!(f, "NOT"),
-
-            // Bitwise
-            OpCode::BitAnd => write!(f, "BIT_AND"),
-            OpCode::BitOr => write!(f, "BIT_OR"),
-            OpCode::BitXor => write!(f, "BIT_XOR"),
-            OpCode::BitNot => write!(f, "BIT_NOT"),
-            OpCode::Shl => write!(f, "SHL"),
-            OpCode::Shr => write!(f, "SHR"),
-
-            // String / List
-            OpCode::Concat(n) => write!(f, "CONCAT {}", n),
-            OpCode::MakeList(n) => write!(f, "MAKE_LIST {}", n),
-            OpCode::ListAppend => write!(f, "LIST_APPEND"),
-            OpCode::ListIndex => write!(f, "LIST_INDEX"),
-            OpCode::ListLength => write!(f, "LIST_LENGTH"),
-            OpCode::StrLen => write!(f, "STR_LEN"),
-            OpCode::StrIndex => write!(f, "STR_INDEX"),
-            OpCode::ExpandList => write!(f, "EXPAND_LIST"),
-            OpCode::ExpandMark => write!(f, "EXPAND_MARK"),
-
-            // Command calls
-            OpCode::Call { cmd_id, argc } => {
-                write!(f, "CALL cmd={} argc={}", cmd_id, argc)
-            }
-            OpCode::CallExpand { cmd_id, argc } => {
-                write!(f, "CALL_EXPAND cmd={} argc={}", cmd_id, argc)
-            }
-            OpCode::DynCall { argc } => write!(f, "DYNCALL argc={}", argc),
-            OpCode::DynCallExpand { argc } => write!(f, "DYNCALL_EXPAND argc={}", argc),
-            OpCode::CallProc { proc_id, argc } => {
-                write!(f, "CALL_PROC proc={} argc={}", proc_id, argc)
-            }
-            OpCode::TailCallProc { proc_id, argc } => {
-                write!(f, "TAIL_CALL_PROC proc={} argc={}", proc_id, argc)
-            }
-
-            // Special
-            OpCode::EvalScript => write!(f, "EVAL_SCRIPT"),
-            OpCode::EvalExpr => write!(f, "EVAL_EXPR"),
-            OpCode::CatchStart(off) => write!(f, "CATCH_START {}", off),
-            OpCode::CatchEnd => write!(f, "CATCH_END"),
-
-            // Debug
-            OpCode::Line(n) => write!(f, "LINE {}", n),
-            OpCode::BeginCmd(site) => write!(f, "BEGIN_CMD {}", site),
-            OpCode::BeginCmdSubMark(site) => write!(f, "BEGIN_CMD_SUB {}", site),
-            OpCode::ExprMarkBeginCmd(site) => write!(f, "EXPR_MARK_BEGIN {}", site),
-            OpCode::BeginCmdPushConst(site, idx) => {
-                write!(f, "BEGIN_CMD_PUSH_CONST {} {}", site, idx)
-            }
-            OpCode::SubEndStoreLocalPop(slot) => {
-                write!(f, "SUB_END_STORE_L_POP {}", slot)
-            }
-            OpCode::SubEndStoreVarPop(idx) => write!(f, "SUB_END_STORE_V_POP {}", idx),
-            OpCode::SubEndReturn => write!(f, "SUB_END_RETURN"),
-            OpCode::SwapToNextMark => write!(f, "SWAP_TO_NEXT_MARK"),
-            OpCode::ForNextIncrLocal(site, slot, k, t) => {
-                write!(f, "FOR_NEXT_INCR_L {} {} {} -> {}", site, slot, k, t)
-            }
-            OpCode::ForNextIncrVar(site, idx, k, t) => {
-                write!(f, "FOR_NEXT_INCR_V {} {} {} -> {}", site, idx, k, t)
-            }
-            OpCode::NextMarkBeginCmd(site) => write!(f, "NEXT_MARK_BEGIN_CMD {}", site),
-            OpCode::BeginCmdIncrLocalPop(site, slot, n) => {
-                write!(f, "BEGIN_CMD_INCR_L_POP {} {} {}", site, slot, n)
-            }
-            OpCode::BeginCmdIncrVarPop(site, idx, n) => {
-                write!(f, "BEGIN_CMD_INCR_V_POP {} {} {}", site, idx, n)
-            }
-            OpCode::ForeachNextClose(info, body) => {
-                write!(f, "FOREACH_NEXT_CLOSE {} -> {}", info, body)
-            }
-            OpCode::SlotSetAddSS { set_site, expr_site, a, b, dst } => {
-                write!(f, "SET_SS_ADD {} {} {} {} -> {}", set_site, expr_site, a, b, dst)
-            }
-            OpCode::VarSetAddVV { set_site, expr_site, a, b, dst } => {
-                write!(f, "SET_VV_ADD {} {} {} {} -> {}", set_site, expr_site, a, b, dst)
-            }
-            OpCode::PushConstSubMark(i) => write!(f, "PUSH_CONST_SUB {}", i),
-            OpCode::SubMarkBeginCmd(site) => write!(f, "SUB_MARK_BEGIN {}", site),
-            OpCode::ExprMarkBeginPushConst(site, i) => {
-                write!(f, "EXPR_MARK_BEGIN_PUSH {} {}", site, i)
-            }
-            OpCode::SubSlotImm(a, k) => write!(f, "SUB_SI {} {}", a, k),
-            OpCode::SubSlotSlot(a, b) => write!(f, "SUB_SS {} {}", a, b),
-            OpCode::SubEndDynCall(argc) => write!(f, "SUB_END_DYNCALL {}", argc),
-            OpCode::SubEndCall { cmd_id, argc } => {
-                write!(f, "SUB_END_CALL {} {}", cmd_id, argc)
-            }
-            OpCode::SubEndAdd => write!(f, "SUB_END_ADD"),
-            OpCode::IncrVarStack(idx) => write!(f, "INCR_V_STACK {}", idx),
-            OpCode::IncrLocalStack(slot) => write!(f, "INCR_L_STACK {}", slot),
-            OpCode::SubEndIncrVarStack(idx) => write!(f, "SUB_END_INCR_V_STACK {}", idx),
-            OpCode::SubEndIncrLocalStack(slot) => write!(f, "SUB_END_INCR_L_STACK {}", slot),
-            OpCode::BodyMark => write!(f, "BODY_MARK"),
-            OpCode::NextMark => write!(f, "NEXT_MARK"),
-            OpCode::SubMark => write!(f, "SUB_MARK"),
-            OpCode::SubEnd => write!(f, "SUB_END"),
-            OpCode::ExprMark => write!(f, "EXPR_MARK"),
-            OpCode::Nop => write!(f, "NOP"),
+            f.write_str(arg.post)?;
         }
+        Ok(())
     }
 }
 

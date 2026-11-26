@@ -40,7 +40,7 @@ pub fn rewrite_slots(l1: &mut L1, code: &ByteCode) {
     // 追加 locals 名——同公式）。融合超指令展开为规范窗口。
     {
         let base = code.constants().len() as u32;
-        let pseudo = |slot: u16| base + slot as u32;
+        let pseudo = |slot: u32| base + slot;
         let mut rewritten: Vec<OpCode> = Vec::with_capacity(l1.ops.len() * 2);
         // 多 op 展开（Cmp/AddSlot*）让后续 op 的 pc 平移——**所有**
         // 跳转/迭代目标必须按 old→new 映射重编，否则目标错位
@@ -52,23 +52,23 @@ pub fn rewrite_slots(l1: &mut L1, code: &ByteCode) {
             map.push(rewritten.len() as u32);
             let op = l1op.op;
             match op {
-                OpCode::LoadLocal(s) => rewritten.push(OpCode::LoadVar(pseudo(s) as u16)),
-                OpCode::StoreLocal(s) => rewritten.push(OpCode::StoreVar(pseudo(s) as u16)),
-                OpCode::IncrLocal(s, n) => rewritten.push(OpCode::IncrVar(pseudo(s) as u16, n)),
-                OpCode::LappendLocal(s) => rewritten.push(OpCode::LappendVar(pseudo(s) as u16)),
+                OpCode::LoadLocal(s) => rewritten.push(OpCode::LoadVar(pseudo(s))),
+                OpCode::StoreLocal(s) => rewritten.push(OpCode::StoreVar(pseudo(s))),
+                OpCode::IncrLocal(s, n) => rewritten.push(OpCode::IncrVar(pseudo(s), n)),
+                OpCode::LappendLocal(s) => rewritten.push(OpCode::LappendVar(pseudo(s))),
                 OpCode::AddSlotSlot(a, b) => {
-                    rewritten.push(OpCode::LoadVar(pseudo(a) as u16));
-                    rewritten.push(OpCode::LoadVar(pseudo(b) as u16));
+                    rewritten.push(OpCode::LoadVar(pseudo(u32::from(a))));
+                    rewritten.push(OpCode::LoadVar(pseudo(u32::from(b))));
                     rewritten.push(OpCode::Add);
                 }
                 OpCode::AddSlotImm(a, k) => {
-                    rewritten.push(OpCode::LoadVar(pseudo(a) as u16));
+                    rewritten.push(OpCode::LoadVar(pseudo(u32::from(a))));
                     rewritten.push(OpCode::PushInt(k));
                     rewritten.push(OpCode::Add);
                 }
                 OpCode::CmpSlotSlot(a, b, cc) => {
-                    rewritten.push(OpCode::LoadVar(pseudo(a) as u16));
-                    rewritten.push(OpCode::LoadVar(pseudo(b) as u16));
+                    rewritten.push(OpCode::LoadVar(pseudo(u32::from(a))));
+                    rewritten.push(OpCode::LoadVar(pseudo(u32::from(b))));
                     rewritten.push(match cc {
                         0 => OpCode::Lt,
                         1 => OpCode::Gt,
@@ -79,7 +79,7 @@ pub fn rewrite_slots(l1: &mut L1, code: &ByteCode) {
                     });
                 }
                 OpCode::CmpSlotImm(a, k, cc) => {
-                    rewritten.push(OpCode::LoadVar(pseudo(a) as u16));
+                    rewritten.push(OpCode::LoadVar(pseudo(u32::from(a))));
                     rewritten.push(OpCode::PushInt(k));
                     rewritten.push(match cc {
                         0 => OpCode::Lt,
@@ -281,9 +281,14 @@ pub fn run(l1: L1, code: &ByteCode) -> Result<L2, Unsupported> {
             Ok(())
         };
         match op {
-            OpCode::LoadVar(i) | OpCode::StoreVar(i) | OpCode::StoreVarPop(i)
-            | OpCode::IncrVar(i, _) | OpCode::LappendVar(i) => {
-                intern_var(*i as u32, &mut vars, &mut var_of_const)?
+            OpCode::LoadVar(i)
+            | OpCode::StoreVar(i)
+            | OpCode::IncrVar(i, _)
+            | OpCode::LappendVar(i) => {
+                intern_var(*i, &mut vars, &mut var_of_const)?
+            }
+            OpCode::StoreVarPop(i) => {
+                intern_var(u32::from(*i), &mut vars, &mut var_of_const)?
             }
             OpCode::PushConst(i) => used_consts.push(*i as u32),
             OpCode::PushConstWide(i) => used_consts.push(*i),

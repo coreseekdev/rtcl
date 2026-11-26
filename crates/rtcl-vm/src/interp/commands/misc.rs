@@ -1697,35 +1697,81 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 pub fn cmd_subst(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 2 {
-        return Err(Error::wrong_args("subst", 2, args.len()));
+        // 9.1 usage spells the positive options first (pinned
+        // subst-1.1).
+        return Err(Error::wrong_args_with_usage(
+            "subst",
+            2,
+            args.len(),
+            "?-backslashes? ?-commands? ?-variables? ?-nobackslashes? ?-nocommands? ?-novariables? string",
+        ));
     }
 
+    // 9.1 option face (tclCmdMZ.c TclSubstOptions): EVERY argument but
+    // the last is an option — GetIndexFromObj's exact/prefix rules with
+    // `ambiguous option` vs `bad option` wordings; the positive options
+    // (-backslashes/-commands/-variables) turn on ONLY those
+    // substitutions, the negative ones mask the default all-on set, and
+    // mixing the two families errors.
+    const SUBST_OPTIONS: [&str; 6] = [
+        "-backslashes",
+        "-commands",
+        "-variables",
+        "-nobackslashes",
+        "-nocommands",
+        "-novariables",
+    ];
+    let mut pos_back = false;
+    let mut pos_cmds = false;
+    let mut pos_vars = false;
     let mut nobackslashes = false;
     let mut nocommands = false;
     let mut novariables = false;
-    let mut i = 1;
-
-    while i < args.len() - 1 {
-        // tclsh accepts unambiguous prefixes (-nov, -nob, -noc).
-        let a = args[i].as_str();
-        let flag = |full: &str| a.len() > 1 && full.starts_with(a);
-        let (m_nob, m_noc, m_nov) = (
-            flag("-nobackslashes"),
-            flag("-nocommands"),
-            flag("-novariables"),
-        );
-        match m_nob as u8 + m_noc as u8 + m_nov as u8 {
-            1 => {
-                nobackslashes |= m_nob;
-                nocommands |= m_noc;
-                novariables |= m_nov;
+    for a in &args[1..args.len() - 1] {
+        let word = a.as_str();
+        let resolved = if SUBST_OPTIONS.contains(&word) {
+            Some(word)
+        } else {
+            let hits: Vec<&str> = SUBST_OPTIONS
+                .iter()
+                .copied()
+                .filter(|o| o.starts_with(word))
+                .collect();
+            match hits.as_slice() {
+                [one] => Some(*one),
+                _ => {
+                    set_error_code(
+                        interp,
+                        &format!("TCL LOOKUP INDEX option {}", word),
+                    );
+                    let kind = if hits.is_empty() { "bad" } else { "ambiguous" };
+                    return Err(tcl_err(format!(
+                        "{} option \"{}\": must be -backslashes, -commands, -variables, -nobackslashes, -nocommands, or -novariables",
+                        kind, word
+                    )));
+                }
             }
-            _ => break,
+        };
+        match resolved {
+            Some("-backslashes") => pos_back = true,
+            Some("-commands") => pos_cmds = true,
+            Some("-variables") => pos_vars = true,
+            Some("-nobackslashes") => nobackslashes = true,
+            Some("-nocommands") => nocommands = true,
+            Some("-novariables") => novariables = true,
+            _ => {}
         }
-        i += 1;
+    }
+    if pos_back || pos_cmds || pos_vars {
+        if nobackslashes || nocommands || novariables {
+            return Err(tcl_err("cannot combine positive and negative options"));
+        }
+        nobackslashes = !pos_back;
+        nocommands = !pos_cmds;
+        novariables = !pos_vars;
     }
 
-    let template = args[i].as_str();
+    let template = args[args.len() - 1].as_str();
     let mut result = String::new();
     let chars: Vec<char> = template.chars().collect();
     let mut ci = 0;

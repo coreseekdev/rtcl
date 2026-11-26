@@ -540,6 +540,11 @@ impl Error {
             Error::Msg(m) if m.starts_with("expected boolean value but got") => {
                 "TCL VALUE NUMBER".to_string()
             }
+            // tailcall 的 proc/lambda/method 合法性错误（9.1 实测
+            // TCL TAILCALL ILLEGAL；顶层与 namespace eval 体同码）。
+            Error::Runtime { message, .. } if message.starts_with("tailcall can only be called") => {
+                "TCL TAILCALL ILLEGAL".to_string()
+            }
             // expr 数学函数的数值转换（int()/wide()/double()/abs()/
             // round()/entier()，9.1 实测六个全为 TCL VALUE NUMBER；
             // `expr {int("x")}` → TCL VALUE NUMBER）。

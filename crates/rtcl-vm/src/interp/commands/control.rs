@@ -1644,7 +1644,14 @@ pub fn cmd_try(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 /// Simplified implementation: evaluates and returns via return control flow.
 pub fn cmd_tailcall(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // tclsh: tailcall outside any proc/lambda/method frame is an error.
-    if interp.frames.is_empty() {
+    // 9.1（C28 钉形）：namespace eval 体**不是** proc 帧——体里开出的
+    // ns-eval 层（ns_level0 深于帧进入时的 ns_depth）让 tailcall 非法
+    // （`proc p {} { namespace eval ns { tailcall z } }` →
+    // tailcall can only be called from a proc, lambda or method，
+    // TCL TAILCALL ILLEGAL；原 rtcl 照常执行，z 在 ns 退出后查找失败）。
+    if interp.frames.is_empty()
+        || interp.frames.last().map(|f| f.ns_depth) != Some(interp.ns_level0.len())
+    {
         return Err(Error::runtime(
             "tailcall can only be called from a proc, lambda or method",
             crate::error::ErrorCode::Generic,

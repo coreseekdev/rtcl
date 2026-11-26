@@ -14,12 +14,14 @@ const LSEARCH_OPTIONS: [&str; 21] = [
     "-stride", "-subindices",
 ];
 
-/// The documented (tclsh 8.6.17) option list, for error messages.
+/// The documented (tclsh 9.1) option list, for error messages.
+/// -stride 在 9.x 是文档化选项（8.6 时代作为 rtcl 扩展隐藏在错误清单
+/// 外）；-bool/-command 仍为 rtcl 扩展，接受但不列入。
 fn lsearch_option_list() -> String {
     let listed: Vec<&str> = LSEARCH_OPTIONS
         .iter()
         .copied()
-        .filter(|o| !matches!(*o, "-bool" | "-command" | "-stride"))
+        .filter(|o| !matches!(*o, "-bool" | "-command"))
         .collect();
     let mut s = String::from("must be ");
     for (i, o) in listed.iter().enumerate() {

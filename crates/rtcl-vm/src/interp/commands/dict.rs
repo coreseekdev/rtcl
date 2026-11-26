@@ -112,17 +112,30 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // 子命令解析：全名 → 唯一前缀缩写（dict-deep 探针：`dict cr a 1`
     // → create）；歧义/无匹配 → tclsh 同文错误。ensemble proc 回落
     // （`dict <name>` proc）仅对未解析名保留原行为。
+    /// tclsh 9.1.0's `dict` subcommand list (`getdef`/`getwithdefault`
+    /// are the TIP 342 additions).
     const DICT_SUBCMDS: &[&str] = &[
-        "append", "create", "exists", "filter", "for", "get", "incr", "info",
-        "keys", "lappend", "map", "merge", "remove", "replace", "set", "size",
-        "unset", "update", "values", "with",
+        "append", "create", "exists", "filter", "for", "get", "getdef",
+        "getwithdefault", "incr", "info", "keys", "lappend", "map", "merge",
+        "remove", "replace", "set", "size", "unset", "update", "values", "with",
     ];
     let raw = args[1].as_str();
-    let matches: Vec<&str> = DICT_SUBCMDS
-        .iter()
-        .copied()
-        .filter(|s| s.starts_with(raw))
-        .collect();
+    // Tcl_GetIndexFromObj: an EXACT match wins over prefix ambiguity
+    // (`dict get` stays exact even with getdef/getwithdefault in the
+    // table — 9.1 pinned).
+    let matches: Vec<&str> = if DICT_SUBCMDS.contains(&raw) {
+        // Exact match wins over prefix ambiguity (Tcl_GetIndexFromObj;
+        // `dict get` stays exact with getdef/getwithdefault in the table
+        // — 9.1 pinned).
+        vec![raw]
+    } else {
+        DICT_SUBCMDS
+            .iter()
+            .copied()
+            .filter(|s| s.starts_with(raw))
+            .collect()
+    };
+    const DICT_SUBCMD_LIST: &str = "append, create, exists, filter, for, get, getdef, getwithdefault, incr, info, keys, lappend, map, merge, remove, replace, set, size, unset, update, values, or with";
     let subcmd = match matches.as_slice() {
         [one] => (*one).to_string(),
         [] => {
@@ -132,8 +145,8 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 super::list::set_error_code(interp, &format!("TCL LOOKUP SUBCOMMAND {}", raw));
                 return Err(Error::runtime(
                     format!(
-                        "unknown or ambiguous subcommand \"{}\": must be append, create, exists, filter, for, get, incr, info, keys, lappend, map, merge, remove, replace, set, size, unset, update, values, or with",
-                        raw
+                        "unknown or ambiguous subcommand \"{}\": must be {}",
+                        raw, DICT_SUBCMD_LIST
                     ),
                     crate::error::ErrorCode::Generic,
                 ));
@@ -143,8 +156,8 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             super::list::set_error_code(interp, &format!("TCL LOOKUP SUBCOMMAND {}", raw));
             return Err(Error::runtime(
                 format!(
-                    "unknown or ambiguous subcommand \"{}\": must be append, create, exists, filter, for, get, incr, info, keys, lappend, map, merge, remove, replace, set, size, unset, update, values, or with",
-                    raw
+                    "unknown or ambiguous subcommand \"{}\": must be {}",
+                    raw, DICT_SUBCMD_LIST
                 ),
                 crate::error::ErrorCode::Generic,
             ));
@@ -227,6 +240,38 @@ pub fn cmd_dict(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                             crate::error::ErrorCode::NotFound,
                         ));
                     }
+                }
+            }
+            Ok(current)
+        }
+
+        // ── dict getdef|getwithdefault dictionary ?key ...? key default ──
+        // TIP 342 (tclsh 9.1, tclDictObj.c DictGetDefCmd): like `dict get`
+        // with >= 1 key, but an absent key (or key-path element) yields
+        // the default instead of erroring.  The dictionary itself is
+        // still validated first (odd dict -> missing value to go with
+        // key); the DEFAULT is returned verbatim (not required to be a
+        // list element).
+        "getdef" | "getwithdefault" => {
+            if args.len() < 5 {
+                // The usage names the INVOKED spelling (dict-26.7 vs
+                // dict-27.7 pin both forms).
+                return Err(Error::wrong_args_with_usage(
+                    format!("dict {}", subcmd),
+                    4,
+                    args.len(),
+                    "dictionary ?key ...? key default",
+                ));
+            }
+            let default = args[args.len() - 1].clone();
+            let keys = &args[3..args.len() - 1];
+            let mut current = args[2].clone();
+            for key_arg in keys {
+                let key = key_arg.as_str();
+                let entries = borrow_dict(interp, &current)?;
+                match entries.get(key) {
+                    Some(v) => current = v.clone(),
+                    None => return Ok(default),
                 }
             }
             Ok(current)

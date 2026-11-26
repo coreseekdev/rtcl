@@ -499,7 +499,11 @@ rtcl 现在每次调用都先 `degrade_frame_all()`——把整帧降成名字�
 `CallFrame.compiled`（两个引擎都有），可以不降级直接列：槽按表顺序，
 其余名字的日志按 `tcl_order` 重放。
 
-**T4 命名空间体里的变量访问提速（事务，T1 之后做）**
+**T4 命名空间体里的变量访问提速（✅ 2026-11-26 完成，task/t4 @ a8e4f2a；**
+P16 达标并反超：bench-ns-body 1500 万次 rtcl 1.9-2.9s vs tclsh9.1 2.7-4.4s
+（0.65-0.72×；基线 40s）；栈上拼键三臂读 + 写只覆写已存在键 + $ns::v 编进
+LoadVar；顺带补齐 T1 的 S8 元素读侧 ns-only。**
+原任务书：**T4 命名空间体里的变量访问提速（事务，T1 之后做）**
 `judge/audit-cases/bench-ns-body.tcl`：1500 万次裸名读写，tclsh
 2.6–3.5 秒，rtcl 约 40 秒（每次约 2.5µs，rtcl 在顶层是 0.19µs）。
 原因是命名空间体里每一次读写都走慢路径：`current_namespace != "::"`

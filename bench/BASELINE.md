@@ -2743,3 +2743,21 @@ dict getdef（rtcl 多出的 8.7 特性）/errorstack+errorline+options 键序
 ### 门禁（合并主树后复验 02:50）
 judge 88/88、crash-gate 128/128（d28 在内）、sweep 12 既有、probes **316**/122
 （t7_arr_elem 新探针入列，无新 DIFF）、workspace rc=0。
+
+## T4 命名空间体裸名快路径——反超 tclsh（task/t4 @ a8e4f2a，2026-11-26，子代理施工+主会话收尾）
+
+- 读侧三臂（read_var_scalar_top）：:: 顶层裸名臂原样；ns 体裸名键
+  `<ns>::<名字>` 栈上拼（64 字节封顶回落）单次探测；根限定单叶 `::leaf`
+  直读 :: 表。get_var/incr 热径与 scalar 直写守卫同构造；写只覆写已存在键。
+  expr_compile bare-word 字符集补 `:`——`$ns::v` 编进 LoadVar 免逐迭代重解析。
+- 顺带补齐 T1 的 S8 读侧：get_var 元素读残留的 8.6 全局数组回落按 9.1 移除
+  （探针钉形）；read_var 两 trace 表全空时直走 get_var。
+- **数字（bench-ns-body 1500 万次，同窗交错三轮）**：rtcl 1.9-2.9s vs
+  tclsh9.1 2.7-4.4s——**反超 0.65-0.72×**（基线 ~40s，约 15×；P16 达标线 3×）。
+- 行为零变化：t4_ns_body_var 探针（错误文本/errorCode/trace 序/variable 声明/
+  ns delete/数组路由/超长带 :: 带 ( 回落）对 tclsh9.1 逐字节一致，vm/tree
+  三方一致。
+- 门禁：quick-gates 十一项 rc=0、crash-gate 128/128、sweep 12 既有、probes
+  **317**/122（t4 探针入列）、workspace cargo exit 0。
+- 施工注记：子代理两次被机器 OOM 杀（进程级），主会话接手收尾——改动本身
+  一次成型，验证链（探针/基准/门禁）由主会话补齐。

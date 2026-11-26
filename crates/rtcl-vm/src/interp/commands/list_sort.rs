@@ -663,10 +663,12 @@ impl IndexSpec {
 /// (negative ints, `end+N`) gets the `cannot select` error.
 fn validate_index_spec(interp: &mut Interp, s: &str) -> Result<IndexSpec> {
     use crate::value::is_tcl_space;
-    const CANNOT_SELECT: &str = "cannot select an element from any list";
+    // 9.1 wording (tclCmdIL.c lsort index precheck): `index "X" out of
+    // range`, errorCode TCL VALUE INDEX OUTOFRANGE (8.6 said "cannot
+    // select an element from any list" with a glued INDEXOUTOFRANGE).
     let reject = |interp: &mut Interp, s: &str| -> Result<IndexSpec> {
-        super::list::set_error_code(interp, "TCL VALUE INDEXOUTOFRANGE");
-        Err(super::list::tcl_err(format!("index \"{}\" {}", s, CANNOT_SELECT)))
+        super::list::set_error_code(interp, "TCL VALUE INDEX OUTOFRANGE");
+        Err(super::list::tcl_err(format!("index \"{}\" out of range", s)))
     };
     // TclGetIntForIndex grammar: integer?[+-]integer? or end?[+-]integer?
     let t = super::list::trim_tcl_space(s);
@@ -1597,7 +1599,7 @@ mod tests {
         let mut interp = Interp::new();
         let e = interp.eval("lsort -index -1 {{a 1} {b 0}}").unwrap_err();
         assert!(
-            e.to_string().contains("index \"-1\" cannot select an element from any list"),
+            e.to_string().contains("index \"-1\" out of range"),
             "{}",
             e
         );
@@ -1608,7 +1610,7 @@ mod tests {
         let mut interp = Interp::new();
         let e = interp.eval("lsort -index end+5 {{a}}").unwrap_err();
         assert!(
-            e.to_string().contains("index \"end+5\" cannot select an element from any list"),
+            e.to_string().contains("index \"end+5\" out of range"),
             "{}",
             e
         );

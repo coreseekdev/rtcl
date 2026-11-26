@@ -92,6 +92,11 @@ static CMD_TABLE: &[CmdEntry] = &[
     // lseq — TIP 746 (tclsh 9.1): pure numeric series; args decode per
     // tclCmdIL.c Tcl_LseqObjCmd, math per tclArithSeries.c.
     CmdEntry { name: "lseq",      func: list::cmd_lseq,          cat: Standard, cmd_id: None,                            usage: "start ?(..|to)? end ??by? step?",  help: "Build a numeric sequence" },
+    // lpop/lremove/ledit — tclsh 9.0 commands (tclCmdIL.c Tcl_LpopObjCmd,
+    // Tcl_LremoveObjCmd, Tcl_LeditObjCmd).
+    CmdEntry { name: "lpop",      func: list::cmd_lpop,          cat: Standard, cmd_id: None,                            usage: "listVar ?index ...?",              help: "Remove and return a list element" },
+    CmdEntry { name: "lremove",   func: list::cmd_lremove,       cat: Standard, cmd_id: None,                            usage: "list ?index ...?",                 help: "Remove elements from a list by index" },
+    CmdEntry { name: "ledit",     func: list::cmd_ledit,         cat: Standard, cmd_id: None,                            usage: "listVar first last ?element ...?", help: "Replace elements of a list stored in variable" },
     CmdEntry { name: "concat",    func: list::cmd_concat,        cat: Standard, cmd_id: Some(CmdId::Concat    as u16),   usage: "?arg ...?",                        help: "Concatenate arguments" },
     CmdEntry { name: "split",     func: list::cmd_split,         cat: Standard, cmd_id: Some(CmdId::Split     as u16),   usage: "string ?splitChars?",              help: "Split a string into a list" },
     CmdEntry { name: "join",      func: list::cmd_join,          cat: Standard, cmd_id: Some(CmdId::Join      as u16),   usage: "list ?joinString?",                help: "Join list elements into a string" },

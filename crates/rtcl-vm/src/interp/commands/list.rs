@@ -1218,6 +1218,162 @@ pub fn cmd_lseq(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     Ok(Value::from_list(&out))
 }
 
+/// lpop varName ?index ...? — remove and return an element (tclsh 9.1;
+/// tclCmdIL.c Tcl_LpopObjCmd: extraction via TclLindexFlat, removal via
+/// TclLsetFlat — an out-of-range index pops empty and then fails in the
+/// removal with `index "raw" out of range`).
+pub fn cmd_lpop(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        set_error_code(interp, "TCL WRONGARGS");
+        return Err(wrong_args("lpop", "listvar ?index?"));
+    }
+    let var_name = args[1].as_str().to_string();
+    let current = interp.get_var(&var_name)?.clone();
+    let list = strict_list(interp, &current)?;
+
+    // No index argument: pop the last element (an empty list reports the
+    // same error as an explicit "end").
+    let indices: Vec<Value> = if args.len() == 2 {
+        if list.is_empty() {
+            set_error_code(interp, "TCL VALUE INDEX OUTOFRANGE");
+            return Err(tcl_err("index \"end\" out of range"));
+        }
+        vec![Value::from_int(list.len() as i64 - 1)]
+    } else if args.len() == 3 {
+        // lindex-style: a single index argument that itself parses as a
+        // list is an index list; a malformed one is one index string.
+        match args[2].as_list() {
+            Some(l) => l.to_vec(),
+            None => vec![args[2].clone()],
+        }
+    } else {
+        args[2..].to_vec()
+    };
+
+    // Extract (lindex-flat semantics: out of range yields the empty
+    // string, malformed intermediates error from the strict list parse).
+    let extracted = lindex_flat(interp, &list, &indices)?;
+
+    // Remove (lset-flat semantics: out of range errors with the raw
+    // index spelling at the failing level).
+    let new_list = lremove_flat(interp, &list, &indices)?;
+    interp.set_var(&var_name, new_list)?;
+    Ok(extracted)
+}
+
+/// lindex-flat: navigate `indices` from `list`, lenient about
+/// out-of-range (empty result), strict about malformed intermediates.
+fn lindex_flat(interp: &mut Interp, list: &[Value], indices: &[Value]) -> Result<Value> {
+    let mut cur: Vec<Value> = list.to_vec();
+    let mut element: Option<Value> = None;
+    for idx in indices {
+        let s = idx.as_str();
+        let raw = parse_tcl_index(s, cur.len()).ok_or_else(|| bad_index(interp, s))?;
+        if raw < 0 || raw >= cur.len() as i64 {
+            element = Some(Value::empty());
+            // Further indices operate on the empty list (lindex keeps
+            // navigating; every remaining index is out of range).
+            cur = Vec::new();
+            continue;
+        }
+        let v = cur[raw as usize].clone();
+        element = Some(v.clone());
+        cur = strict_list(interp, &v)?;
+    }
+    Ok(element.unwrap_or_else(Value::empty))
+}
+
+/// lset-flat with a NULL value (removal): mirrors TclLsetFlat's errors —
+/// `index "raw" out of range` at the failing level, list-parse errors for
+/// malformed intermediates.
+fn lremove_flat(interp: &mut Interp, list: &[Value], indices: &[Value]) -> Result<Value> {
+    let idx_str = indices[0].as_str();
+    let raw = parse_tcl_index(idx_str, list.len()).ok_or_else(|| bad_index(interp, idx_str))?;
+    if raw < 0 || raw >= list.len() as i64 {
+        set_error_code(interp, "TCL VALUE INDEX OUTOFRANGE");
+        return Err(tcl_err(format!("index \"{}\" out of range", idx_str)));
+    }
+    let idx = raw as usize;
+    let mut new_list = list.to_vec();
+    if indices.len() == 1 {
+        new_list.remove(idx);
+    } else {
+        let sub = strict_list(interp, &new_list[idx])?;
+        let new_sub = lremove_flat(interp, &sub, &indices[1..])?;
+        new_list[idx] = new_sub;
+    }
+    Ok(Value::from_list(&new_list))
+}
+
+/// lremove list ?index ...? — remove elements by index, simultaneously
+/// (tclsh 9.1; tclCmdIL.c Tcl_LremoveObjCmd: indices sorted descending,
+/// duplicates and out-of-range values skipped).
+pub fn cmd_lremove(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 2 {
+        set_error_code(interp, "TCL WRONGARGS");
+        return Err(wrong_args("lremove", "list ?index ...?"));
+    }
+    let list = strict_list(interp, &args[1])?;
+    if args.len() == 2 {
+        return Ok(args[1].clone());
+    }
+    let len = list.len();
+    let mut idxs: Vec<i64> = Vec::with_capacity(args.len() - 2);
+    for a in &args[2..] {
+        let s = a.as_str();
+        match parse_tcl_index(s, len) {
+            Some(r) => idxs.push(r),
+            None => return Err(bad_index(interp, s)),
+        }
+    }
+    idxs.sort_unstable_by(|a, b| b.cmp(a));
+    idxs.dedup();
+    let mut result = list.clone();
+    for &idx in &idxs {
+        if idx < 0 || idx >= len as i64 {
+            continue;
+        }
+        result.remove(idx as usize);
+    }
+    Ok(Value::from_list(&result))
+}
+
+/// ledit listVar first last ?element ...? — replace a range in a list
+/// variable (tclsh 9.1; tclCmdIL.c Tcl_LeditObjCmd: first clamped into
+/// [0, len], last clamped to < len, last < first is a pure insert).
+pub fn cmd_ledit(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    if args.len() < 4 {
+        set_error_code(interp, "TCL WRONGARGS");
+        return Err(wrong_args("ledit", "listVar first last ?element ...?"));
+    }
+    let var_name = args[1].as_str().to_string();
+    let current = interp.get_var(&var_name)?.clone();
+    let list = strict_list(interp, &current)?;
+    let len = list.len();
+    let first_raw = match parse_tcl_index(args[2].as_str(), len) {
+        Some(r) => r,
+        None => return Err(bad_index(interp, args[2].as_str())),
+    };
+    let last_raw = match parse_tcl_index(args[3].as_str(), len) {
+        Some(r) => r,
+        None => return Err(bad_index(interp, args[3].as_str())),
+    };
+    let first = first_raw.clamp(0, len as i64) as usize;
+    let last = last_raw.min(len as i64 - 1);
+
+    let mut result = Vec::with_capacity(len + args.len() - 4);
+    result.extend(list[..first].iter().cloned());
+    result.extend(args[4..].iter().cloned());
+    if last >= first as i64 {
+        result.extend(list[(last + 1) as usize..].iter().cloned());
+    } else {
+        result.extend(list[first..].iter().cloned());
+    }
+    let result = Value::from_list(&result);
+    interp.set_var(&var_name, result.clone())?;
+    Ok(result)
+}
+
 /// lset varName ?index ...? value
 /// Set an element in a list variable.
 pub fn cmd_lset(interp: &mut Interp, args: &[Value]) -> Result<Value> {

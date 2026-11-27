@@ -311,3 +311,33 @@ rule InfoClassVariablesSplitsPrivate {
     ensures: completion.value = "x y"
     -- probe: 2026-11-27 tclsh9.1
 }
+
+rule AnonymousObjectNameAndCreationId {
+    -- Anonymous objects are ::oo::Obj<digits>; creationid is the numeric
+    -- suffix, stable for one object, and strictly increasing for later
+    -- objects. The absolute start value is implementation-defined and is
+    -- not pinned (9.1.0 starts at 20).
+    when: Evaluates("set a [oo::object new]; set ia [info object creationid $a]; set b [oo::object new]; set ib [info object creationid $b]; list [string match {::oo::Obj*} $a] [expr {$ib == $ia + 1}] [expr {[info object creationid $a] == $ia}] [expr {$ib > $ia}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 1"
+    -- probe: oo_objcount91 (normalized name; ids are relational)
+}
+
+rule AnonymousObjectIdNotRecycledAfterDestroy {
+    -- Destroying an object does not reuse its creation id.
+    when: Evaluates("set a [oo::object new]; set ia [info object creationid $a]; $a destroy; set b [oo::object new]; expr {[info object creationid $b] > $ia}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: oo_objcount91
+}
+
+rule InfoObjectIsaCategories {
+    -- info object isa distinguishes object/class/typeof categories; an
+    -- instance is not a class, its class is.
+    when: Evaluates("oo::class create IsaP {}; IsaP create i; list [info object isa object i] [info object isa class i] [info object isa class IsaP] [info object isa typeof i IsaP]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 1 1"
+    -- probe: oo_features91
+}
+
+open question "OO object counter base: tclsh 9.1.0 starts anonymous names at ::oo::Obj20; rtcl's pre-created set differs. The spec pins name shape and creationid relations, not the absolute base."

@@ -264,6 +264,42 @@ rule BinaryScanShortInputLeavesVarsUnset {
     ensures: completion.value = "0 0"
 }
 
+-- ── 9.1 binary float bit fidelity (T7, 2026-11-27) ──────────────
+-- Probe: pbr6_float_bits. 9.1.0 emits canonical IEEE-754 bits; the old
+-- rtcl saturation to 7f7fffff / 7fefffffffffffff is a code divergence.
+
+rule BinaryFormatFloatNonFiniteBits {
+    -- Single precision canonical bits: Inf/-Inf/NaN/-0.0.
+    when: Evaluates("list [binary encode hex [binary format R Inf]] [binary encode hex [binary format R -Inf]] [binary encode hex [binary format R NaN]] [binary encode hex [binary format R -0.0]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "7f800000 ff800000 7fc00000 80000000"
+    -- probe: pbr6_float_bits
+}
+
+rule BinaryFormatDoubleNonFiniteBits {
+    -- Double precision canonical bits: Inf/-Inf/NaN/-0.0.
+    when: Evaluates("list [binary encode hex [binary format Q Inf]] [binary encode hex [binary format Q -Inf]] [binary encode hex [binary format Q NaN]] [binary encode hex [binary format Q -0.0]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "7ff0000000000000 fff0000000000000 7ff8000000000000 8000000000000000"
+    -- probe: pbr6_float_bits
+}
+
+rule BinaryFormatLittleEndianFloatBits {
+    -- The r/q forms are the byte-reversed R/Q forms.
+    when: Evaluates("list [binary encode hex [binary format r Inf]] [binary encode hex [binary format r NaN]] [binary encode hex [binary format q Inf]] [binary encode hex [binary format q NaN]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0000807f 0000c07f 000000000000f07f 000000000000f87f"
+    -- probe: pbr6_float_bits
+}
+
+rule BinaryScanRoundTripsNonFinite {
+    -- Scanning the canonical bytes recovers Inf/-Inf.
+    when: Evaluates("list [binary scan [binary format R Inf] R x] $x [binary scan [binary format Q -Inf] Q y] $y")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 Inf 1 -Inf"
+    -- probe: pbr6_float_bits
+}
+
 -- ── clock ─────────────────────────────────────────────────────────
 
 rule ClockFormatUsesLocalTimezone {

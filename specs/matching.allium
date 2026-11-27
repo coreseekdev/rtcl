@@ -41,13 +41,14 @@ rule RegexpLookbehindIsCompileError {
     --   (a superset of tclsh)  [D-17]
 }
 
-rule RegexpRejectsNonCapturingGroups {
-    -- Tcl ARE has no (?:...) syntax: tclsh rejects it as
-    -- "invalid quantifier operand".
+rule RegexpAcceptsNonCapturingGroups {
+    -- Tcl ARE does support (?:...) non-capturing groups (it is (?<...) /
+    -- lookbehind that is absent).
     when: Evaluates("regexp {(?:ab|a)(?=c)} abc")
-    ensures: completion.code = error
-    -- oracle: cannot compile regular expression pattern: invalid quantifier operand
-    -- rtcl: accepts (?: via the regex crate — superset, same family as D-18)
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: 2026-11-27 tclsh9.1 (8.6.17 also accepts; the old
+    --   RegexpRejectsNonCapturingGroups rule was wrong)
 }
 
 rule RegexpUnicodeEscapeIsAccepted {
@@ -87,16 +88,17 @@ rule RegsubBackrefsAndEscapes {
     -- backslash in the replacement.
     when: Evaluates("list [regsub {(\\w)(\\w)} hi {\\2\\1&}] [regsub {x} x {\\\\&}]")
     ensures: completion.code = ok
-    ensures: completion.value = "ihhi \\x"
+    ensures: completion.value = "ihhi {\\x}"
+    -- probe: 2026-11-27 tclsh9.1 (list quotes the backslash element)
 }
 
-rule RegsubHasNoCommandOption {
-    -- tclsh 8.6 regsub has no -command option.
-    when: Evaluates("regsub -command {o} foo up x")
-    ensures: completion.code = error
-    -- oracle: bad option "-command": must be -all, -nocase, -expanded,
-    --   -line, -linestop, -lineanchor, -start, or --
-    -- rtcl: -command is an rtcl-only extension  [D-21]
+rule RegsubRejectsUnknownOption {
+    -- 9.1 regsub option menu includes -command; anything else is a bad
+    -- option.
+    when: Evaluates("catch {regsub -bogus {o} foo up x} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"-bogus\": must be -all, -command, -expanded, -line, -linestop, -lineanchor, -nocase, -start, or --"
+    -- probe: 2026-11-27 tclsh9.1
 }
 
 -- ── string match ──────────────────────────────────────────────────

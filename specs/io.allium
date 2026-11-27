@@ -17,11 +17,9 @@ given {
 
 rule GetsAtEofReturnsMinusOneAndEmptiesVar {
     -- gets at EOF returns -1 and (with varName) sets the variable to
-    -- ""; eof is 1 only after the read that hit EOF.
-    when: Evaluates("list $n $v $e1 $n2 $e2 [info exists v]")
-    -- after: set f [open F w]; puts $f hello; close $f;
-    --        set f [open F r]; set n [gets $f v]; set e1 [eof $f];
-    --        set n2 [gets $f v]; set e2 [eof $f]
+    -- ""; eof is 1 only after the read that hit EOF. The successful read
+    -- must be captured before the EOF read overwrites the variable.
+    when: Evaluates("set f [open /tmp/rtcl_spec_gets.txt w]; puts $f hello; close $f; set f [open /tmp/rtcl_spec_gets.txt r]; set n [gets $f v]; set got $v; set e1 [eof $f]; set n2 [gets $f v]; set e2 [eof $f]; close $f; list $n $got $e1 $n2 $e2 [info exists v]")
     ensures: completion.code = ok
     ensures: completion.value = "5 hello 0 -1 1 1"
 }
@@ -29,16 +27,14 @@ rule GetsAtEofReturnsMinusOneAndEmptiesVar {
 rule ReadCountIsCharactersNotBytes {
     -- read chan N reads N characters through the channel encoding, not
     -- N bytes.
-    when: Evaluates("string length [read $f 3]")
-    -- after: file contains "héllo" (6 bytes UTF-8)
+    when: Evaluates("set f [open /tmp/rtcl_spec_read.txt w]; fconfigure $f -encoding utf-8; puts -nonewline $f \"héllo\"; close $f; set f [open /tmp/rtcl_spec_read.txt r]; set n [string length [read $f 3]]; close $f; set n")
     ensures: completion.code = ok
     ensures: completion.value = "3"
     -- rtcl: 2 (reads 3 bytes = "hé")  [D-31]
 }
 
 rule ReadZeroDoesNotSetEof {
-    when: Evaluates("eof $f")
-    -- after: read $f 0 on a channel with data remaining
+    when: Evaluates("set f [open /tmp/rtcl_spec_read.txt r]; read $f 0; set e [eof $f]; close $f; set e")
     ensures: completion.code = ok
     ensures: completion.value = "0"
     -- rtcl: 1 (read 0 marks at_eof)  [D-31]
@@ -47,8 +43,7 @@ rule ReadZeroDoesNotSetEof {
 rule ReadWriteFileInterleavesAtOnePosition {
     -- An r+ channel has ONE shared position: after reading 2 chars the
     -- next write overwrites in place ("AAB"), not appends.
-    when: Evaluates("[read $f]")
-    -- after: open w+; puts AAAA; seek 0; read 2; puts B; close; read back
+    when: Evaluates("set f [open /tmp/rtcl_spec_rw.txt w+]; puts -nonewline $f AAA; seek $f 0; read $f 2; puts -nonewline $f B; close $f; set f [open /tmp/rtcl_spec_rw.txt r]; set s [read $f]; close $f; set s")
     ensures: completion.code = ok
     ensures: completion.value = "AAB"
     -- rtcl: "AAAA\nB" — BufReader prefetch desyncs the write offset

@@ -44,8 +44,7 @@ rule TraceRemoveRemovesOneExactMatch {
     -- remove deletes ONE registration per call (exact op-list +
     -- callback-prefix match); duplicate registrations each need their
     -- own remove. No match is a silent no-op.
-    when: Evaluates("llength [trace info variable x]")
-    -- after: two identical `trace add variable x write cb`; one remove
+    when: Evaluates("proc cb {args} {}; trace add variable x write cb; trace add variable x write cb; trace remove variable x write cb; llength [trace info variable x]")
     ensures: completion.code = ok
     ensures: completion.value = "1"
     -- rtcl: FIXED 2026-11-04（逐条删）
@@ -222,8 +221,7 @@ rule ExecTraceRecordRemovedMidfireStaysSilent {
 rule ExecTraceHandlerErrorPropagates {
     -- An error inside a leave/enterstep/leavestep handler replaces the
     -- command's result with the error and KEEPS the trace registration.
-    when: Evaluates("list $m [llength [trace info execution foo]]")
-    -- after: leave handler errors; catch {foo} m
+    when: Evaluates("proc foo {} {}; proc h {args} {error LE}; trace add execution foo leave h; catch {foo} m; list $m [llength [trace info execution foo]]")
     ensures: completion.code = ok
     ensures: completion.value = "LE 1"
     -- rtcl: FIXED 2026-11-05（恒传播 + 记录保留）[D-39]

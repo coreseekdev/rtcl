@@ -142,12 +142,13 @@ rule PackageFilesListsScripts {
 }
 
 rule TclNamespaceCommandSet {
-    -- The ::tcl::* command set has 18 entries on 9.1.0 (not the 27 in the
-    -- old migration note); tcl::process is present.
+    -- The ::tcl::* command set has 17 entries in a fresh 9.1.0 (the old
+    -- migration note said 27 vs 23); tcl::process is present. Loading
+    -- packages may add entries (msgcat adds MacOSXPkgUnknown).
     when: Evaluates("list [llength [info commands ::tcl::*]] [llength [lsearch -exact [info commands ::tcl::*] ::tcl::process]]")
     ensures: completion.code = ok
-    ensures: completion.value = "18 1"
-    -- probe: 2026-11-27 tclsh9.1
+    ensures: completion.value = "17 1"
+    -- probe: 2026-11-27 tclsh9.1 (fresh interpreter)
 }
 
 -- ── 9.1 unsupported::assemble (T7, 2026-11-27) ──────────────────

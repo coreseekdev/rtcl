@@ -162,12 +162,13 @@ rule JoinUsesSeparator {
 -- Probes: lpop91, lseq91, lfilter91; re-run on tclsh 9.1.0.
 
 rule LpopMutatesListVariable {
-    -- lpop removes and returns the element at index (default 0) from the
-    -- named variable; a nested index path descends into sublists.
+    -- lpop removes and returns the element at index; the default index is
+    -- the LAST element (lpop l 0 pops the first). A nested index path
+    -- descends into sublists.
     when: Evaluates("set l {a b c d}; list [lpop l] $l")
     ensures: completion.code = ok
-    ensures: completion.value = "a {b c d}"
-    -- probe: lpop91 (lpop n 1 2 => f; n => {{a b c} {d e} {g h i}})
+    ensures: completion.value = "d {a b c}"
+    -- probe: lpop91 (lpop l 0 => a; lpop nested 1 2 => f)
 }
 
 rule LremoveReturnsFilteredCopy {

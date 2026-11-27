@@ -110,7 +110,7 @@ rule EmptySuperclassResetsToObject {
 rule MixinCycleDetectedAtDefinition {
     -- An indirect mixin cycle (M mixins A, A's superclass is M) is an
     -- error at definition time.
-    when: Evaluates("catch {oo::define M {mixin A}} m; set m")
+    when: Evaluates("oo::class create M; oo::class create A {superclass M}; catch {oo::define M {mixin A}} m; set m")
     ensures: completion.code = ok
     ensures: completion.value = "may not mix a class into itself"
     -- rtcl: FIXED 2026-11-05（DFS mixin+superclass 边）[D-41]
@@ -256,7 +256,7 @@ rule InfoStubbedSubcommands {
     -- and info object filters/forward/methodtype/definition are all
     -- implemented in tclsh 8.6 (empty result when unset; definition's
     -- usage is objName methodName).
-    when: Evaluates("catch {info object filters o} m; set m")
+    when: Evaluates("oo::object create o; catch {info object filters o} m; set m")
     ensures: completion.code = ok
     ensures: completion.value = ""
     -- rtcl: FIXED 2026-11-05（filters/constructor/destructor；

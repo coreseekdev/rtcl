@@ -99,8 +99,7 @@ rule ArrayNamesListsKeys {
 }
 
 rule ArrayExistsAndSize {
-    when: Evaluates("list [array exists a] [array exists nope] [array size a]")
-    -- after: array set a {x 1 y 2}
+    when: Evaluates("array set a {x 1 y 2}; list [array exists a] [array exists nope] [array size a]")
     ensures: completion.code = ok
     ensures: completion.value = "1 0 2"
     -- also: array set a {}; array size a => 0 (empty array EXISTS as array)
@@ -109,8 +108,7 @@ rule ArrayExistsAndSize {
 rule UnsetElementShrinksArray {
     -- Unsetting the last element of an array leaves the array variable
     -- itself existing (with zero elements).
-    when: Evaluates("list [array size a] [info exists a]")
-    -- after: array set a {x 1 y 2}; unset a(x)
+    when: Evaluates("array set a {x 1 y 2}; unset a(x); list [array size a] [info exists a]")
     ensures: completion.code = ok
     ensures: completion.value = "1 1"
 }
@@ -302,7 +300,7 @@ rule NsBodyArrayElementStaysInNamespace {
 }
 
 rule WhichVariableReportsNsVar {
-    when: Evaluates("namespace eval d {namespace which -variable v}")
+    when: Evaluates("namespace eval d {variable v; namespace which -variable v}")
     ensures: completion.code = ok
     ensures: completion.value = "::d::v"
     -- probe: namespace eval d {variable v; puts [namespace which -variable v]}

@@ -2,8 +2,8 @@
 -- io.allium
 -- Behaviour spec: channels, IO, file, encoding — open/puts/gets/read/
 -- seek/eof/close/fconfigure/chan/file/glob/source, CLI exit semantics.
--- Oracle: tclsh 9.1.0 (core-9-1-0). A/B rules re-anchored 2026-11-27;
--- remaining C-class coverage tracked in HANDOFF-SPEC-910.md §8.
+-- Oracle: tclsh 9.1.0 (core-9-1-0). A/B + T3 rules re-anchored
+-- 2026-11-27; remaining C-class coverage tracked in HANDOFF-SPEC-910.md §8.
 -- rtcl divergences from this spec are tracked in DIVERGENCES.md
 -- (D-29 … D-34；glob 归 D-26；台账为准).
 
@@ -167,6 +167,96 @@ rule EncodingUserMatchesSystem {
     ensures: completion.value = "utf-8 utf-8"
     -- probe 2026-11-27 tclsh9.1 on Linux
     -- rtcl: user subcommand absent.
+}
+
+-- ── 9.1 channels/encoding (T3, 2026-11-27) ──────────────────────
+-- Probes: chan_copy_modes, chan_eofchar, chan_io_p3/p4/p7-p9/p11/p16/
+-- p22, chan_names_order, chan_seek_tell. Re-run on tclsh 9.1.0.
+
+rule EncodingBinaryNameRemoved {
+    -- Tcl 9 removed the "binary" encoding; the error points at the two
+    -- supported replacements.
+    when: Evaluates("set f [open /tmp/rtcl_spec910_w w]; set c [catch {fconfigure $f -encoding binary} m]; close $f; list $c [string match {unknown encoding \"binary\": No longer supported*} $m]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+    -- probe: chan_copy_modes/chan_eofchar (binary pairs), doc/encoding.n
+}
+
+rule FconfigureProfileDefaultsStrict {
+    -- -profile defaults to strict; bad values name the three profiles.
+    when: Evaluates("set f [open /tmp/rtcl_spec910_w w]; list [fconfigure $f -profile] [catch {fconfigure $f -profile bogus} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "strict 1 {bad profile name \"bogus\": must be replace, strict, or tcl8}"
+    -- errorCode: TCL ENCODING PROFILE bogus ; probe: chan_io_p9
+}
+
+rule FconfigureStatReportsMetadata {
+    -- -stat returns the file metadata dict (dev/ino/type at least).
+    when: Evaluates("set f [open /tmp/rtcl_spec910_w w]; set s [fconfigure $f -stat]; close $f; list [dict exists $s dev] [dict exists $s ino] [dict exists $s type] [dict get $s type]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 file"
+    -- probe: chan_io_p9 among the fconfigure option table
+}
+
+rule FconfigureEofcharOutputFaceRemoved {
+    -- An input eofchar is still settable (returns ""); the two-element
+    -- [in out] form is rejected because the output face was removed.
+    when: Evaluates("set f [open /tmp/rtcl_spec910_w w]; set r [list [fconfigure $f -eofchar [format %c 26]] [catch {fconfigure $f -eofchar [list {} [format %c 3]]} m] $m]; close $f; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 1 {bad value for -eofchar: must be non-NUL ASCII character}"
+    -- probe: chan_io_p7/p16/p22
+}
+
+rule ChanIsBinaryTracksTranslation {
+    -- chan isbinary is 1 only when the channel's translation is binary.
+    when: Evaluates("set f [open /tmp/rtcl_spec910_w w]; set a [chan isbinary $f]; fconfigure $f -translation binary; set b [chan isbinary $f]; close $f; list $a $b")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 1"
+    -- probe: chan_io_p3 (isbinary is in the subcommand table)
+}
+
+rule ChanNamesFiltersStdChannels {
+    -- chan names patterns select channels; *out* is stdout, a non-match is
+    -- empty. The full order is hash-table order, so it is not pinned here.
+    when: Evaluates("list [chan names *out*] [chan names nope*]")
+    ensures: completion.code = ok
+    ensures: completion.value = "stdout {}"
+    -- probe: chan_names_order/chan_io_p8 (fileN interleave by bucket)
+}
+
+rule ChanNamesCountsOpenFiles {
+    -- Each open file adds exactly one fileN channel; close removes it.
+    when: Evaluates("set a [llength [chan names file*]]; set f [open /tmp/rtcl_spec910_w w]; set b [llength [chan names file*]]; close $f; set c [llength [chan names file*]]; list [expr {$b-$a}] [expr {$c-$a}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+    -- probe: chan_names_order
+}
+
+rule FconfigureErrorsUseTclValueNumber {
+    -- Bad option values share the unified TCL VALUE NUMBER errorCode (the
+    -- pre-9.1 POSIX/other tails are gone).
+    when: Evaluates("set f [open /tmp/rtcl_spec910_w w]; catch {fconfigure $f -buffersize bogus} m; close $f; list $m $::errorCode")
+    ensures: completion.code = ok
+    ensures: completion.value = "{expected integer but got \"bogus\"} {TCL VALUE NUMBER}"
+    -- probe: chan_io_p11/p16/p22, incr_window_p*
+}
+
+rule ChannelReadStrictProfileRejectsBadBytes {
+    -- Default strict profile: reading invalid UTF-8 raises an EILSEQ-class
+    -- error rather than substituting.
+    when: Evaluates("set h [open /tmp/rtcl_spec910_bad.bin w]; fconfigure $h -translation binary; puts -nonewline $h [binary format H* 61ff62]; close $h; set h [open /tmp/rtcl_spec910_bad.bin r]; set c [catch {read $h} m]; close $h; list $c [string match {*invalid or incomplete multibyte*} $m]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+    -- probe: chan_io_p9 (profile strict is the default)
+}
+
+rule SourceDefaultsToStrictUtf8 {
+    -- source reads as strict UTF-8; bad bytes are a read error, not a
+    -- silently evaluated script.
+    when: Evaluates("set h [open /tmp/rtcl_spec910_src.bin w]; fconfigure $h -translation binary; puts -nonewline $h [binary format H* 736574207820310aff]; close $h; set c [catch {source /tmp/rtcl_spec910_src.bin} m]; list $c [string match {couldn't read file*} $m]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+    -- probe: doc/source.n (default system encoding, strict UTF-8 here)
 }
 
 -- ── file ──────────────────────────────────────────────────────────

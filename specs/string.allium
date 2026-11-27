@@ -1,8 +1,8 @@
 -- allium: 3
 -- string.allium
 -- Behaviour spec: Tcl string commands. Oracle: tclsh 9.1.0 (core-9-1-0).
--- T1 rules re-anchored 2026-11-27; T2 (64-bit indices) and T3 (Unicode
--- classes) coverage tracked in HANDOFF-SPEC-910.md §8.
+-- T1/T3 rules re-anchored 2026-11-27; T2 (64-bit indices) coverage
+-- tracked in HANDOFF-SPEC-910.md §8.
 --
 -- Indices in Tcl strings are character-based, never byte offsets.  For
 -- the BMP (all of tclsh 8.6's practical surface) tclsh counts UCS-2
@@ -113,4 +113,32 @@ rule StringIsWideIntegerExcludesBignum {
     ensures: completion.code = ok
     ensures: completion.value = "1 0 1"
     -- probe: s_probe
+}
+
+-- ── 9.1 Unicode classes / dict class (T3, 2026-11-27) ────────────
+
+rule StringIsDictClass {
+    -- 9.1 adds the dict class (a well-formed even-sized list).
+    when: Evaluates("list [string is dict {a 1 b 2}] [string is dict {a}] [string is dict {}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 1"
+    -- probe: probe5/probe9
+}
+
+rule StringIsDigitCoversUnicode18 {
+    -- Unicode 18.0 digit data: Adlam, Devanagari and mathematical digits
+    -- are all digits.
+    when: Evaluates("list [string is digit [format %c 0x1E950]] [string is digit ९] [string is digit 𝟘]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1"
+    -- probe: probe5/probe6
+}
+
+rule StringIsAmbiguousClassNamesTheMenu {
+    -- A one-letter class abbreviation that matches several classes is an
+    -- ambiguity error carrying the full 9.1 class menu.
+    when: Evaluates("catch {string is a x} m; string match {ambiguous class \"a\": must be alnum, alpha, ascii, control, boolean, dict, digit, double, entier, false, graph, integer, list, lower, print, punct, space, true, upper, wideinteger, wordchar, or xdigit} $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: probe9 (bad class "bogus" uses the same menu)
 }

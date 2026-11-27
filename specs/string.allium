@@ -1,8 +1,7 @@
 -- allium: 3
 -- string.allium
 -- Behaviour spec: Tcl string commands. Oracle: tclsh 9.1.0 (core-9-1-0).
--- T1/T3 rules re-anchored 2026-11-27; T2 (64-bit indices) coverage
--- tracked in HANDOFF-SPEC-910.md §8.
+-- T1/T2/T3 rules re-anchored 2026-11-27.
 --
 -- Indices in Tcl strings are character-based, never byte offsets.  For
 -- the BMP (all of tclsh 8.6's practical surface) tclsh counts UCS-2
@@ -141,4 +140,33 @@ rule StringIsAmbiguousClassNamesTheMenu {
     ensures: completion.code = ok
     ensures: completion.value = "1"
     -- probe: probe9 (bad class "bogus" uses the same menu)
+}
+
+-- ── 9.1 index expressions and 64-bit range (T2, 2026-11-27) ─────
+-- Probes: ix1-ix6, cmp_string_index; re-run on tclsh 9.1.0.
+
+rule StringIndexAcceptsOneOffsetTerm {
+    -- An index is an integer literal optionally followed by one signed
+    -- integer offset (end-1, 0x1+1, 1++1); no whitespace inside.
+    when: Evaluates("list [string index abcdefgh 1+1] [string index abcdefgh 0x1+1] [string index abcdefgh 1++1] [string index abcdefgh end-1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "c c c g"
+    -- probe: ix1/ix3/ix6
+}
+
+rule StringIndexRejectsChainedTerms {
+    -- A second offset term is a bad index, not left-to-right arithmetic.
+    when: Evaluates("catch {string index abcdefgh 1+1+1} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad index \"1+1+1\": must be integer?[+-]integer? or end?[+-]integer?"
+    -- probe: ix1 (same text for 1+, x+1, 1.5, empty)
+}
+
+rule StringIndexIs64Bit {
+    -- Index arithmetic is 64-bit: values beyond the 32-bit range are not
+    -- wrapped; an out-of-range index is simply empty.
+    when: Evaluates("list [string index abcdefgh 4294967296] [string index abcdefgh -4294967295] [string index abcdefgh 9223372036854775807] [string range ab 2147483647 2147483647]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {} {} {}"
+    -- probe: ix3/ix4/ix5
 }

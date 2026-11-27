@@ -2,8 +2,9 @@
 -- matching.allium
 -- Behaviour spec: pattern matching and value formatting — regexp /
 -- regsub (Tcl ARE), string match (glob), format / scan, binary, clock.
--- Oracle: tclsh 9.1.0 (core-9-1-0). T1 (format/scan) re-anchored
--- 2026-11-27; T7 (regex/binary) coverage tracked in HANDOFF-SPEC-910.md §8.
+-- Oracle: tclsh 9.1.0 (core-9-1-0). T1 (format/scan) and T7 regex wording
+-- re-anchored 2026-11-27; assemble/binary coverage tracked in
+-- HANDOFF-SPEC-910.md §8.
 -- rtcl divergences from this spec are tracked in DIVERGENCES.md
 -- (D-18 … D-27；台账为准).
 
@@ -34,7 +35,7 @@ rule RegexpLookbehindIsCompileError {
     -- 8.6 ARE; both fail to compile.
     when: Evaluates("regexp {(?<!x)y} xy")
     ensures: completion.code = error
-    -- oracle: couldn't compile regular expression pattern: quantifier operand invalid
+    -- oracle: cannot compile regular expression pattern: invalid quantifier operand
     -- rtcl: fast-engine routing misses (?<= / (?<! and leaks the Rust
     --   regex-crate parse error; the BT fallback would answer 0/1
     --   (a superset of tclsh)  [D-17]
@@ -42,10 +43,10 @@ rule RegexpLookbehindIsCompileError {
 
 rule RegexpRejectsNonCapturingGroups {
     -- Tcl ARE has no (?:...) syntax: tclsh rejects it as
-    -- "quantifier operand invalid".
+    -- "invalid quantifier operand".
     when: Evaluates("regexp {(?:ab|a)(?=c)} abc")
     ensures: completion.code = error
-    -- oracle: couldn't compile regular expression pattern: quantifier operand invalid
+    -- oracle: cannot compile regular expression pattern: invalid quantifier operand
     -- rtcl: accepts (?: via the regex crate — superset, same family as D-18)
 }
 
@@ -54,7 +55,7 @@ rule RegexpRejectsUnicodeEscapes {
     -- 8.6 ARE (\x41 two-digit hex IS valid).
     when: Evaluates("regexp {\\u0041} A")
     ensures: completion.code = error
-    -- oracle: couldn't compile regular expression pattern: invalid escape \ sequence
+    -- oracle: cannot compile regular expression pattern: invalid escape \ sequence
     -- rtcl: accepts, matches literal 'A'  [D-18]
 }
 
@@ -295,6 +296,15 @@ rule GlobMatchesTclGlobSemantics {
     -- rtcl: uses the Rust glob crate: ** recursion + {} alternation +
     --   leading-dot matching diverge  [D-25]
     -- probe: glob -nocomplain **/*.md  — rtcl recurses; tclsh does not
+}
+
+rule RegexpCompileErrorWording {
+    -- 9.1 says "cannot" (not "couldn't") and "invalid quantifier operand"
+    -- (not the 8.6 "quantifier operand invalid"); the errorCode detail follows.
+    when: Evaluates("catch {regexp {a**} x} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "cannot compile regular expression pattern: invalid quantifier operand"
+    -- probe: p6/v_re (regsub uses the same wording)
 }
 
 -- ── 9.1 regsub -command (T4, 2026-11-27) ────────────────────────

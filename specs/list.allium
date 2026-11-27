@@ -2,8 +2,7 @@
 -- list.allium
 -- Behaviour spec: Tcl list values and list commands
 -- (list, llength, lindex, lrange, lset, lsort, lsearch, concat/split/join).
--- Oracle: tclsh 9.1.0 (core-9-1-0). T4 rules re-anchored 2026-11-27;
--- T2 (64-bit indices) coverage tracked in HANDOFF-SPEC-910.md §8.
+-- Oracle: tclsh 9.1.0 (core-9-1-0). T2/T4 rules re-anchored 2026-11-27.
 
 use "./interp.allium" as interp
 
@@ -214,4 +213,13 @@ rule LsearchStrideGroupsElements {
     ensures: completion.code = ok
     ensures: completion.value = "3 2"
     -- probe: 2026-11-27 tclsh9.1; stride 0 => "stride length must be at least 1"
+}
+
+rule ListIndicesUseIndexExpressionGrammar {
+    -- lindex/lrange/lsort -index share the string-index expression grammar
+    -- (one offset term), including the 64-bit range (T2).
+    when: Evaluates("list [lindex {a b c d} 1+1] [lrange {a b c d} 1+1 end-1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "c c"
+    -- probe: ix1/ix3 (lsort -index 1+0 works; string repeat counts do not)
 }

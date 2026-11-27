@@ -132,6 +132,24 @@ rule TimerateReportsRateShape {
     -- probe: 2026-11-27 tclsh9.1
 }
 
+rule PackageFilesListsScripts {
+    -- package files lists the script files of a loaded package (msgcat
+    -- ships two here: pkgIndex.tcl and msgcat.tcl).
+    when: Evaluates("package require msgcat; list [llength [package files msgcat]] [file tail [lindex [package files msgcat] 0]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "2 pkgIndex.tcl"
+    -- probe: 2026-11-27 tclsh9.1
+}
+
+rule TclNamespaceCommandSet {
+    -- The ::tcl::* command set has 18 entries on 9.1.0 (not the 27 in the
+    -- old migration note); tcl::process is present.
+    when: Evaluates("list [llength [info commands ::tcl::*]] [llength [lsearch -exact [info commands ::tcl::*] ::tcl::process]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "18 1"
+    -- probe: 2026-11-27 tclsh9.1
+}
+
 -- ── 9.1 unsupported::assemble (T7, 2026-11-27) ──────────────────
 -- Probes: cmp_assemble, unsupported_assemble; 9.1.0 instruction menu.
 

@@ -267,6 +267,15 @@ rule ExecEncodingDecodesChildOutput {
     -- probe: 2026-11-27 tclsh9.1 on Linux
 }
 
+rule SocketNodelayAndKeepalive {
+    -- TCP sockets expose -nodelay/-keepalive as boolean channel options,
+    -- default 0 and settable to 1.
+    when: Evaluates("proc accept {chan addr port} {close $chan}; set srv [socket -server accept 0]; set port [lindex [fconfigure $srv -sockname] 2]; set c [socket 127.0.0.1 $port]; set r [list [fconfigure $c -nodelay] [fconfigure $c -keepalive]]; fconfigure $c -nodelay 1; fconfigure $c -keepalive 1; lappend r [fconfigure $c -nodelay] [fconfigure $c -keepalive]; close $c; close $srv; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0 1 1"
+    -- probe: 2026-11-27 tclsh9.1 loopback (port 0 ephemeral)
+}
+
 -- ── file ──────────────────────────────────────────────────────────
 
 rule FileMtimeSetterSets {

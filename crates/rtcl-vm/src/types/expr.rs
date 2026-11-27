@@ -656,6 +656,7 @@ impl<'a> ExprParser<'a> {
                 || self.peek() == '+'
                 || self.peek() == '~'
                 || self.peek() == '!'
+                || self.peek() == '"'
                 || self.peek().is_ascii_alphabetic()
             {
                 // tclsh: -9223372036854775808 is a valid integer literal
@@ -681,7 +682,10 @@ impl<'a> ExprParser<'a> {
             self.pos = saved;
         }
         if self.match_op("+") {
-            return self.nested(|p| p.parse_unary());
+            // 9.1：一元 + 是数值断言（`+"a"` → cannot use non-numeric
+            // string "a" as operand of "+"；NaN 报浮点类），不是恒等。
+            let val = self.nested(|p| p.parse_unary())?;
+            return expr_ops::op_pos(&val);
         }
         self.parse_primary()
     }
@@ -1355,8 +1359,22 @@ impl<'a> ExprParser<'a> {
     }
 
     fn skip_whitespace(&mut self) {
-        while !self.is_at_end() && self.peek().is_whitespace() {
-            self.advance();
+        loop {
+            while !self.is_at_end() && self.peek().is_whitespace() {
+                self.advance();
+            }
+            // TIP582（9.0 新特性）：`#` 到行尾是注释，词法上等价于空白
+            // ——token 边界处均可出现（`expr {1 # + 2}` → 1；
+            // `expr {max# c\n(1,2)}` 函数名与 `(` 之间的注释也吃）。
+            // 字符串/变量名/函数名内部的 `#` 在各自的 token 扫描里消费，
+            // 到不了这里。
+            if !self.is_at_end() && self.peek() == '#' {
+                while !self.is_at_end() && self.peek() != '\n' {
+                    self.advance();
+                }
+                continue;
+            }
+            break;
         }
     }
 

@@ -1047,6 +1047,32 @@ impl Interp {
         }
     }
 
+    /// `$env` 镜像同步（B2 登记项，E1 批）：env 数组元素 set/unset 直通
+    /// 进程环境——tclsh 的 env 写落 putenv/unsetenv，exec / open |cmd
+    /// 的子进程即时可见（oracle 钉形：set 后 printenv 可见、空值也算
+    /// "已设置"；unset 后子进程不可见）。非法键/值（空键、含 '=' 或
+    /// NUL）Rust 会 panic——静默跳过，tcl 端数组语义不变。
+    #[cfg(feature = "env")]
+    fn env_proc_sync(&mut self, base: &str, index: &str, value: Option<&Value>) {
+        if base != "env" {
+            return;
+        }
+        let sane = !index.is_empty()
+            && !index.bytes().any(|b| b == b'=' || b == 0)
+            && value.map_or(true, |v| !v.as_str().bytes().any(|b| b == 0));
+        if !sane {
+            return;
+        }
+        match value {
+            Some(v) => std::env::set_var(index, v.as_str()),
+            None => std::env::remove_var(index),
+        }
+    }
+
+    /// 非 env 构建桩：无进程环境可同步（wasm）。
+    #[cfg(not(feature = "env"))]
+    fn env_proc_sync(&mut self, _base: &str, _index: &str, _value: Option<&Value>) {}
+
     /// Remove an entire array: all element keys, the array marker, and the
     /// base key (tclsh: `unset arr` kills the array itself).
     fn loc_remove_array(&mut self, loc: &VarLoc) {
@@ -1967,6 +1993,7 @@ impl Interp {
                     self.bump_stamp(&loc);
                     self.loc_elem_count_bump(&loc, 1);
                 }
+                self.env_proc_sync(&base, &idx, Some(&value));
             } else if self.loc_base_exists(&loc) {
                 let base = name.split('(').next().unwrap_or(name);
                 crate::interp::commands::list::set_error_code(
@@ -1986,6 +2013,7 @@ impl Interp {
                 let key = loc.element_key(index);
                 self.loc_insert(&loc, key, value.clone());
                 self.loc_elem_count_bump(&loc, 1);
+                self.env_proc_sync(&base, &idx, Some(&value));
             }
             self.clear_phantom(&base, &idx);
             // Write traces fire after the write lands; a trace error is
@@ -2498,6 +2526,7 @@ impl Interp {
                     self.bump_stamp(&loc);
                     self.loc_elem_count_bump(&loc, -1);
                     self.clear_phantom(&base, &idx);
+                    self.env_proc_sync(&base, &idx, None);
                     // Unset traces fire after deletion; errors are
                     // discarded (tclsh: the unset still succeeds).
                     // 9.1：元素 unset 的 name1 = unset 写下的全名

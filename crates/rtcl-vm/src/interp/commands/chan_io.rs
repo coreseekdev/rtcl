@@ -343,7 +343,7 @@ fn finish_gets(interp: &mut Interp, args: &[Value], line: Option<&str>) -> Resul
 
 pub fn cmd_seek(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 3 || args.len() > 4 {
-        return Err(Error::wrong_args_with_usage("seek", 3, args.len(), "seek channelId offset ?origin?"));
+        return Err(Error::wrong_args_with_usage("seek", 3, args.len(), "channel offset ?origin?"));
     }
     let chan_id = args[1].as_str();
     let offset = args[2].as_int().ok_or_else(|| {
@@ -402,7 +402,7 @@ pub fn cmd_seek(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 pub fn cmd_tell(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(Error::wrong_args_with_usage("tell", 2, args.len(), "tell channelId"));
+        return Err(Error::wrong_args_with_usage("tell", 2, args.len(), "channel"));
     }
     let chan_id = args[1].as_str();
     if !interp.channels.contains(chan_id) {
@@ -426,7 +426,7 @@ pub fn cmd_tell(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 pub fn cmd_eof(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(Error::wrong_args_with_usage("eof", 2, args.len(), "eof channelId"));
+        return Err(Error::wrong_args_with_usage("eof", 2, args.len(), "channel"));
     }
     let chan_id = args[1].as_str();
     // `chan create` channels report EOF through their read handler.
@@ -444,7 +444,7 @@ pub fn cmd_eof(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 pub fn cmd_flush(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(Error::wrong_args_with_usage("flush", 2, args.len(), "channelId"));
+        return Err(Error::wrong_args_with_usage("flush", 2, args.len(), "channel"));
     }
     let chan_id = args[1].as_str();
     if !interp.channels.contains(chan_id) {
@@ -464,7 +464,7 @@ pub fn cmd_flush(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 pub fn cmd_fblocked(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(Error::wrong_args_with_usage("fblocked", 2, args.len(), "channelId"));
+        return Err(Error::wrong_args_with_usage("fblocked", 2, args.len(), "channel"));
     }
     let chan_id = args[1].as_str();
     if interp.reflected.contains_key(chan_id) {
@@ -540,25 +540,15 @@ fn sock_addr_err(_interp: &mut Interp, _which: &str, _e: &std::io::Error) -> Err
     Error::runtime("sockets not built", crate::error::ErrorCode::Io)
 }
 
-/// Render an `-eofchar` query the way Tcl does: single-access channels
-/// report a one-element list, read/write channels a two-element list.
-fn eofchar_query(ch_read: bool, ch_write: bool, in_c: Option<char>, out_c: Option<char>) -> Value {
-    // Tcl renders a single-access query as a one-element list, so an
-    // unset character shows up as the braced empty string "{}".
-    let v = |c: Option<char>| match c {
+/// Render an `-eofchar` query the 9.1 way: the write-side eofchar is
+/// gone (9.0 移除)，query 只报读侧——设置了非零字符报该字符，否则空串
+///（tclsh 9.1 实测：rw 通道也是单值，`fconfigure $f -eofchar` →
+/// `` 或 `z`；不再有 8.6 的二元组/带引渲染）。写侧通道的设置被忽略
+///（set 路径只对 readable 存），故查询只看 eofchar_in。
+fn eofchar_query(in_c: Option<char>) -> Value {
+    match in_c {
         Some(c) => Value::from_str(&c.to_string()),
-        None => Value::from_str(""),
-    };
-    let quoted = |c: Option<char>| match c {
-        Some(c) => Value::from_str(&c.to_string()),
-        None => Value::from_str("{}"),
-    };
-    if ch_read && ch_write {
-        Value::from_list(&[v(in_c), v(out_c)])
-    } else if ch_read {
-        quoted(in_c)
-    } else {
-        quoted(out_c)
+        None => Value::empty(),
     }
 }
 
@@ -578,24 +568,6 @@ fn translation_query(
         s(in_mode)
     } else {
         s(out_mode)
-    }
-}
-
-/// Validate one `-eofchar` element: Tcl allows a single non-NUL ASCII char.
-fn eofchar_element(interp: &mut Interp, val: &str) -> std::result::Result<Option<char>, Error> {
-    let mut chars = val.chars();
-    // Tcl uses the first character of each element; the rest of the
-    // element is ignored (`-eofchar ab` means 0x61, and "ab cd" means
-    // input 'a', output 'c').
-    match (chars.next(), chars.next()) {
-        (Some(c), _) if c != '\0' && (c as u32) <= 0x7f => Ok(Some(c)),
-        (None, _) => Ok(None),
-        _ => {
-            super::list::set_error_code(interp, "NONE");
-            Err(super::list::tcl_err(
-                "bad value for -eofchar: must be non-NUL ASCII character",
-            ))
-        }
     }
 }
 
@@ -644,10 +616,11 @@ pub fn cmd_fconfigure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         } else {
             trans
         };
-        let eof = eofchar_query(ch_read, ch_write, cfg.eofchar_in, cfg.eofchar_out);
+        let eof = eofchar_query(cfg.eofchar_in);
         let eof = eof.as_str().to_string();
-        let eof_field = if ch_read && ch_write {
-            format!("{{{}}}", eof)
+        // 9.1 单值渲染：未设 → `{}`（空串），设了 → 裸词（rw 同形）。
+        let eof_field = if eof.is_empty() {
+            "{}".to_string()
         } else {
             eof
         };
@@ -702,7 +675,7 @@ pub fn cmd_fconfigure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }),
             "-buffersize" => Value::from_int(cfg.buffer_size as i64),
             "-encoding" => Value::from_str(&cfg.encoding),
-            "-eofchar" => eofchar_query(ch_read, ch_write, cfg.eofchar_in, cfg.eofchar_out),
+            "-eofchar" => eofchar_query(cfg.eofchar_in),
             "-translation" => translation_query(
                 ch_read,
                 ch_write,
@@ -774,38 +747,27 @@ pub fn cmd_fconfigure(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         if !interp.channels.contains(chan_id) {
                 return Err(chan_not_found(interp, chan_id));
             }
-        // -eofchar is validated before the config borrow so its errors can
-        // install their own errorCode. Either a single character (both
-        // directions) or a two-element list {readChar writeChar}; an empty
-        // value (or list of empties) clears the setting.
-        let eof_pair: Option<(Option<char>, Option<char>)> = if opt == "-eofchar" {
-            let elems = match Value::from_str(val).as_list_strict() {
-                Ok(e) => e,
-                Err(e) => {
-                    super::list::set_error_code(interp, e.code);
-                    return Err(Error::runtime(
-                        e.message.clone(),
-                        crate::error::ErrorCode::Generic,
-                    ));
-                }
-            };
-            Some(match elems.len() {
-                0 => (None, None),
-                1 => {
-                    let c = eofchar_element(interp, elems[0].as_str())?;
-                    (c, c)
-                }
-                2 => (
-                    eofchar_element(interp, elems[0].as_str())?,
-                    eofchar_element(interp, elems[1].as_str())?,
-                ),
-                _ => {
-                    super::list::set_error_code(interp, "NONE");
-                    return Err(super::list::tcl_err(
-                        "bad value for -eofchar: should be a list of zero, one, or two elements",
-                    ));
-                }
-            })
+        // -eofchar（9.1 钉形，oracle 实测）：值按 **字符串形** 判定，不是
+        // 列表解析——`fconfigure $f -eofchar {z z}` 的值串 "z z" 直接报
+        // `bad value for -eofchar: must be non-NUL ASCII character`（EC
+        // 不装）。接受：空串（清）；单字节 ASCII 非 NUL；`X {}`（4 字节、
+        // 首字节 ASCII 非 NUL，兼容形）。其余一律报错。效果：仅 readable
+        // 通道存入 eofchar_in；写侧 eofchar 已随 9.0 移除——写侧通道的
+        // 设置**静默忽略**（stdout 上 set x → 查询仍空）。
+        let eof_val: Option<Option<char>> = if opt == "-eofchar" {
+            let b = val.as_bytes();
+            if b.is_empty() {
+                Some(None)
+            } else if b.len() == 1 && b[0] < 0x80 && b[0] != 0 {
+                Some(Some(b[0] as char))
+            } else if b.len() == 4 && &b[1..] == b" {}" && b[0] < 0x80 && b[0] != 0 {
+                Some(Some(b[0] as char))
+            } else {
+                super::list::set_error_code(interp, "NONE");
+                return Err(super::list::tcl_err(
+                    "bad value for -eofchar: must be non-NUL ASCII character",
+                ));
+            }
         } else {
             None
         };
@@ -924,9 +886,12 @@ let cfg = interp.channels.config_mut(chan_id).unwrap();
             }
             "-eofchar" => {
                 // Validated above, before the config was borrowed.
-                let (in_c, out_c) = eof_pair.unwrap();
-                cfg.eofchar_in = in_c;
-                cfg.eofchar_out = out_c;
+                let v = eof_val.unwrap();
+                if ch_read {
+                    cfg.eofchar_in = v;
+                }
+                // 写侧通道：静默忽略（9.1 无写侧 eofchar，实测 stdout
+                // set x → 查询空、无错误）。eofchar_out 不再落值。
             }
             "-translation" => {
                 // 已在上方 cfg 借用前解析/校验。

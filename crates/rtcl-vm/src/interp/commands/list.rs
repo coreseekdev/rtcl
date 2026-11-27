@@ -162,49 +162,152 @@ pub(crate) fn out_of_memory(interp: &mut Interp, bytes: usize) -> Error {
 /// Parse a Tcl index (`integer?[+-]integer?` or `end?[+-]integer?`),
 /// resolving `end` against `len`. The result may be negative or >= len;
 /// callers clamp or report out-of-range as appropriate.
-/// Mirrors Tcl 8.6's TclGetIntForIndex (probed on 8.6.17): at most two
-/// terms with no internal whitespace, each term's magnitude bounded by
-/// 2^32-1 (`4294967295` accepted, `4294967296` rejected), and the sum
-/// wraps to C `int` — `end+4294967295` on an 8-char string is index 6,
-/// and `-4294967295` is index 1.
+///
+/// 9.1 semantics (TIP 626 / tclUtil.c Tcl_GetIntForIndexM，oracle 实测
+/// 2026-11-27，E1 批 util-9.x)：项是任意大小整数——整个值先按数解析
+/// （超出 wide 的 bignum 按符号饱和到 ±WIDE_MAX）；`end±int` /
+/// `int±int` 两项各保留自己的符号，bignum 精确求和后按符号截断到
+/// ±WIDE_MAX。**越界不再是错误**——`string index a 0x1FFFFFFFF+0` 是
+/// 空串而非 bad index；8.6 的 2^32-1 项界与 C int 回绕（wrap_i32）随
+/// 之废除（`-4294967295` 不再回绕成 1）。仅真正解析不出（`0x`、
+/// `1.5`、`1+1+1`、`1 + 1`、多元素列表）才 None → bad index。
 pub(crate) fn parse_tcl_index(s: &str, len: usize) -> Option<i64> {
-    const MAX_TERM: i64 = 4294967295; // 2^32 - 1
+    use crate::types::bignum::{parse_int, scan_number, IntRep, NumPayload};
+    use num_bigint::BigInt;
+    use num_traits::{Signed, ToPrimitive};
+    let end_value = len as i64 - 1;
     let t = trim_tcl_space(s);
-    // 1. "end" or a leading integer (leading whitespace already trimmed).
-    let (base, rest) = if let Some(rest) = t.strip_prefix("end") {
-        (len as i64 - 1, rest)
-    } else {
-        let (v, used) = scan_tcl_int(t)?;
-        if v.unsigned_abs() > MAX_TERM as u64 {
+    // 按符号饱和到 wide（Tcl：BIG → ±WIDE_MAX，C 源 mp_isneg 分支）。
+    // 热路径（`12345`/`end-7`）全程 i64/i128，零 BigInt 分配——只有
+    // bignum 项才提升（基准 e1_iostr_bench：BigInt 回退曾致 ix 命中
+    // +20%）。
+    fn sat_i128(v: i128) -> i64 {
+        if v > i64::MAX as i128 {
+            i64::MAX
+        } else if v < i64::MIN as i128 {
+            i64::MIN
+        } else {
+            v as i64
+        }
+    }
+    let saturate = |v: &BigInt| -> i64 {
+        match v.to_i64() {
+            Some(i) => i,
+            None => {
+                if v.is_negative() {
+                    i64::MIN
+                } else {
+                    i64::MAX
+                }
+            }
+        }
+    };
+    // 两项求和：双 i64 走 i128 精确（end/int±int 的 wide 数学饱和等价
+    // i128 后饱和）；含 bignum 走 BigInt 精确后截断（oracle：任一项
+    // BIG → 全式 expr 精确求值再 truncate）。
+    fn op_sum(a: IntRep, minus: bool, b: IntRep) -> i64 {
+        use num_traits::{Signed, ToPrimitive};
+        match (a, b) {
+            (IntRep::I64(x), IntRep::I64(y)) => {
+                let (x, y) = (x as i128, y as i128);
+                sat_i128(if minus { x - y } else { x + y })
+            }
+            (a, b) => {
+                let (x, y) = (a.to_big(), b.to_big());
+                let v = if minus { x - y } else { x + y };
+                match v.to_i64() {
+                    Some(i) => i,
+                    None => {
+                        if v.is_negative() {
+                            i64::MIN
+                        } else {
+                            i64::MAX
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 1. 整值数字（Tcl_GetNumberFromObj 先行；end/表达式不是数字）。
+    if let Some(rep) = parse_int(t) {
+        return Some(match rep {
+            IntRep::I64(i) => i,
+            r => saturate(&r.to_big()),
+        });
+    }
+    // 2. "end[+-]integer"：操作符后无空白，第二项保留自己的符号。
+    if let Some(rest) = t.strip_prefix("end") {
+        if rest.is_empty() {
+            return Some(end_value);
+        }
+        let rb = rest.as_bytes();
+        if rb.len() < 2 || (rb[0] != b'+' && rb[0] != b'-') || is_tcl_space(rb[1]) {
             return None;
         }
-        (v, &t[used..])
-    };
-    if rest.is_empty() {
-        return Some(wrap_i32(base));
+        let off = parse_int(&rest[1..])?;
+        return Some(op_sum(IntRep::I64(end_value), rb[0] == b'-', off));
     }
-    // 2. Optional second term: an operator with no whitespace before the
-    //    number, whose value keeps its own sign (`-1--2` is 1, `1++1` is 2).
+    // 3. "integer[+-]integer"：首项是前缀扫描（剩余留给第二项）。
+    //    量级在 i64 内攒 u64（与 parse_int 同法），溢出转 bignum。
+    let scan = scan_number(t, true)?;
+    let NumPayload::Int { radix, run } = scan.payload else {
+        return None;
+    };
+    let digits = scan.int_digits(t);
+    if digits.is_empty() || digits.bytes().all(|b| b == b'_') {
+        return None;
+    }
+    let mut mag: u64 = 0;
+    let mut overflow = false;
+    for &b in digits.as_bytes() {
+        if b == b'_' {
+            continue;
+        }
+        mag = match mag
+            .checked_mul(radix as u64)
+            .and_then(|m| m.checked_add(crate::types::bignum::digit_value(b) as u64))
+        {
+            Some(v) => v,
+            None => {
+                overflow = true;
+                break;
+            }
+        };
+    }
+    let first = if overflow {
+        let stripped: String =
+            digits.bytes().filter(|&b| b != b'_').map(|b| b as char).collect();
+        let big = BigInt::parse_bytes(stripped.as_bytes(), radix)?;
+        IntRep::Big(if scan.neg { -big } else { big })
+    } else if scan.neg && mag == (i64::MAX as u64) + 1 {
+        IntRep::I64(i64::MIN)
+    } else if mag > i64::MAX as u64 {
+        // 符号化后超 wide：精确 Big（与 parse_int 同）——不可提前饱和，
+        // `hugeA-hugeB` 型精确差仍可能落在 wide 内（oracle 钉形）。
+        let big = BigInt::from(mag);
+        IntRep::Big(if scan.neg { -big } else { big })
+    } else {
+        IntRep::I64(if scan.neg { -(mag as i64) } else { mag as i64 })
+    };
+    let rest = &t[scan.stop..];
+    if rest.is_empty() {
+        return Some(match first {
+            IntRep::I64(i) => i,
+            IntRep::Big(ref b) => saturate(b),
+        });
+    }
     let rb = rest.as_bytes();
     if rb.len() < 2 || (rb[0] != b'+' && rb[0] != b'-') || is_tcl_space(rb[1]) {
         return None;
     }
-    let off = tcl_get_int(&rest[1..])?;
-    if off.unsigned_abs() > MAX_TERM as u64 {
-        return None;
-    }
-    Some(wrap_i32(if rb[0] == b'+' { base + off } else { base - off }))
+    let second = parse_int(&rest[1..])?;
+    Some(op_sum(first, rb[0] == b'-', second))
 }
 
 /// Whether a Tcl index is spelled from `end` — the one form whose value
 /// depends on the length it is resolved against.
 pub(crate) fn index_is_from_end(s: &str) -> bool {
     trim_tcl_space(s).starts_with("end")
-}
-
-/// C `int` wraparound, which Tcl index arithmetic is subject to.
-fn wrap_i32(v: i64) -> i64 {
-    v as i32 as i64
 }
 
 pub fn cmd_list(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -409,7 +512,6 @@ pub fn cmd_lrepeat(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             args[1].as_str()
         )));
     }
-    let count = count as usize;
     let elements: Vec<Value> = args[2..].to_vec();
     if elements.is_empty() {
         return Ok(Value::empty());
@@ -424,13 +526,19 @@ pub fn cmd_lrepeat(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         set_error_code(interp, "TCL MEMORY");
         tcl_err(format!("max length ({max}) of a Tcl list exceeded"))
     };
-    let total = match count.checked_mul(elements.len()) {
-        Some(t) if t as u64 <= TCL91_LIST_MAX => t,
-        _ => return Err(over(interp, TCL91_LIST_MAX)),
-    };
-    if total > MAX_LIST_ELEMENTS {
+    // S21 wasm32 兼容：count×elements 的守卫留在 u128 域——usize=u32
+    // 时 `count as usize` 先窄化会把 2^32 截成 0，守卫全被绕过且循环
+    // 体静默产出空列表（silently wrong）。预算内（≤ MAX_LIST_ELEMENTS
+    // < u32::MAX）再窄化，两个目标都安全。
+    let total_wide = (count as u128) * (elements.len() as u128);
+    if total_wide > TCL91_LIST_MAX as u128 {
+        return Err(over(interp, TCL91_LIST_MAX));
+    }
+    if total_wide > MAX_LIST_ELEMENTS as u128 {
         return Err(over(interp, MAX_LIST_ELEMENTS as u64));
     }
+    let count = count as usize;
+    let total = total_wide as usize;
     let mut result = Vec::new();
     result
         .try_reserve(total)
@@ -1597,17 +1705,27 @@ mod tests {
     }
 
     #[test]
-    fn index_32bit_bounds_and_wrap() {
-        // Term magnitude must stay under 2^32; the sum wraps to C int.
-        assert_eq!(idx("4294967295", 8), Some(-1)); // wraps, out of range
-        assert_eq!(idx("4294967296", 8), None);
-        assert_eq!(idx("-4294967295", 8), Some(1)); // wraps to index 1
-        assert_eq!(idx("-4294967296", 8), None);
-        assert_eq!(idx("9223372036854775807", 8), None);
-        assert_eq!(idx("9223372036854775807+1", 8), None);
-        assert_eq!(idx("2147483647+1", 8), Some(-2147483648));
-        assert_eq!(idx("end+4294967295", 8), Some(6)); // (7 + 4294967295) as i32
+    fn index_91_wide_and_bignum() {
+        // 9.1 重钉（E1 批 util-9.x，oracle 实测）：项不再限 2^32-1、
+        // 求和不再回绕 C int——任意大小整数按符号饱和到 ±wide，越界
+        // 由调用方钳制（string index → 空串），不再报 bad index。
+        assert_eq!(idx("4294967295", 8), Some(4294967295)); // out of range
+        assert_eq!(idx("4294967296", 8), Some(4294967296));
+        assert_eq!(idx("-4294967295", 8), Some(-4294967295)); // no i32 wrap
+        assert_eq!(idx("9223372036854775807", 8), Some(i64::MAX));
+        assert_eq!(idx("9223372036854775808", 8), Some(i64::MAX)); // BIG→WIDE_MAX
+        assert_eq!(idx("-9223372036854775808", 8), Some(i64::MIN));
+        assert_eq!(idx("9223372036854775807+1", 8), Some(i64::MAX)); // saturate
+        assert_eq!(idx("2147483647+1", 8), Some(2147483648)); // no wrap
+        assert_eq!(idx("end+4294967295", 8), Some(4294967302)); // out of range
         assert_eq!(idx("4294967295-4294967295", 8), Some(0));
+        assert_eq!(idx("0x10000000000000000", 8), Some(i64::MAX));
+        assert_eq!(
+            idx("99999999999999999999-99999999999999999999", 8),
+            Some(0) // both BIG → exact bignum difference
+        );
+        assert_eq!(idx("0d100000000000+0", 8), Some(100000000000));
+        assert_eq!(idx("end+2305843009213693950", 8), Some(2305843009213693957));
     }
 
     // --- concat_trim: Tcl_Concat's backslash-aware whitespace trim ---

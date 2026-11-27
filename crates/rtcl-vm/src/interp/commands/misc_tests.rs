@@ -909,20 +909,30 @@ fn test_format_strict_errors() {
         .unwrap();
     assert_eq!(
         r.as_str(),
-        "{expected integer but got \"x\"} {TCL VALUE INTEGER}"
+        "{expected integer but got \"x\"} {TCL VALUE NUMBER}"
     );
     // *.*: precision arg also strict
     let r = interp
         .eval("catch {format %*.*f 2 xyz 3} m; list $m")
         .unwrap();
     assert_eq!(r.as_str(), "{expected integer but got \"xyz\"}");
-    // bad conversion char
+    // 9.1：q 是 size 修饰符（≈64 位档），裸 %q 到串尾即"域说明符中断"
+    // （oracle 实测 INCOMPLETE）；%qx 255 → ff。bad conversion char 改
+    // 用真不在清单里的转换符 r 钉（oracle format-8.20 同款）。
     let r = interp
         .eval("catch {format %q x} m; list $m [set ::errorCode]")
         .unwrap();
     assert_eq!(
         r.as_str(),
-        "{bad field specifier \"q\"} {TCL FORMAT BADTYPE}"
+        "{format string ended in middle of field specifier} {TCL FORMAT INCOMPLETE}"
+    );
+    assert_eq!(interp.eval("format %qx 255").unwrap().as_str(), "ff");
+    let r = interp
+        .eval("catch {format %r x} m; list $m [set ::errorCode]")
+        .unwrap();
+    assert_eq!(
+        r.as_str(),
+        "{bad field specifier \"r\"} {TCL FORMAT BADTYPE}"
     );
     // '-' after '.' is a bad field specifier
     let r = interp
@@ -1032,26 +1042,28 @@ fn test_format_h_modifier_and_xpg() {
 fn test_format_wrap_and_padding() {
     let mut interp = Interp::new();
     // bignum wraps mod 2^64 then reinterprets
+    // 9.0/9.1：无 size 修饰符的 %d 一律截 32 位（oracle 实测三例；
+    // i64 回绕是 8.6 语义，退役）。
     assert_eq!(
         interp
             .eval("format %d 99999999999999999999")
             .unwrap()
             .as_str(),
-        "7766279631452241919"
+        "1661992959"
     );
     assert_eq!(
         interp
             .eval("format %d -9223372036854775809")
             .unwrap()
             .as_str(),
-        "9223372036854775807"
+        "-1"
     );
     assert_eq!(
         interp
             .eval("format %d 9223372036854775808")
             .unwrap()
             .as_str(),
-        "-9223372036854775808"
+        "0"
     );
     // Tcl integer grammar（9.1 重钉：017 是十进制 17——oracle 实测；
     // %d 的 32 位截断规则是另一批次，i64 回绕两行保持原钉）

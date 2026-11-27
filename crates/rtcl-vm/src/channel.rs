@@ -2187,18 +2187,8 @@ impl ChannelTable {
     }
 
     fn close_with(&mut self, id: &str, at_exit: bool) -> io::Result<()> {
-        // tclsh：out-eofchar 在 close 时一次性写出（flush 后、底层关闭
-        // 前；不是逐 puts/flush）——`fconfigure $f -eofchar {{} \x03}` +
-        // puts "X" + close → "X\x03"。
-        let eofc = self.configs.get(id).and_then(|c| c.eofchar_out);
-        if let Some(c) = eofc {
-            if let Some(ch) = self.channels.get_mut(id) {
-                if ch.is_writable() {
-                    let _ = ch.write_bytes(&[c as u8]);
-                    let _ = ch.flush();
-                }
-            }
-        }
+        // 8.6 的 out-eofchar close 时一次性写出已随 9.x 移除（9.0 起写
+        // 侧 eofchar 消失；eofchar_out 不再落值，见 fconfigure set 路径）。
         self.configs.remove(id);
         self.untrack(id);
         match self.channels.remove(id) {
@@ -3311,7 +3301,17 @@ pub(crate) fn open_file_channel(
     path: &str,
     mode: &str,
 ) -> io::Result<(Box<dyn Channel>, bool)> {
-    let mut binary = false;
+    // 具名 binary 形（tclsh 9.1 实测钉形：rb/wb/ab/rb+/wb+/ab+ = 同名
+    // 无后缀形的 access + binary 翻译/iso8859-1 编码；大小写敏感）。
+    let (mode, mut binary) = match mode {
+        "rb" => ("r", true),
+        "wb" => ("w", true),
+        "ab" => ("a", true),
+        "rb+" => ("r+", true),
+        "wb+" => ("w+", true),
+        "ab+" => ("a+", true),
+        m => (m, false),
+    };
     let file = match mode {
         "r" => {
             let f = std::fs::File::open(path)?;
@@ -3346,7 +3346,7 @@ pub(crate) fn open_file_channel(
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
-                        "invalid access mode \"{}\": must be RDONLY, WRONLY, RDWR, APPEND, BINARY, CREAT, EXCL, NOCTTY, NONBLOCK, or TRUNC",
+                        "invalid access mode \"{}\": must be APPEND, BINARY, CREAT, EXCL, NOCTTY, NONBLOCK, RDONLY, RDWR, TRUNC, or WRONLY",
                         mode
                     ),
                 ));

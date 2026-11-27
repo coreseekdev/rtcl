@@ -162,49 +162,85 @@ pub(crate) fn out_of_memory(interp: &mut Interp, bytes: usize) -> Error {
 /// Parse a Tcl index (`integer?[+-]integer?` or `end?[+-]integer?`),
 /// resolving `end` against `len`. The result may be negative or >= len;
 /// callers clamp or report out-of-range as appropriate.
-/// Mirrors Tcl 8.6's TclGetIntForIndex (probed on 8.6.17): at most two
-/// terms with no internal whitespace, each term's magnitude bounded by
-/// 2^32-1 (`4294967295` accepted, `4294967296` rejected), and the sum
-/// wraps to C `int` — `end+4294967295` on an 8-char string is index 6,
-/// and `-4294967295` is index 1.
+///
+/// 9.1 semantics (TIP 626 / tclUtil.c Tcl_GetIntForIndexM，oracle 实测
+/// 2026-11-27，E1 批 util-9.x)：项是任意大小整数——整个值先按数解析
+/// （超出 wide 的 bignum 按符号饱和到 ±WIDE_MAX）；`end±int` /
+/// `int±int` 两项各保留自己的符号，bignum 精确求和后按符号截断到
+/// ±WIDE_MAX。**越界不再是错误**——`string index a 0x1FFFFFFFF+0` 是
+/// 空串而非 bad index；8.6 的 2^32-1 项界与 C int 回绕（wrap_i32）随
+/// 之废除（`-4294967295` 不再回绕成 1）。仅真正解析不出（`0x`、
+/// `1.5`、`1+1+1`、`1 + 1`、多元素列表）才 None → bad index。
 pub(crate) fn parse_tcl_index(s: &str, len: usize) -> Option<i64> {
-    const MAX_TERM: i64 = 4294967295; // 2^32 - 1
+    use crate::types::bignum::{parse_int, scan_number, NumPayload};
+    use num_bigint::BigInt;
+    use num_traits::ToPrimitive;
+    let end_value = len as i64 - 1;
     let t = trim_tcl_space(s);
-    // 1. "end" or a leading integer (leading whitespace already trimmed).
-    let (base, rest) = if let Some(rest) = t.strip_prefix("end") {
-        (len as i64 - 1, rest)
-    } else {
-        let (v, used) = scan_tcl_int(t)?;
-        if v.unsigned_abs() > MAX_TERM as u64 {
+    // 按符号饱和到 wide（Tcl：BIG → ±WIDE_MAX，C 源 mp_isneg 分支）。
+    let saturate = |v: &BigInt| -> i64 {
+        match v.to_i64() {
+            Some(i) => i,
+            None => {
+                use num_traits::Signed;
+                if v.is_negative() {
+                    i64::MIN
+                } else {
+                    i64::MAX
+                }
+            }
+        }
+    };
+    // 1. 整值数字（Tcl_GetNumberFromObj 先行；end/表达式不是数字）。
+    if let Some(rep) = parse_int(t) {
+        return Some(saturate(&rep.to_big()));
+    }
+    // 2. "end[+-]integer"：操作符后无空白，第二项保留自己的符号。
+    if let Some(rest) = t.strip_prefix("end") {
+        if rest.is_empty() {
+            return Some(end_value);
+        }
+        let rb = rest.as_bytes();
+        if rb.len() < 2 || (rb[0] != b'+' && rb[0] != b'-') || is_tcl_space(rb[1]) {
             return None;
         }
-        (v, &t[used..])
-    };
-    if rest.is_empty() {
-        return Some(wrap_i32(base));
+        let off = parse_int(&rest[1..])?.to_big();
+        let v = if rb[0] == b'+' {
+            BigInt::from(end_value) + off
+        } else {
+            BigInt::from(end_value) - off
+        };
+        return Some(saturate(&v));
     }
-    // 2. Optional second term: an operator with no whitespace before the
-    //    number, whose value keeps its own sign (`-1--2` is 1, `1++1` is 2).
+    // 3. "integer[+-]integer"：首项是前缀扫描（剩余留给第二项）。
+    let scan = scan_number(t, true)?;
+    let NumPayload::Int { radix, run } = scan.payload else {
+        return None;
+    };
+    let digits = scan.int_digits(t);
+    if digits.is_empty() || digits.bytes().all(|b| b == b'_') {
+        return None;
+    }
+    let stripped: String = digits.bytes().filter(|&b| b != b'_').map(|b| b as char).collect();
+    let first = BigInt::parse_bytes(stripped.as_bytes(), radix)?;
+    let first = if scan.neg { -first } else { first };
+    let rest = &t[scan.stop..];
+    if rest.is_empty() {
+        return Some(saturate(&first));
+    }
     let rb = rest.as_bytes();
     if rb.len() < 2 || (rb[0] != b'+' && rb[0] != b'-') || is_tcl_space(rb[1]) {
         return None;
     }
-    let off = tcl_get_int(&rest[1..])?;
-    if off.unsigned_abs() > MAX_TERM as u64 {
-        return None;
-    }
-    Some(wrap_i32(if rb[0] == b'+' { base + off } else { base - off }))
+    let second = parse_int(&rest[1..])?.to_big();
+    let v = if rb[0] == b'+' { first + second } else { first - second };
+    Some(saturate(&v))
 }
 
 /// Whether a Tcl index is spelled from `end` — the one form whose value
 /// depends on the length it is resolved against.
 pub(crate) fn index_is_from_end(s: &str) -> bool {
     trim_tcl_space(s).starts_with("end")
-}
-
-/// C `int` wraparound, which Tcl index arithmetic is subject to.
-fn wrap_i32(v: i64) -> i64 {
-    v as i32 as i64
 }
 
 pub fn cmd_list(_interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -1597,17 +1633,27 @@ mod tests {
     }
 
     #[test]
-    fn index_32bit_bounds_and_wrap() {
-        // Term magnitude must stay under 2^32; the sum wraps to C int.
-        assert_eq!(idx("4294967295", 8), Some(-1)); // wraps, out of range
-        assert_eq!(idx("4294967296", 8), None);
-        assert_eq!(idx("-4294967295", 8), Some(1)); // wraps to index 1
-        assert_eq!(idx("-4294967296", 8), None);
-        assert_eq!(idx("9223372036854775807", 8), None);
-        assert_eq!(idx("9223372036854775807+1", 8), None);
-        assert_eq!(idx("2147483647+1", 8), Some(-2147483648));
-        assert_eq!(idx("end+4294967295", 8), Some(6)); // (7 + 4294967295) as i32
+    fn index_91_wide_and_bignum() {
+        // 9.1 重钉（E1 批 util-9.x，oracle 实测）：项不再限 2^32-1、
+        // 求和不再回绕 C int——任意大小整数按符号饱和到 ±wide，越界
+        // 由调用方钳制（string index → 空串），不再报 bad index。
+        assert_eq!(idx("4294967295", 8), Some(4294967295)); // out of range
+        assert_eq!(idx("4294967296", 8), Some(4294967296));
+        assert_eq!(idx("-4294967295", 8), Some(-4294967295)); // no i32 wrap
+        assert_eq!(idx("9223372036854775807", 8), Some(i64::MAX));
+        assert_eq!(idx("9223372036854775808", 8), Some(i64::MAX)); // BIG→WIDE_MAX
+        assert_eq!(idx("-9223372036854775808", 8), Some(i64::MIN));
+        assert_eq!(idx("9223372036854775807+1", 8), Some(i64::MAX)); // saturate
+        assert_eq!(idx("2147483647+1", 8), Some(2147483648)); // no wrap
+        assert_eq!(idx("end+4294967295", 8), Some(4294967302)); // out of range
         assert_eq!(idx("4294967295-4294967295", 8), Some(0));
+        assert_eq!(idx("0x10000000000000000", 8), Some(i64::MAX));
+        assert_eq!(
+            idx("99999999999999999999-99999999999999999999", 8),
+            Some(0) // both BIG → exact bignum difference
+        );
+        assert_eq!(idx("0d100000000000+0", 8), Some(100000000000));
+        assert_eq!(idx("end+2305843009213693950", 8), Some(2305843009213693957));
     }
 
     // --- concat_trim: Tcl_Concat's backslash-aware whitespace trim ---

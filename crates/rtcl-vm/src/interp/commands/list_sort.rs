@@ -38,8 +38,45 @@ fn lsearch_option_list() -> String {
 
 pub fn cmd_lsearch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     use super::list::{bad_index, parse_tcl_index, set_error_code, strict_list, tcl_err, tcl_get_int, trim_tcl_space, scan_tcl_int};
+    use crate::value::SeriesRep;
     use crate::value::is_tcl_space;
     use std::cmp::Ordering;
+
+    /// lsearch source: ordinary list or lazy lseq series.  All option
+    /// paths index through this view, so a huge series is never
+    /// materialized just to search it.
+    enum SearchList {
+        Vec(Vec<Value>),
+        Series(SeriesRep),
+    }
+    impl SearchList {
+        fn len(&self) -> usize {
+            match self {
+                SearchList::Vec(v) => v.len(),
+                SearchList::Series(s) => usize::try_from(s.len.max(0)).unwrap_or(usize::MAX),
+            }
+        }
+        fn get(&self, i: usize) -> Value {
+            match self {
+                SearchList::Vec(v) => v.get(i).cloned().unwrap_or_else(Value::empty),
+                SearchList::Series(s) => {
+                    if (i as i64) < s.len {
+                        s.element(i as i64)
+                    } else {
+                        Value::empty()
+                    }
+                }
+            }
+        }
+        fn range(&self, a: usize, b: usize) -> Vec<Value> {
+            let b = b.min(self.len());
+            let mut out = Vec::with_capacity(b.saturating_sub(a));
+            for i in a..b {
+                out.push(self.get(i));
+            }
+            out
+        }
+    }
 
     if args.len() < 3 {
         return Err(Error::wrong_args_with_usage(
@@ -254,7 +291,11 @@ pub fn cmd_lsearch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         None
     };
 
-    let list = strict_list(interp, &args[args.len() - 2])?;
+    let list = if let Some(s) = args[args.len() - 2].series() {
+        SearchList::Series(s)
+    } else {
+        SearchList::Vec(strict_list(interp, &args[args.len() - 2])?)
+    };
 
     // -stride group sanity; with -index, the leading index value becomes
     // the offset of the compared element within each group (TIP #351).
@@ -346,9 +387,9 @@ pub fn cmd_lsearch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             mid -= mid % gs;
             let ui = (mid + group_offset) as usize;
             let item = if index_specs.is_empty() {
-                list[ui].clone()
+                list.get(ui)
             } else {
-                select_from_sublist(interp, &list[ui], &index_specs)?
+                select_from_sublist(interp, &list.get(ui), &index_specs)?
             };
             let cmp: i64 = match data {
                 DataType::Ascii => {
@@ -414,9 +455,9 @@ pub fn cmd_lsearch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         while (p as usize) < list.len() {
             let ui = p as usize + group_offset as usize;
             let item = if index_specs.is_empty() {
-                list[ui].clone()
+                list.get(ui)
             } else {
-                select_from_sublist(interp, &list[ui], &index_specs)?
+                select_from_sublist(interp, &list.get(ui), &index_specs)?
             };
             let mut m = if let Some(ref cmd) = command {
                 let script = format!(
@@ -476,14 +517,14 @@ pub fn cmd_lsearch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 if inline {
                     if subindices && !index_specs.is_empty() {
-                        all_results.push(select_from_sublist(interp, &list[ui], &index_specs)?);
+                        all_results.push(select_from_sublist(interp, &list.get(ui), &index_specs)?);
                     } else if subindices && stride > 1 {
-                        all_results.push(list[ui].clone());
+                        all_results.push(list.get(ui));
                     } else if stride > 1 {
                         let end = (ui + stride as usize).min(list.len());
-                        all_results.extend(list[ui..end].iter().cloned());
+                        all_results.extend(list.range(ui, end));
                     } else {
-                        all_results.push(list[ui].clone());
+                        all_results.push(list.get(ui));
                     }
                 } else if subindices {
                     // Displayed path entries decode `end` forms against
@@ -523,14 +564,14 @@ pub fn cmd_lsearch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Ok(Value::from_str(""));
     }
     if subindices {
-        return select_from_sublist(interp, &list[(index + group_offset) as usize], &index_specs);
+        return select_from_sublist(interp, &list.get((index + group_offset) as usize), &index_specs);
     }
     if stride > 1 {
         let ui = index as usize;
         let end = (ui + stride as usize).min(list.len());
-        return Ok(Value::from_list(&list[ui..end]));
+        return Ok(Value::from_list(&list.range(ui, end)));
     }
-    Ok(list[index as usize].clone())
+    Ok(list.get(index as usize))
 }
 
 // ============================================================================
@@ -1803,5 +1844,35 @@ mod tests {
         let mut interp = Interp::new();
         assert_eq!(interp.eval("lsort {}").unwrap().as_str(), "");
         assert_eq!(interp.eval("lsort -indices {}").unwrap().as_str(), "");
+    }
+
+    #[test]
+    fn test_lsearch_huge_series_is_lazy() {
+        let mut interp = Interp::new();
+        assert_eq!(interp.eval("lsearch [lseq 0x7fffffff] 5").unwrap().as_str(), "5");
+        assert_eq!(
+            interp.eval("lsearch -exact [lseq 0x7fffffff] 5").unwrap().as_str(),
+            "5"
+        );
+        assert_eq!(
+            interp.eval("lsearch -inline [lseq 0x7fffffff] 5").unwrap().as_str(),
+            "5"
+        );
+        assert_eq!(
+            interp.eval("lsearch -start 4 [lseq 0x7fffffff] 5").unwrap().as_str(),
+            "5"
+        );
+        assert_eq!(
+            interp.eval("lsearch -not [lseq 0x7fffffff] 0").unwrap().as_str(),
+            "1"
+        );
+        assert_eq!(
+            interp.eval("lsearch -integer [lseq 0x7fffffff] 5").unwrap().as_str(),
+            "5"
+        );
+        assert_eq!(
+            interp.eval("lsearch -stride 2 -index 1 [lseq 0x7ffffffe] 1").unwrap().as_str(),
+            "0"
+        );
     }
 }

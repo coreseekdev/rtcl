@@ -414,9 +414,11 @@ doc/*.n 章节）。
     （§4 授权）。
 - 门禁终态：`allium check specs/` 0 error（3 warning 为 memory-lifecycle
   既有 unused entity/binding；3 info 为既有 unused field）；
-  `allium analyse specs/` 0 finding。自审 260 条可执行 `when` 对
-  9.1.0 0 mismatch。未改 crates/judge 代码（仅按授权加 3 个探针），
-  未跑 judge（规格-only 改动不触发代码门禁）。
+  `allium analyse specs/` 0 finding。自审脚本
+  `python3 specs/scripts/audit-91.py`：checked=260 skipped=91
+  mismatches=0（跳过的是 `-- after:` 前态/多行 trigger）。未改
+  crates/judge 代码（仅按授权加 3 个探针 + 审计脚本），未跑 judge
+  （规格-only 改动不触发代码门禁）。
 - git diff --stat 范围：`specs/*.allium`（已换锚的 12 份）+ 本文件 +
-  `judge/probes/{oo_objcount91,oo_features91,pbr6_float_bits}.tcl`
-  （§4 授权新增探针，只加不改）。
+  `judge/probes/{oo_objcount91,oo_features91,pbr6_float_bits}.tcl` +
+  `specs/scripts/audit-91.py`（§4 授权新增探针/审计脚本，只加不改）。

@@ -321,6 +321,24 @@ rule ClockScanSupportsIsoDates {
     -- rtcl: "clock scan: format parsing not yet implemented"  [D-24]
 }
 
+rule ClockAddWeekdaysSkipsWeekend {
+    -- clock add ... weekdays counts business days (Sat/Sun skipped):
+    -- Wed 2020-01-01 + 5 weekdays = Wed 2020-01-08.
+    when: Evaluates("set t [clock scan 2020-01-01 -gmt 1]; clock format [clock add $t 5 weekdays -gmt 1] -format %Y-%m-%d -gmt 1")
+    ensures: completion.code = ok
+    ensures: completion.value = "2020-01-08"
+    -- probe: 2026-11-27 tclsh9.1
+}
+
+rule ClockScanValidateControlsRangeAdjustment {
+    -- -validate 1 (default) raises on an out-of-range day; -validate 0
+    -- normalises it (2020-02-31 -> 2020-03-02). Syntax errors still raise.
+    when: Evaluates("list [catch {clock scan 2020-02-31 -validate 1 -gmt 1} m] $m [clock format [clock scan 2020-02-31 -validate 0 -gmt 1] -format %Y-%m-%d -gmt 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {unable to convert input string: invalid day} 2020-03-02"
+    -- probe: 2026-11-27 tclsh9.1
+}
+
 -- ── glob ──────────────────────────────────────────────────────────
 
 rule GlobMatchesTclGlobSemantics {

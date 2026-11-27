@@ -259,6 +259,14 @@ rule SourceDefaultsToStrictUtf8 {
     -- probe: doc/source.n (default system encoding, strict UTF-8 here)
 }
 
+rule ExecEncodingDecodesChildOutput {
+    -- 9.1 exec takes -encoding for the child's stdout/stderr decode.
+    when: Evaluates("exec -encoding utf-8 echo hi")
+    ensures: completion.code = ok
+    ensures: completion.value = "hi"
+    -- probe: 2026-11-27 tclsh9.1 on Linux
+}
+
 -- ── file ──────────────────────────────────────────────────────────
 
 rule FileMtimeSetterSets {

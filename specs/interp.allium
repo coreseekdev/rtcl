@@ -72,6 +72,66 @@ rule ProcessSubcommandMenu {
     -- probe: process91
 }
 
+-- ── 9.1 utility/introspection surface (T4, 2026-11-27) ──────────
+
+rule InfoLoadedIsEmptyAtStartup {
+    -- info loaded lists packages loaded from shared libraries; the core
+    -- is static, so it is empty in a fresh interpreter.
+    when: Evaluates("list [info loaded] [info loaded {}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {}"
+    -- probe: 2026-11-27 tclsh9.1
+}
+
+rule InfoCmdtypeDistinguishesNative {
+    -- info cmdtype reports native for built-ins; an unknown name errors.
+    when: Evaluates("list [info cmdtype set] [info cmdtype puts]")
+    ensures: completion.code = ok
+    ensures: completion.value = "native native"
+    -- probe: 2026-11-27 tclsh9.1 (unknown: unknown command "foo")
+}
+
+rule BuildInfoReportsCoreVersion {
+    -- tcl::build-info starts with the core version.
+    when: Evaluates("string match {9.1.0*} [tcl::build-info]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: 2026-11-27 tclsh9.1 (full string has git hash/compiler)
+}
+
+rule PkgconfigKeySetAndFlags {
+    -- ::tcl::pkgconfig has 19 keys in 9.1.0; spot flags on this build.
+    when: Evaluates("list [llength [::tcl::pkgconfig list]] [::tcl::pkgconfig get debug] [::tcl::pkgconfig get threaded] [::tcl::pkgconfig get 64bit]")
+    ensures: completion.code = ok
+    ensures: completion.value = "19 0 1 0"
+    -- probe: 2026-11-27 tclsh9.1
+}
+
+rule UnicodeNormalizationCommand {
+    -- unicode is the 9.1 normalization ensemble (tonfc/tonfd/tonfkc/
+    -- tonfkd); NFC composes e + U+0301 to é, NFD decomposes it back.
+    when: Evaluates("list [unicode tonfc \"e[format %c 0x301]\"] [string length [unicode tonfd \"é\"]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "é 2"
+    -- probe: 2026-11-27 tclsh9.1
+}
+
+rule ZipfsRootIsVolumeRoot {
+    -- zipfs root returns the mount-point root of the built-in zip volume.
+    when: Evaluates("zipfs root")
+    ensures: completion.code = ok
+    ensures: completion.value = "//zipfs:/"
+    -- probe: 2026-11-27 tclsh9.1 (zipfs list is a large file list)
+}
+
+rule TimerateReportsRateShape {
+    -- timerate returns a human-readable rate line; only the shape is stable.
+    when: Evaluates("string match {*µs/#*#/sec*} [timerate {expr 1+1} 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: 2026-11-27 tclsh9.1
+}
+
 -- ── 9.1 unsupported::assemble (T7, 2026-11-27) ──────────────────
 -- Probes: cmp_assemble, unsupported_assemble; 9.1.0 instruction menu.
 

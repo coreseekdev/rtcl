@@ -228,6 +228,8 @@ pub(crate) struct OoObject {
     pub variables: Rc<Vec<String>>,
     /// TIP500 `private variable` 声明（见 [`OoClass.private_variables`]）。
     pub private_variables: Vec<String>,
+    /// 9.1 `oo::configurable` 的属性定义（实例级）。
+    pub properties: Vec<PropertyDef>,
 }
 
 /// A class (both the behaviour of its instances and, via `obj_*`, the
@@ -268,11 +270,31 @@ pub(crate) struct OoClass {
     pub singleton_class: bool,
     /// singleton 类的唯一实例（首次 new 后写入）。
     pub singleton_instance: Option<String>,
+    /// 9.1 `oo::configurable` 产生的类：提供 property 定义方言 + configure。
+    pub configurable: bool,
+    /// 9.1 configurable 属性（类级）。
+    pub properties: Vec<PropertyDef>,
     /// TIP524 定义命名空间（`definitionnamespace ?kind? ns` 设置）：
     /// `None` = 未设置（info class definitionnamespace → {}）。锁定值
     /// （oo::object 的 instance / oo::class 的 class）与用户设置同形。
     pub defns_class: Option<String>,
     pub defns_instance: Option<String>,
+}
+
+/// 9.1 configurable property kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropKind {
+    Readable,
+    Writable,
+    ReadWrite,
+}
+
+#[derive(Debug, Clone)]
+pub struct PropertyDef {
+    pub name: String,
+    pub kind: PropKind,
+    pub getter: Option<Rc<str>>,
+    pub setter: Option<Rc<str>>,
 }
 
 /// A method execution in progress (`self`/`my`/`next` context).  The
@@ -464,13 +486,13 @@ fn register_oo_command(interp: &mut Interp, key: &str, usage: &'static str, func
 const DEFINE_WORDS: &[&str] = &[
     "method", "forward", "unexport", "mixin", "superclass", "variable", "self",
     "renamemethod", "filter", "export", "deletemethod", "destructor", "constructor",
-    "definitionnamespace", "private",
+    "definitionnamespace", "private", "property",
 ];
 /// Slot words: implemented by `::oo::Slot` instance objects.
 const DEFINE_SLOTS: &[&str] = &["mixin", "superclass", "variable", "filter"];
 const OBJDEFINE_WORDS: &[&str] = &[
     "class", "forward", "export", "method", "renamemethod", "filter", "variable",
-    "unexport", "deletemethod", "mixin", "private",
+    "unexport", "deletemethod", "mixin", "private", "property",
 ];
 const OBJDEFINE_SLOTS: &[&str] = &["filter", "variable", "mixin"];
 /// `::oo::Helpers` — the per-method helpers.  tclsh puts `self`/`next`/
@@ -484,7 +506,7 @@ const HELPERS_ORDER: &[&str] = &["nextto", "self", "next"];
 const INFOCLASS_ORDER: &[&str] = &[
     "instances", "mixins", "subclasses", "variables", "definition", "filters",
     "methodtype", "call", "forward", "superclasses", "constructor", "destructor",
-    "methods", "definitionnamespace",
+    "methods", "properties", "definitionnamespace",
 ];
 const INFOOBJECT_ORDER: &[&str] = &[
     "mixins", "definition", "filters", "variables", "methodtype", "call",
@@ -1235,6 +1257,7 @@ fn exec_chain_entry(
             }
             "create" => oo_create(interp, key, call_args, typed),
             "new" => oo_new(interp, key, call_args, typed),
+            "configure" => cmd_configure(interp, key, call_args, typed),
             // D-43⑤：my variable / my varname / my eval——对象 ns 语义
             // （variable 链接对象 ns 变量进当前帧；varname 出全名；eval
             // 在对象 ns 求值）。<cloned> 为复制钩子占位（oo::copy 另走
@@ -1761,12 +1784,149 @@ extern "Rust" fn cmd_oo_object(interp: &mut Interp, args: &[Value]) -> Result<Va
 
 // ── my / self / next ───────────────────────────────────────────────────
 
+// ── 9.1 configurable properties ─────────────────────────────────────
+
+fn collect_properties(interp: &Interp, obj_key: &str) -> Vec<PropertyDef> {
+    let class_key = object_class_of(interp, obj_key);
+    let mut out: Vec<PropertyDef> = Vec::new();
+    for c in linearize(interp, &class_key) {
+        if let Some(cl) = interp.oo.classes.get(&c) {
+            for p in &cl.properties {
+                out.retain(|q| q.name != p.name);
+                out.push(p.clone());
+            }
+        }
+    }
+    if let Some(o) = interp.oo.objects.get(obj_key) {
+        for p in &o.properties {
+            out.retain(|q| q.name != p.name);
+            out.push(p.clone());
+        }
+    }
+    out
+}
+
+fn eval_property_script(interp: &mut Interp, script: &str, args: &[Value]) -> Result<Value> {
+    let params = if args.is_empty() { Value::empty() } else { Value::from_str("value") };
+    let lambda = Value::from_list(&[params, Value::from_str(script)]);
+    let mut call = vec![Value::from_str("apply"), lambda];
+    call.extend_from_slice(args);
+    interp.dispatch_values(&call)
+}
+
+fn cfg_get(interp: &mut Interp, obj_key: &str, p: &PropertyDef) -> Result<Value> {
+    let ns = object_ns_of(interp, obj_key);
+    if let Some(getter) = &p.getter {
+        let prev = core::mem::replace(&mut interp.current_namespace, ns);
+        let r = eval_property_script(interp, getter, &[]);
+        interp.current_namespace = prev;
+        return r;
+    }
+    let key = format!("{}::{}", ns, p.name);
+    interp
+        .get_var(&key)
+        .map(|v| v.clone())
+        .map_err(|_| Error::Msg(format!("can't read \"{}\": no such variable", p.name)))
+}
+
+fn cfg_set(interp: &mut Interp, obj_key: &str, p: &PropertyDef, value: Value) -> Result<Value> {
+    let ns = object_ns_of(interp, obj_key);
+    if let Some(setter) = &p.setter {
+        let prev = core::mem::replace(&mut interp.current_namespace, ns);
+        let r = eval_property_script(interp, setter, &[value]);
+        interp.current_namespace = prev;
+        return r;
+    }
+    let key = format!("{}::{}", ns, p.name);
+    interp.set_var(&key, value).map(|_| Value::empty())
+}
+
+fn cfg_resolve(props: &[PropertyDef], typed: &str) -> Result<PropertyDef> {
+    let name = typed.strip_prefix('-').unwrap_or(typed);
+    if let Some(p) = props.iter().find(|p| p.name == name) {
+        return Ok(p.clone());
+    }
+    let hits: Vec<&PropertyDef> = props.iter().filter(|p| p.name.starts_with(name)).collect();
+    match hits.len() {
+        1 => Ok(hits[0].clone()),
+        0 => {
+            let mut names: Vec<String> = props.iter().map(|p| format!("-{}", p.name)).collect();
+            names.sort();
+            let menu = match names.len() {
+                0 => String::new(),
+                1 => names[0].clone(),
+                2 => format!("{} or {}", names[0], names[1]),
+                _ => format!(
+                    "{} or {}",
+                    names[..names.len() - 1].join(", "),
+                    names[names.len() - 1]
+                ),
+            };
+            Err(Error::Msg(format!(
+                "bad property \"-{}\": must be {}",
+                name, menu
+            )))
+        }
+        _ => Err(Error::Msg(format!("ambiguous property \"{}\"", name))),
+    }
+}
+
+fn cmd_configure(
+    interp: &mut Interp,
+    obj_key: &str,
+    args: &[Value],
+    _typed: &str,
+) -> Result<Value> {
+    let props = collect_properties(interp, obj_key);
+    if args.is_empty() {
+        let mut readable: Vec<&PropertyDef> =
+            props.iter().filter(|p| p.kind != PropKind::Writable).collect();
+        readable.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut out: Vec<Value> = Vec::new();
+        for p in readable {
+            out.push(Value::from_str(&format!("-{}", p.name)));
+            out.push(cfg_get(interp, obj_key, p)?);
+        }
+        return Ok(Value::from_list(&out));
+    }
+    if args.len() == 1 {
+        let p = cfg_resolve(&props, args[0].as_str())?;
+        if p.kind == PropKind::Writable {
+            return Err(Error::Msg(format!(
+                "bad property \"-{}\": must be readable",
+                p.name
+            )));
+        }
+        return cfg_get(interp, obj_key, &p);
+    }
+    if args.len() % 2 != 0 {
+        return Err(Error::wrong_args_with_usage(
+            "configure",
+            2,
+            args.len() + 1,
+            "?-prop? ?-prop value ...?",
+        ));
+    }
+    let mut i = 0;
+    while i < args.len() {
+        let p = cfg_resolve(&props, args[i].as_str())?;
+        if p.kind == PropKind::Readable {
+            return Err(Error::Msg(format!(
+                "bad property \"-{}\": must be writable",
+                p.name
+            )));
+        }
+        cfg_set(interp, obj_key, &p, args[i + 1].clone())?;
+        i += 2;
+    }
+    Ok(Value::empty())
+}
+
 /// `::oo::Helpers::classvariable` (and its per-object hidden spelling):
 /// link names to the namespace of the class that defined the running
 /// method (all instances share it).  Object-defined methods link to the
 /// object namespace, matching the doc's namespace-upvar equivalence.
-extern "Rust" fn cmd_oo_classvariable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
-    let (owner, obj_key) = match interp.oo.active.last() {
+extern "Rust" fn cmd_oo_classvariable(interp: &mut Interp, args: &[Value]) -> Result<Value> {    let (owner, obj_key) = match interp.oo.active.last() {
         Some(a) => (
             a.chain.get(a.index).map(|e| e.owner.clone()),
             Some(Rc::clone(&a.obj)),
@@ -2308,6 +2468,11 @@ fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) 
     let ns = Rc::from(next_ns(interp));
     let epoch = interp.oo.next_obj_id;
     if is_meta {
+        let configurable = class_key == "::oo::configurable";
+        let mut methods = Vec::new();
+        if configurable {
+            methods.push(("configure".to_string(), builtin_method("configure")));
+        }
         interp.oo.classes.insert(
             canonical.clone(),
             OoClass {
@@ -2316,6 +2481,8 @@ fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) 
                 superclasses: vec!["::oo::object".to_string()],
                 abstract_class: class_key == "::oo::abstract",
                 singleton_class: class_key == "::oo::singleton",
+                configurable,
+                methods,
                 ..Default::default()
             },
         );
@@ -3521,8 +3688,108 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
             interp.oo.define_private = saved;
             r
         }
+        "property" => def_property(interp, &target, rest),
         _ => Err(Error::invalid_command(word)),
     }
+}
+
+/// 9.1 `property` definition word (oo::configurable classes/instances).
+fn def_property(interp: &mut Interp, target: &DefineTarget, rest: &[Value]) -> Result<Value> {
+    let configurable = match target {
+        DefineTarget::Class(c) => interp.oo.classes.get(c).is_some_and(|x| x.configurable),
+        DefineTarget::Object(o) => {
+            if let Some(obj) = interp.oo.objects.get(o) {
+                interp
+                    .oo
+                    .classes
+                    .get(&obj.class)
+                    .is_some_and(|c| c.configurable)
+            } else {
+                interp.oo.classes.get(o).is_some_and(|c| c.configurable)
+            }
+        }
+    };
+    if !configurable {
+        return Err(Error::invalid_command("property"));
+    }
+    if rest.is_empty() {
+        return Err(Error::wrong_args_with_usage(
+            "property",
+            2,
+            rest.len() + 1,
+            "name ?-kind kind? ?-get script? ?-set script? ?name ...?",
+        ));
+    }
+    let mut props: Vec<PropertyDef> = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        let name = rest[i].as_str().to_string();
+        if name.starts_with('-') {
+            return Err(Error::Msg(format!("bad property name \"{}\"", name)));
+        }
+        i += 1;
+        let mut kind = PropKind::ReadWrite;
+        let mut getter = None;
+        let mut setter = None;
+        while i < rest.len() && rest[i].as_str().starts_with('-') {
+            let opt = rest[i].as_str().to_string();
+            if i + 1 >= rest.len() {
+                return Err(Error::wrong_args_with_usage(
+                    "property",
+                    3,
+                    rest.len() + 1,
+                    "name ?-kind kind? ?-get script? ?-set script? ?name ...?",
+                ));
+            }
+            let val = rest[i + 1].as_str().to_string();
+            i += 2;
+            match opt.as_str() {
+                "-kind" => {
+                    kind = match val.as_str() {
+                        "readable" => PropKind::Readable,
+                        "writable" => PropKind::Writable,
+                        "readwrite" => PropKind::ReadWrite,
+                        _ => {
+                            return Err(Error::Msg(format!(
+                                "bad property kind \"{}\": must be readable, writable, or readwrite",
+                                val
+                            )))
+                        }
+                    }
+                }
+                "-get" => getter = Some(Rc::from(val.as_str())),
+                "-set" => setter = Some(Rc::from(val.as_str())),
+                _ => {
+                    return Err(Error::Msg(format!(
+                        "bad option \"{}\": must be -get, -kind, or -set",
+                        opt
+                    )))
+                }
+            }
+        }
+        props.push(PropertyDef { name, kind, getter, setter });
+    }
+    for p in props {
+        match target {
+            DefineTarget::Class(c) => {
+                if let Some(cl) = interp.oo.classes.get_mut(c) {
+                    cl.properties.retain(|q| q.name != p.name);
+                    cl.properties.push(p);
+                }
+            }
+            DefineTarget::Object(o) => {
+                if let Some(obj) = interp.oo.objects.get_mut(o) {
+                    obj.properties.retain(|q| q.name != p.name);
+                    obj.properties.push(p);
+                } else if let Some(cl) = interp.oo.classes.get_mut(o) {
+                    cl.properties.retain(|q| q.name != p.name);
+                    cl.properties.push(p);
+                }
+            }
+        }
+    }
+    interp.oo.mutation_ctr += 1;
+    Ok(Value::empty())
 }
 
 fn def_target_name(target: &DefineTarget) -> String {
@@ -3842,7 +4109,7 @@ const OBJECT_SUBCMDS: &[&str] = &[
 
 const CLASS_SUBCMDS: &[&str] = &[
     "call", "constructor", "definition", "definitionnamespace", "destructor", "filters", "forward", "instances",
-    "methods", "methodtype", "mixins", "subclasses", "superclasses", "variables",
+    "methods", "methodtype", "mixins", "properties", "subclasses", "superclasses", "variables",
 ];
 
 pub(crate) extern "Rust" fn cmd_info_entry(interp: &mut Interp, args: &[Value]) -> Result<Value> {
@@ -4592,6 +4859,57 @@ fn info_class(interp: &mut Interp, args: &[Value], prefix: &str) -> Result<Value
         None => return Err(unknown_sub_error(word, CLASS_SUBCMDS)),
     };
     match sub {
+        "properties" => {
+            if args.len() < 4 {
+                return Err(Error::wrong_args_with_usage(
+                    &format!("{} properties", prefix),
+                    4,
+                    args.len(),
+                    "className ?-all|-readable|-writable?",
+                ));
+            }
+            let key = resolve_class_arg(interp, args[3].as_str())?;
+            let mut all = false;
+            let mut mode = 0u8; // 0 = readable (default), 1 = readable, 2 = writable
+            for flag in &args[4..] {
+                match flag.as_str() {
+                    "-all" => all = true,
+                    "-readable" => mode = 1,
+                    "-writable" => mode = 2,
+                    other => {
+                        return Err(Error::Msg(format!(
+                            "bad option \"{}\": must be -all, -readable, or -writable",
+                            other
+                        )))
+                    }
+                }
+            }
+            let classes: Vec<String> = if all {
+                linearize(interp, &key)
+            } else {
+                vec![key.clone()]
+            };
+            let mut out: Vec<String> = Vec::new();
+            for c in classes {
+                if let Some(cl) = interp.oo.classes.get(&c) {
+                    for p in &cl.properties {
+                        let ok = match p.kind {
+                            PropKind::ReadWrite => true,
+                            PropKind::Readable => mode != 2,
+                            PropKind::Writable => mode == 2,
+                        };
+                        if ok {
+                            out.push(format!("-{}", p.name));
+                        }
+                    }
+                }
+            }
+            out.sort();
+            out.dedup();
+            Ok(Value::from_list(
+                &out.iter().map(|s| Value::from_str(s)).collect::<Vec<_>>(),
+            ))
+        }
         "superclasses" => {
             if args.len() != 4 {
                 return Err(Error::wrong_args_with_usage(
@@ -4975,6 +5293,30 @@ mod tests {
         assert_eq!(
             eval("oo::class create Counted {variable number; constructor {} {classvariable count; set number [incr count]}; method report {} {classvariable count; list $number $count}}; set a [Counted new]; set b [Counted new]; list [$a report] [$b report]"),
             "{1 2} {2 2}"
+        );
+    }
+
+    #[test]
+    fn test_oo_9_1_properties() {
+        assert_eq!(
+            eval("oo::configurable create K {property a -kind readable; property b -kind writable; property c -kind readwrite}; list [info class properties K] [info class properties K -readable] [info class properties K -writable]"),
+            "{-a -c} {-a -c} {-b -c}"
+        );
+        assert_eq!(
+            eval("oo::configurable create C {property p}; C create c; set w [c configure -p 1]; list $w [c configure -p] [c configure]"),
+            "{} 1 {-p 1}"
+        );
+        assert_eq!(
+            eval("oo::configurable create Q {property p}; Q create q; catch {q configure -q 1} m; set m"),
+            "bad property \"-q\": must be -p"
+        );
+        assert_eq!(
+            eval("oo::configurable create G {property x -get {return 9} -set {set ::setv $value}}; G create g; list [g configure -x] [g configure -x 5] $::setv"),
+            "9 {} 5"
+        );
+        assert_eq!(
+            eval_err("oo::class create P {property x}"),
+            "invalid command name \"property\""
         );
     }
 

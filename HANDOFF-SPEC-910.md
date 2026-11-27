@@ -235,6 +235,12 @@ doc/*.n 章节）。
    差异以 `-- rtcl:` 注释内嵌，属 T3 迁移面。
 5. 9.1 oracle 与 doc 的冲突实例：`doc/chan.n` 的 errorstack 示例仍写
    `invokeStk1`，实测 9.1.0 已统一为 `invokeStk`（按 §4 证据原则取实测）。
+6. `matching.allium` `FormatCIsBmpOnly` — 9.1 把 `%c` 上限从 16 位
+   `Tcl_UniChar` 提到 Unicode 标量 0..0x10FFFF：65536/128512 正常输出
+   星光面字符，1114112 与负数才落 U+FFFD。原 8.6 规则已改为
+   `FormatCRendersUnicodeScalar`（T1 批）。
+7. `expr` 的 `017` 是十进制 17，而 `scan %i`/`%o` 的 `017` 仍是八进制
+   15（C 语义）。两处都已按 oracle 分别钉死，勿当同一套字面量语法。
 
 ## 8. 交接记录
 
@@ -267,10 +273,14 @@ doc/*.n 章节）。
 - 换锚：expr / variables / trace / error-deep / io 五份头部改
   `Oracle: tclsh 9.1.0 (core-9-1-0)`，并注明 C 类未覆盖范围；其余 9 份
   仍为 8.6.17，待各自 C 类完成后再换。
-- C 类：未开始。下一期顺序 T1 → T5 → T3 → T4 新命令面 → T6 → T2/T7。
+- C 类：T1 已完成（expr/string/matching 三份补 29 条规则，含数字
+  字面量、任意精度、lt/le/gt/ge、expr 注释、C99 mathfunc、新数值命令、
+  string is 字面量、format/scan 32 位与 size 修饰符、format 语法错误、
+  %c Unicode 标量上限）。T5/T3/T4/T6/T2/T7 未开始；下一期顺序
+  T5 → T3 → T4 新命令面 → T6 → T2/T7。
 - 门禁终态：`allium check specs/` 0 error（4 warning 为 memory-lifecycle
   既有 unused entity/binding；5 info 为既有 unused field）；
   `allium analyse specs/` 0 finding。未改 crates/judge，未跑 judge
   （规格-only 改动不触发代码门禁）。
-- git diff --stat 范围：`specs/{expr,variables,trace,error-deep,io}.allium`
-  + 本文件，符合 §4 边界。
+- git diff --stat 范围：`specs/{expr,string,matching,variables,trace,
+  error-deep,io}.allium` + 本文件，符合 §4 边界。

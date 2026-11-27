@@ -2206,14 +2206,39 @@ pub fn cmd_format(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 if flag_hash { format!("0b{}", s) } else { s }
             }
             'c' => {
-                let v = int_arg!(arg);
-                // D-23：%c 是 16 位 Tcl_UniChar——>0xFFFF 直接 U+FFFD
-                // （tclsh 实测 65536 → 替换符，无 16 位回绕）。
-                let cp = if size_h { v as u16 as u32 } else { v as u32 };
-                if cp > 0xFFFF {
-                    '\u{FFFD}'.to_string()
+                // 9.1 钉形（oracle 实测，utf-20.1）：Tcl_UniChar 已 32 位，
+                // %c 接受完整 Unicode——0x10000 → U+10000 单字符；size 修饰
+                // 符不窄化（%hc/%lc 0x10000 均 65536）；负数与 >0x10FFFF
+                // → U+FFFD；超 i64 的 bignum 报 ARITH IOVERFLOW（非
+                // expected integer）。代理区 rtcl 字符串层（Rust String）
+                // 不可存独代理 → 同 U+FFFD（oracle 可存但 puts 报 invalid
+                // multibyte，语料不钉此面）。
+                let v = match parse_tcl_int_strict(arg.as_str()) {
+                    Some(v) => v,
+                    None => {
+                        if crate::types::bignum::parse_int(arg.as_str().trim()).is_some() {
+                            return fmt_err!(
+                                "integer value too large to represent",
+                                "ARITH IOVERFLOW {integer value too large to represent}"
+                            );
+                        }
+                        let msg = format!("expected integer but got \"{}\"", arg.as_str());
+                        return fmt_err!(msg, "TCL VALUE NUMBER");
+                    }
+                };
+                // Tcl_GetIntFromObj 的界：[INT_MIN, UINT_MAX]（注意上界是
+                // UINT_MAX——2147483648 通过并截断回绕，-2147483649 报错，
+                // oracle 实测非对称）；(unsigned)cp > 0x10FFFF → U+FFFD。
+                if !(i32::MIN as i64..=(u32::MAX as i64)).contains(&v) {
+                    return fmt_err!(
+                        "integer value too large to represent",
+                        "ARITH IOVERFLOW {integer value too large to represent}"
+                    );
+                }
+                if (0..=0x10FFFF).contains(&v) {
+                    char::from_u32(v as u32).unwrap_or('\u{FFFD}').to_string()
                 } else {
-                    char::from_u32(cp).unwrap_or('\u{FFFD}').to_string()
+                    '\u{FFFD}'.to_string()
                 }
             }
             'f' => {

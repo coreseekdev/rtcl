@@ -1,12 +1,12 @@
 -- allium: 3
 -- regex-spencer.allium
 -- Behaviour spec: Spencer/Tcl-ARE 正则引擎（B 路径 Rust 移植）。
--- Oracle: tclsh 8.6.17. 目标：语义逐字对齐；实现见
+-- Oracle: tclsh 9.1.0 (core-9-1-0). 目标：语义逐字对齐；实现见
 -- crates/rtcl-vm/src/interp/commands/regexp_spencer/ 与
 -- specs/regex-spencer-port.md。性能结构不在此层（见该文档 §性能）。
 --
 -- 本 spec 是 M2/M3/M4 的验收口径：每条规则的 oracle 结果均来自
--- tclsh 8.6.17 实测；rtcl 现状/差异注释保留。
+-- 2026-11-27 tclsh 9.1.0 实测（23 条全量复跑）；rtcl 现状/差异注释保留。
 
 use "./interp.allium" as interp
 
@@ -91,7 +91,9 @@ rule StringAnchorsBindSearchStart {
 }
 
 rule WordAndWordStartAssertions {
-    when: Evaluates("list [regexp {\\ya+} \" baa\"] [regexp {\\ma+} \" baa\"] [regexp {\\Ma} \"ba a\"]")
+    -- \y = word boundary, \m = word start, \M = word end (the assertion
+    -- sits before the next atom, so the a in "ba a" is matched by a\M).
+    when: Evaluates("list [regexp {\\ya+} \" aa\"] [regexp {\\ma+} \" aa\"] [regexp {a\\M} \"ba a\"]")
     ensures: completion.code = ok
     ensures: completion.value = "1 1 1"
 }
@@ -157,10 +159,11 @@ rule InvalidEmbeddedOption {
     ensures: completion.value = "1"
 }
 
-rule LookbehindRejectedIn86 {
+rule LookbehindRejected {
     when: Evaluates("catch {regexp {(?<=a)b} x} m")
     ensures: completion.code = ok
     ensures: completion.value = "1"
+    -- 9.1 still has no lookbehind; REG_BADRPT ("invalid quantifier operand")
 }
 
 rule LiteralPrefixQuoteMode {

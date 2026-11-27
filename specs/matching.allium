@@ -50,13 +50,14 @@ rule RegexpRejectsNonCapturingGroups {
     -- rtcl: accepts (?: via the regex crate — superset, same family as D-18)
 }
 
-rule RegexpRejectsUnicodeEscapes {
-    -- \uXXXX / \x{...} inside a pattern are invalid escapes in tclsh
-    -- 8.6 ARE (\x41 two-digit hex IS valid).
-    when: Evaluates("regexp {\\u0041} A")
-    ensures: completion.code = error
-    -- oracle: cannot compile regular expression pattern: invalid escape \ sequence
-    -- rtcl: accepts, matches literal 'A'  [D-18]
+rule RegexpUnicodeEscapeIsAccepted {
+    -- \uXXXX is a valid ARE escape (matches U+0041); the brace form
+    -- \x{...} is not. \x41 two-digit hex is valid.
+    when: Evaluates("list [regexp {\\u0041} A] [catch {regexp {\\x{41}} A} m]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+    -- probe: 2026-11-27 tclsh9.1 (8.6.17 behaves the same); the brace
+    --   form errors REGEXP REG_EESCAPE "invalid escape \ sequence".
 }
 
 rule RegexpLazyQuantifierPreference {

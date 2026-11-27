@@ -2922,3 +2922,31 @@ judge **94/95**（余 gen_lseq 1 = arithseries rep 记账项）、crash-gate
 128/128、probes **398/76**（known 2/10：objsec/objquad 容差化后转绿）、
 sweep 12 既有、workspace **cargo exit 0**（rtcl-vm 871/0）、wasm32 ✓、
 五特性 ✓。案例链：语料 9.1 重提取基线 4157 → 各批累计 **4817/4849=99.3%**。
+
+## D1 步骤 1——VarArena + 全局表迁移（task/d1-vars1 @ 499acc6，2026-11-27，子代理施工）
+
+- **Arena 形状**：VarRef{table,slot,gen} 句柄 + generation-guarded 槽
+  arena（删除置洞+代数+1，槽地址永不搬移，空洞复用靠代数防 ABA）+
+  Fx 桶链键索引 + 插入序向量（删除留洞跳洞枚举→「每活键恰一次、末
+  次创建位」）= tclsh 表序。Var{value,flags(ARRAY/UNDEFINED/LINKED),
+  elem_count,traces,link} 16B；traces/link 占位恒 None（步骤 3/4 迁）。
+  embedded cfg 退 BTreeMap（本模块零错误）。
+- **三合一迁移**：globals 平表 + phantom_globals + array_globals（含
+  全局 elem_counts）→ 每命名空间一张 VarTable。读写面全路由
+  （vars/vm_exec/namespace/oo/misc/array/eval/control/proc/package/
+  interp_cmd/introspect/list/dict）；var_slot_fast 两处 &mut 逃逸改
+  闭包形（with_var_slot_res/link_res）。
+- **对拍**：debug 双读逐读对拍（旧平表路径保留至步骤 5）+ release
+  judge 对 oracle 逐字节。**抓到 1 个真漏点**：启动数组标记先于基键
+  落表 → `info globals` 序错位——insert_moving（无值条目上值=新建序
+  位）修复。
+- 门禁（合并树）：judge **95/95 全绿**——**gen_lseq-4.11 顺势转绿**
+  （arena 复用语义与 tclsh arithseries 面对齐，记账项清除）；crash-gate
+  128/128；probes 398/76；sweep 12 既有；rtcl-vm **884/0**（对拍常开）；
+  五特性/wasm32 ✓。
+- 基准：var_incr/dict/list/string_build ±噪声内；元素微基准 create
+  **-5%（反超）**/read +2.5%；array size O(1) 保持；ns 体反超方向保持。
+- wasm 体积 +25.6KB/+0.83%（arena 机制+路径；步骤 5 删镜像结构预期
+  回收）。行为序变化面（登记）：`array unset <pattern>` 逐元素 trace
+  触发序、oo copy 复制序从 HashMap 迭代序换 arena 插入序——judge 语料
+  证实两处旧序未被钉。

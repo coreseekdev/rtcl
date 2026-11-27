@@ -57,7 +57,7 @@ rule ExprDivisionByZeroErrors {
     when: Evaluates("expr {1 / 0}")
     ensures: completion.code = error
     ensures: completion.value = "divide by zero"
-    -- probe: puts [expr {1.0/0.0}]   =>  Inf     (tclsh 8.6.17, 2026-11-03 实证)
+    -- probe: puts [expr {1.0/0.0}]   =>  Inf     (tclsh 8.6.17/9.1.0, 2026-11-27)
     -- probe: puts [expr {-1.0/0.0}]  =>  -Inf
     -- probe: puts [expr {0.0/0.0}]   =>  domain error: argument not in valid range
 }

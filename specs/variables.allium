@@ -2,8 +2,8 @@
 -- variables.allium
 -- Behaviour spec: variable scoping in Tcl — proc frames, global, upvar,
 -- namespaces, arrays. Oracle: tclsh 9.1.0 (core-9-1-0).
--- A/B + T5 rules re-anchored 2026-11-27; remaining C-class coverage tracked
--- in HANDOFF-SPEC-910.md §8.
+-- A/B + T4/T5 rules re-anchored 2026-11-27; remaining C-class coverage
+-- tracked in HANDOFF-SPEC-910.md §8.
 --
 -- 9.1 namespace rule: an unqualified variable name inside a namespace eval
 -- body resolves only within the current namespace (plus variable links in

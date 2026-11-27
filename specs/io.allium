@@ -2,7 +2,7 @@
 -- io.allium
 -- Behaviour spec: channels, IO, file, encoding — open/puts/gets/read/
 -- seek/eof/close/fconfigure/chan/file/glob/source, CLI exit semantics.
--- Oracle: tclsh 9.1.0 (core-9-1-0). A/B + T3 rules re-anchored
+-- Oracle: tclsh 9.1.0 (core-9-1-0). A/B + T3/T4 rules re-anchored
 -- 2026-11-27; remaining C-class coverage tracked in HANDOFF-SPEC-910.md §8.
 -- rtcl divergences from this spec are tracked in DIVERGENCES.md
 -- (D-29 … D-34；glob 归 D-26；台账为准).
@@ -93,7 +93,7 @@ rule FconfigureEncodingMustBeKnown {
     when: Evaluates("catch {fconfigure stdout -encoding bogus} m; set m")
     ensures: completion.code = ok
     -- oracle: unknown encoding "bogus"
-    -- rtcl: silently accepts and stores (query echoes "bogus")  [D-30]
+    -- rtcl: FIXED 2026-11-05（校验 + TCL LOOKUP ENCODING）[D-29]
 }
 
 rule EncodingCommandExists {

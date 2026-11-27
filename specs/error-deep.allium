@@ -140,7 +140,7 @@ rule TryTrapMatchesElementWiseExactPrefix {
     -- try supports trap, but the pattern matching is ELEMENT-WISE EXACT
     -- PREFIX (no glob!): {E} matches [E C]; {E *} does NOT match [E C];
     -- the {ARITH DIVZERO *} idiom does not fire in 8.6 (glob is Tcl 9).
-    -- 2026-11-05 oracle reversal: tclsh 8.6.17 dual-probed.
+    -- 2026-11-05 oracle reversal: tclsh 8.6.17 dual-probed; 9.1.0 same.
     when: Evaluates("try {error msg2 {} {E C}} trap {E} {m} {set m}")
     ensures: completion.code = ok
     ensures: completion.value = "msg2"

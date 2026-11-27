@@ -3,8 +3,8 @@
 -- Behaviour spec: TclOO — oo::object / oo::class / oo::define /
 -- oo::objdefine / oo::copy, method resolution (C3), next, filters,
 -- unknown dispatch, info object / info class, object lifecycle and
--- rename interop.  Oracle: tclsh 9.1.0 (core-9-1-0). T6 measured subset
--- re-anchored 2026-11-27; object-count question is §6.1 (open).
+-- rename interop.  Oracle: tclsh 9.1.0 (core-9-1-0). T6 re-anchored
+-- 2026-11-27 (object-count base pinned at Obj20).
 -- 2026-11-03 distillation round (probes: specs/oo-deep.probes; divergences
 -- D-40 … D-43 in DIVERGENCES.md).
 
@@ -407,5 +407,59 @@ rule UnknownMethodMessageListsVisibleMethods {
     when: Evaluates("oo::class create E {method m {} {}}; E create e; catch {e nosuch} m; set m")
     ensures: completion.code = ok
     ensures: completion.value = "unknown method \"nosuch\": must be destroy or m"
+    -- probe: 2026-11-27 tclsh9.1
+}
+
+rule ClassVariableIsSharedAcrossInstances {
+    -- classvariable is a method-scope command linking to the defining
+    -- class's namespace, so all instances share the counter (it is not an
+    -- oo::define subcommand).
+    when: Evaluates("oo::class create Counted {variable number; constructor {} {classvariable count; set number [incr count]}; method report {} {classvariable count; list $number $count}}; set a [Counted new]; set b [Counted new]; set ra [$a report]; set rb [$b report]; set c [Counted new]; list $ra $rb [$c report]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{1 2} {2 2} {3 3}"
+    -- probe: oo_features91 (doc/classvariable.n)
+}
+
+rule ConfigurablePropertyKinds {
+    -- oo::configurable's property command defines readable/writable/
+    -- readwrite properties; info class properties filters by kind.
+    when: Evaluates("oo::configurable create KindP {property a -kind readable; property b -kind writable; property c -kind readwrite}; list [info class properties KindP] [info class properties KindP -readable] [info class properties KindP -writable]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{-a -c} {-a -c} {-b -c}"
+    -- probe: oo_features91 (doc/configurable.n)
+}
+
+rule ConfigureReadsWritesAndListsProperties {
+    -- configure with one arg reads, with pairs writes (empty result), and
+    -- with no args returns the sorted property/value dict.
+    when: Evaluates("oo::configurable create CfgP {property p}; CfgP create cp; set w [cp configure -p 1]; list $w [cp configure -p] [cp configure]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 1 {-p 1}"
+    -- probe: 2026-11-27 tclsh9.1
+}
+
+rule ConfigureUnknownPropertyMessage {
+    -- Setting an unknown property is a bad-property error naming the
+    -- available property.
+    when: Evaluates("oo::configurable create CfgQ {property p}; CfgQ create cq; catch {cq configure -q 1} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad property \"-q\": must be -p"
+    -- probe: 2026-11-27 tclsh9.1
+}
+
+rule PropertyCustomAccessors {
+    -- -get/-set supply the property accessor bodies; -set receives value.
+    when: Evaluates("oo::configurable create CfgR {property x -get {return 9} -set {set ::setv $value}}; CfgR create cr; list [cr configure -x] [cr configure -x 5] $::setv")
+    ensures: completion.code = ok
+    ensures: completion.value = "9 {} 5"
+    -- probe: 2026-11-27 tclsh9.1
+}
+
+rule InstancePropertyDefinition {
+    -- oo::objdefine can add a property to one instance; class properties
+    -- stay empty.
+    when: Evaluates("oo::configurable create CfgS {}; CfgS create cs; oo::objdefine cs {property q}; list [info class properties CfgS] [catch {cs configure -q} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 1 {can't read \"q\": no such variable}"
     -- probe: 2026-11-27 tclsh9.1
 }

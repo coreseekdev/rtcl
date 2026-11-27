@@ -1,6 +1,8 @@
 -- allium: 3
 -- memory-lifecycle.allium
 -- Runtime resource-lifecycle contract for rtcl.
+-- Oracle: n/a — this is an implementation resource contract; the
+-- Tcl-observable behaviour lives in the domain specs (all tclsh 9.1.0).
 --
 -- Scope: ownership and timely release of runtime resources — values,
 -- channels (files/pipes/reflected/transforms), call frames, OO objects,

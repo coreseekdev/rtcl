@@ -1,6 +1,7 @@
 -- allium: 3
 -- interp.allium
 -- Shared vocabulary for the rtcl behaviour specs.
+-- Oracle: tclsh 9.1.0 (core-9-1-0). T4 timer/process/utility rules.
 --
 -- Scope: observable semantics of evaluating Tcl scripts, as defined by
 -- the oracle implementation (tclsh 9.1.0). All sibling specs state

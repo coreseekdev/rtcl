@@ -39,12 +39,33 @@ q classvars {
     list [info class variables VarP] [info class variables VarP -private]
 }
 
-# 9.1.0 gaps: docs exist but the definition commands do not
-q classvariable-absent {
-    oo::class create CV {}
-    list [catch {oo::define CV {classvariable cv 5}} m] $m
+# classvariable is a METHOD-SCOPE command (not an oo::define subcommand);
+# properties are provided by the oo::configurable metaclass.
+q classvariable-shared {
+    oo::class create CountP {
+        variable number
+        constructor {} {classvariable count; set number [incr count]}
+        method report {} {classvariable count; list $number $count}
+    }
+    set a [CountP new]
+    set b [CountP new]
+    set ra [$a report]
+    set rb [$b report]
+    set c [CountP new]
+    list $ra $rb [$c report]
 }
-q property-absent {list [catch {oo::class create PropP {property foo}} m] $m}
+q classvariable-in-define {oo::class create CV {}; list [catch {oo::define CV {classvariable cv 5}} m] $m}
+q property-configurable {oo::configurable create PropP {property foo}; info class properties PropP}
+q property-plain-class {list [catch {oo::class create PlainP {property foo}} m] $m}
+q property-kinds {
+    oo::configurable create KindP {property a -kind readable; property b -kind writable; property c -kind readwrite}
+    list [info class properties KindP] [info class properties KindP -readable] [info class properties KindP -writable]
+}
+q configure {
+    KindP create kp
+    kp configure -c 1
+    kp configure -c
+}
 
 # object identity / introspection
 q creationid {set o [oo::object new]; list [expr {[info object creationid $o] > 0}] [expr {[info object creationid $o] == [info object creationid $o]}]}

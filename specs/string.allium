@@ -1,6 +1,8 @@
 -- allium: 3
 -- string.allium
--- Behaviour spec: Tcl string commands. Oracle: tclsh 8.6.17.
+-- Behaviour spec: Tcl string commands. Oracle: tclsh 9.1.0 (core-9-1-0).
+-- T1 rules re-anchored 2026-11-27; T2 (64-bit indices) and T3 (Unicode
+-- classes) coverage tracked in HANDOFF-SPEC-910.md §8.
 --
 -- Indices in Tcl strings are character-based, never byte offsets.  For
 -- the BMP (all of tclsh 8.6's practical surface) tclsh counts UCS-2
@@ -92,4 +94,23 @@ rule StringEqualAndCompare {
     ensures: completion.code = ok
     ensures: completion.value = "1"
     -- compare returns -1/0/1; both support -nocase and -length
+}
+
+-- ── 9.1 integer literal grammar (T1, 2026-11-27) ────────────────
+
+rule StringIsIntegerUses9LiteralGrammar {
+    -- string is integer accepts 0o/0b/0x, leading-zero decimal and
+    -- underscore separators; malformed radix prefixes are rejected.
+    when: Evaluates("list [string is integer 0o17] [string is integer 0b101] [string is integer 010] [string is integer 08] [string is integer 0b2] [string is integer 0x]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 1 0 0"
+    -- probe: s_probe (0b2/0x are false; bignum still integer)
+}
+
+rule StringIsWideIntegerExcludesBignum {
+    -- wideinteger means fits in 64 bits; a bignum is not wideinteger.
+    when: Evaluates("list [string is wideinteger 9223372036854775807] [string is wideinteger 9223372036854775808] [string is wideinteger 0x10]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 1"
+    -- probe: s_probe
 }

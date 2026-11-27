@@ -2,7 +2,8 @@
 -- matching.allium
 -- Behaviour spec: pattern matching and value formatting — regexp /
 -- regsub (Tcl ARE), string match (glob), format / scan, binary, clock.
--- Oracle: tclsh 8.6.17. 2026-11-03 deep-water round.
+-- Oracle: tclsh 9.1.0 (core-9-1-0). T1 (format/scan) re-anchored
+-- 2026-11-27; T7 (regex/binary) coverage tracked in HANDOFF-SPEC-910.md §8.
 -- rtcl divergences from this spec are tracked in DIVERGENCES.md
 -- (D-18 … D-27；台账为准).
 
@@ -118,13 +119,131 @@ rule StringMatchNocaseIsPerCharSimpleFold {
 
 -- ── format / scan ─────────────────────────────────────────────────
 
-rule FormatCIsBmpOnly {
-    -- %c renders Tcl_UniChar (16-bit) values: 65536 wraps to U+FFFD
-    -- territory — no astral-plane character is produced.
-    when: Evaluates("format %c 65536")
+rule FormatCRendersUnicodeScalar {
+    -- 9.1 raised %c's ceiling from the 16-bit Tcl_UniChar to the Unicode
+    -- scalar range 0..0x10FFFF. Out-of-range and negative values render
+    -- U+FFFD (65533).
+    when: Evaluates("list [scan [format %c 65536] %c] [scan [format %c 128512] %c] [scan [format %c 1114112] %c]")
     ensures: completion.code = ok
-    -- oracle: U+FFFD (replacement char, bytes ef bf bd)
-    -- rtcl: U+10000 astral char (f0 90 80 80)  [D-23]
+    ensures: completion.value = "65536 128512 65533"
+    -- probe: format_grammarD (1114112 => U+FFFD); 8.6 capped every value
+    --   above 65535 at U+FFFD, which is why this rule was BMP-only.
+}
+
+-- ── 9.1 format/scan widths and grammar (T1, 2026-11-27) ─────────
+
+rule FormatIntegerTruncatesTo32Bits {
+    -- Without a size modifier, integer conversions use the C target width
+    -- (32-bit for d/i/u/o/x/b, 16-bit for h) and truncate modulo that
+    -- width rather than saturating. l/ll/L and j/q/z/t select 64 bits.
+    when: Evaluates("list [format %d 2147483648] [format %u -1] [format %x -255] [format %ld 3000000000] [format %lld 30000000000] [format %hd 65535]")
+    ensures: completion.code = ok
+    ensures: completion.value = "-2147483648 4294967295 ffffff01 3000000000 30000000000 -1"
+    -- probe: format_grammarE/format_grammarD/p45
+}
+
+rule FormatAlternatePrefixes {
+    -- %# prefixes: octal uses the 9.x 0o form, binary 0b, hex 0x; a zero
+    -- value gets no prefix (C99 rule).
+    when: Evaluates("list [format %#o 5] [format %#o 0] [format %#x 0] [format %#b 5]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0o5 0 0 0b101"
+    -- probe: format_grammarC
+}
+
+rule FormatSizeModifiersSelect64Bit {
+    -- j/q/z/t (and L/ll) select a 64-bit target even without a wider
+    -- integer; bare conversions are the only 32-bit path.
+    when: Evaluates("list [format %jd 30000000000] [format %qd 30000000000] [format %zd 30000000000] [format %td 30000000000] [format %Ld 30000000000]")
+    ensures: completion.code = ok
+    ensures: completion.value = "30000000000 30000000000 30000000000 30000000000 30000000000"
+    -- probe: p45/format_grammarD (9.0.1 completed the modifier set)
+}
+
+rule ScanSizeModifiersSelect64Bit {
+    -- The same modifiers work on scan's integer conversions.
+    when: Evaluates("list [scan 30000000000 %jd] [scan 30000000000 %qd] [scan 30000000000 %zd] [scan 30000000000 %td] [scan 30000000000 %Ld]")
+    ensures: completion.code = ok
+    ensures: completion.value = "30000000000 30000000000 30000000000 30000000000 30000000000"
+    -- probe: p45/p48
+}
+
+rule FormatIntegerLiteralGrammar {
+    -- Integer arguments are parsed with the 9.1 literal grammar: 0b/0o,
+    -- leading-zero decimal and underscore separators all work.
+    when: Evaluates("list [format %d 1_000] [format %d 0b101] [format %d 017] [format %d 08]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1000 5 17 8"
+    -- format %d 0o18 => expected integer but got "0o18"
+    -- probe: format_grammarF
+}
+
+rule FormatIncompleteSpecifierErrors {
+    -- A specifier cut off before its conversion letter is INCOMPLETE.
+    when: Evaluates("catch {format {%.} 5} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "format string ended in middle of field specifier"
+    -- errorCode: TCL FORMAT INCOMPLETE ; probe: format_grammarG (%. / %q)
+}
+
+rule FormatSpecifierMixErrors {
+    -- Positional (%n$) and sequential (%) conversions cannot be mixed.
+    when: Evaluates("catch {format {%d %1$d} 1 2} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "cannot mix \"%\" and \"%n$\" conversion specifiers"
+    -- errorCode: TCL FORMAT MIXEDSPECTYPES ; probe: format_grammarC/G
+}
+
+rule FormatNotEnoughArguments {
+    -- A trailing % with no argument is a field/variable mismatch.
+    when: Evaluates("catch {format {ab%}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "not enough arguments for all format specifiers"
+    -- errorCode: TCL FORMAT FIELDVARMISMATCH ; probe: format_grammar8/G
+}
+
+rule ScanIntegerTruncatesTo32Bits {
+    -- scan mirrors format: %d/%i/%x are 32-bit and truncate modulo 2^32;
+    -- an overflowing digit run saturates at INT_MAX.
+    when: Evaluates("list [scan 3000000000 %d] [scan 2147483648 %d] [scan 99999999999999999999 %d] [scan 3000000000 %ld] [scan ffffffffffffffff %x]")
+    ensures: completion.code = ok
+    ensures: completion.value = "-1294967296 -2147483648 2147483647 3000000000 -1"
+    -- probe: p45/p51/scan_overflow
+}
+
+rule ScanIntegerLiteralGrammar {
+    -- scan's %i honours C-style octal (010 => 8) and %o/%x/%b their
+    -- bases, unlike expr where a leading zero is decimal.
+    when: Evaluates("list [scan 010 %i] [scan 017 %o] [scan 0x10 %x] [scan 0b101 %b]")
+    ensures: completion.code = ok
+    ensures: completion.value = "8 15 16 5"
+    -- probe: p44/p48
+}
+
+rule ScanOverflowSaturates {
+    -- A 17-digit hex run saturates at INT_MAX / INT_MIN (32-bit target).
+    when: Evaluates("list [scan fffffffffffffffff %x] [scan -ffffffffffffffff %x]")
+    ensures: completion.code = ok
+    ensures: completion.value = "2147483647 -2147483648"
+    -- probe: p51/scan_overflow
+}
+
+rule ScanCharReturnsCodePoint {
+    -- %c scans one character and returns its code point; width/size
+    -- modifiers are rejected (there is exactly one character).
+    when: Evaluates("list [scan é %c] [catch {scan -12 {%2c%n} a b} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "233 1 {field width may not be specified in %c conversion}"
+    -- probe: p45/p48 (size modifier gets the analogous message)
+}
+
+rule ScanFloatSpecialValues {
+    -- inf/-inf spellings are accepted and yield Inf/-Inf; a NaN token
+    -- consumes nothing (zero conversions, p51).
+    when: Evaluates("list [scan Inf %f] [scan -Infinity %f] [scan 1e3 %f]")
+    ensures: completion.code = ok
+    ensures: completion.value = "Inf -Inf 1000.0"
+    -- probe: p48/p51 (scan NaN %f reports zero conversions)
 }
 
 -- ── binary ────────────────────────────────────────────────────────

@@ -2,7 +2,7 @@
 -- expr.allium
 -- Behaviour spec: Tcl expression evaluation (`expr`, and the expression
 -- arguments of if/while/for). Oracle: tclsh 9.1.0 (core-9-1-0).
--- A/B rules re-anchored 2026-11-27; remaining C-class coverage tracked in
+-- A/B + T1 rules re-anchored 2026-11-27; T2/T7 coverage tracked in
 -- HANDOFF-SPEC-910.md §8.
 --
 -- Scope: numeric type rules, operator semantics, substitutions, errors.
@@ -202,4 +202,132 @@ rule ExprMalformedListOperandErrors {
     when: Evaluates("expr {\"a\" in \"{\"}")
     ensures: completion.code = error
     -- oracle: unmatched open brace in list
+}
+
+-- ── 9.1 numeric surface (T1, 2026-11-27) ─────────────────────────
+-- Probes: judge/probes/bn2-bn14, expr_lead1/2, bnprobe2, incr_widen,
+-- p11/p13/p40, info4. Every value below was re-run on tclsh 9.1.0.
+
+rule ExprRadixPrefixesAreExplicit {
+    -- 0o/0x/0b select the radix; a bare leading zero is decimal.
+    when: Evaluates("list [expr {0o17}] [expr {0x1A}] [expr {0b101}] [expr {017}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "15 26 5 17"
+    -- probe: bn2/bn4/expr_lead1
+}
+
+rule ExprDigitSeparatorsAllowed {
+    -- Underscores may separate digits in any radix and are not part of the
+    -- value; the underscore must follow a digit (0x_10 is rejected).
+    when: Evaluates("list [expr {1_000}] [expr {0o1_7}] [expr {0b1_01}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1000 15 5"
+    -- probe: bn2/bnprobe2
+}
+
+rule ExprLeadingZeroFloatIsDecimal {
+    -- Leading-zero floats are decimal too: 08.5 is 8.5, not an octal error.
+    when: Evaluates("list [expr {08.5}] [expr {028.1 + 09.2}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "8.5 37.3"
+    -- probe: expr_lead1/expr_lead2
+}
+
+rule ExprCommentsRunToEndOfLine {
+    -- 9.0 added # comments inside expressions; the rest of the line is
+    -- ignored.
+    when: Evaluates("expr {1 + 2 # ignored + 3}")
+    ensures: completion.code = ok
+    ensures: completion.value = "3"
+}
+
+rule ExprStringOrderingOpsLtLeGtGe {
+    -- lt/le/gt/ge compare as strings, unlike < <= > >= which compare
+    -- numerically when both operands are numeric ("2" sorts after "10").
+    when: Evaluates("list [expr {2 lt 10}] [expr {2 le 10}] [expr {2 gt 10}] [expr {2 ge 10}] [expr {2 < 10}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0 1 1 1"
+    -- probe: p11/p13
+}
+
+rule ExprBooleanListOperandErrors {
+    -- A list value in boolean position is a type error, not "true".
+    when: Evaluates("expr {\"a b\" ? 1 : 0}")
+    ensures: completion.code = error
+    ensures: completion.value = "expected boolean value but got a list"
+    -- probe: p32/p33 (dict filter/map script bodies)
+}
+
+rule ExprNonNumericOperandMessage {
+    -- 9.1 names the offending value and the operand side for arithmetic.
+    when: Evaluates("catch {expr {\"true\" % 2}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "cannot use non-numeric string \"true\" as left operand of \"%\""
+    -- probe: bn10
+}
+
+rule ExprNaNValueMessage {
+    -- NaN as an arithmetic operand gets the "non-numeric floating-point"
+    -- wording (bare `nan` alone is a domain error instead).
+    when: Evaluates("catch {expr {nan + 0}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "cannot use non-numeric floating-point value \"nan\" as left operand of \"+\""
+    -- probe: bn6/bn7
+}
+
+rule ExprNotOperatorMessage {
+    -- ! on a non-numeric string names the value and the (unary) operator.
+    when: Evaluates("catch {expr {!\"foo\"}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "cannot use non-numeric string \"foo\" as operand of \"!\""
+    -- probe: verify
+}
+
+rule ExprIncrWidensToBignum {
+    -- incr promotes at the i64 boundary in both directions; it never wraps.
+    when: Evaluates("set y 9223372036854775807; set z -9223372036854775808; list [incr y] [incr z -1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "9223372036854775808 -9223372036854775809"
+    -- probe: incr_widen/incr_window_p*
+}
+
+rule ExprIntConvertsFloatToBignum {
+    -- int()/entier() truncate toward zero and widen to arbitrary precision
+    -- for large doubles (no 32/64-bit clamp).
+    when: Evaluates("list [expr {int(1e22)}] [expr {int(-1.5)}] [expr {entier(-1.5)}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "10000000000000000000000 -1 -1"
+    -- probe: bn2/bn3/bnprobe2
+}
+
+rule ExprMathFunctionsC99Core {
+    -- The C99 math surface is present (info functions lists 53 names).
+    when: Evaluates("list [expr {hypot(3,4)}] [expr {log2(8)}] [expr {exp2(3)}] [expr {copysign(3,-2)}] [expr {fma(2,3,4)}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "5.0 3.0 8.0 -3.0 10.0"
+    -- probe: info4
+}
+
+rule ExprMathFunctionsPredicates {
+    -- Predicate functions return 0/1 integers, not floating-point booleans.
+    when: Evaluates("list [expr {signbit(-1)}] [expr {isunordered(NaN,1)}] [expr {isnormal(1.0)}] [expr {issubnormal(1e-320)}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 1"
+    -- probe: info4
+}
+
+rule ExprNewNumericCommands {
+    -- 9.1 adds fpclassify/divmod/frexp/modf/remquo; divmod floors like /.
+    when: Evaluates("list [fpclassify 0.0] [divmod -7 3] [frexp 8] [modf 3.25] [remquo 7 3]")
+    ensures: completion.code = ok
+    ensures: completion.value = "zero {-3 2} {0.5 4} {3.0 0.25} {1.0 2}"
+    -- probe: info4
+}
+
+rule ExprMathopStringComparisons {
+    -- ::tcl::mathop gains lt/le/gt/ge alongside the numeric operators.
+    when: Evaluates("list [::tcl::mathop::lt 2 10] [::tcl::mathop::le 2 10] [::tcl::mathop::gt 2 10] [::tcl::mathop::ge 2 10]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0 1 1"
+    -- probe: p40
 }

@@ -71,3 +71,24 @@ rule ProcessSubcommandMenu {
     ensures: completion.value = "unknown or ambiguous subcommand \"gorp\": must be autopurge, list, purge, or status"
     -- probe: process91
 }
+
+-- ── 9.1 unsupported::assemble (T7, 2026-11-27) ──────────────────
+-- Probes: cmp_assemble, unsupported_assemble; 9.1.0 instruction menu.
+
+rule AssembleInstructionSetChanged {
+    -- swap is available and land is gone; the menu also adds isEmpty,
+    -- strge/strgt/strle/strlt, jumpTableNum, dictGetDef/dictPut/
+    -- dictRemove and tclooId. lshift is still present in 9.1.
+    when: Evaluates("list [catch {tcl::unsupported::assemble {land}} e] [string match {bad instruction \"land\"*} $e] [catch {tcl::unsupported::assemble {push a; push b; swap; pop}} r] $r")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 0 b"
+    -- probe: cmp_assemble/unsupported_assemble
+}
+
+rule AssembleReportsStackBalance {
+    -- Leaving values on the stack is a compile-time error naming the depth.
+    when: Evaluates("catch {tcl::unsupported::assemble {push a; push b}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "stack is unbalanced on exit from the code (depth=2)"
+    -- probe: cmp_assemble
+}

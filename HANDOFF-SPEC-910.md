@@ -216,12 +216,61 @@ doc/*.n 章节）。
 
 （暂无）
 
+### 2026-11-27（spec-910 接手轮）
+
+1. `variables.allium` `VariableLinkIsPerEvalBodyFrame` — A4 未列出的同类实伤：
+   原 ensures `"9 2"` 依赖 8.6 的 ns→global 回退；9.1 内层体写
+   `::o::i::s`，实测 `list $::o::s $s [set ::o::i::s]` = `"9 1 2"`。
+   已按实测改写（与 A4 同批提交）。
+2. `trace.allium` `TraceInfoRoundTripsAndOrdersOps` — 注释钉的 op 序
+   `read, write, unset, array` 对 8.6.17 也不成立；两 oracle 实测均为
+   `array read write unset`。且原 ensures 漏了外层列表括号（完整返回是
+   `{{write unset} cb}`）。已把 when 改为 `lindex [...] 0` 并修正注释。
+3. `io.allium` `EncodingCommandExists` — 原文引 `[D-30]`，但 DIVERGENCES
+   的 encoding 条目是 D-29（D-30 是 read 计数）。已改引 D-29（FIXED）。
+4. B1 实现面差异（只登记，不修码）：rtcl `encoding` 已存在，但 NAMES 仍是
+   8.6 的 86 名（保 identity，无 utf-16/utf-32/ucs-2/cesu-8；9.1 为 95），
+   且 `profiles`/`user` 子命令与 `-profile`/`-failindex` 解析缺失
+   （`io.rs` 的 convertfrom/to 要求恰好 4 个参数）。规格按 oracle 钉，
+   差异以 `-- rtcl:` 注释内嵌，属 T3 迁移面。
+5. 9.1 oracle 与 doc 的冲突实例：`doc/chan.n` 的 errorstack 示例仍写
+   `invokeStk1`，实测 9.1.0 已统一为 `invokeStk`（按 §4 证据原则取实测）。
+
 ## 8. 交接记录
 
 ### 2026-11-27（交出）
 
 - 交出方：对照与底账（§3 全部内容）由本轮会话完成；产物即本文件。
-- 接收方：（待填）
-- 完成范围：（待填——A 类 6 处 + B1 为必达；C 类按组登记）
-- 门禁终态：（待填——allium check/analyse 数字；judge 双 oracle 未受影响
-  的确认）
+- 接收方：spec-910 会话（见下一节）。
+- 完成范围：仅交出底账，未改任何规格。
+- 门禁终态：基线 `allium check/analyse specs/` 与 2026-11-27 一致。
+
+### 2026-11-27（接收/本期执行）
+
+- 接收方：spec-910 会话（worktree `/home/nzinfo/src.note/rtcl-spec910`，
+  branch `task/spec-910`）。
+- 完成范围（必达项）：
+  - A1 `ExprLeadingZeroIsDecimal`（原 `ExprLegacyOctalLiteral`）：
+    `expr {010}` ensures `"8"` → `"10"`，补 0o/0d/0b/下划线。
+  - A2 位运算错误文案改 9.1 口径（含值与左右操作数指位）。
+  - A3 `WhichVariableDoesNotFallBackToGlobal`（原
+    `WhichVariableFollowsChain`）：`"::g"` → `""`。
+  - A4 `NsBodyIncrCreatesNamespaceVariable` /
+    `NsBodyIncrDoesNotTouchGlobal` / `NsBodyArrayElementStaysInNamespace`
+    三条按 9.1 重钉；另补 `VariableLinkIsPerEvalBodyFrame`（§7-1）。
+  - A5 legacy `trace variable|vdelete|vinfo` 两条改为 bad-option 报错；
+    `TraceInfoRoundTripsAndOrdersOps` 的 op 序一并修正（§7-2）。
+  - A6/B2 `ErrorstackEntries`：`invokeStk1`→`invokeStk`，补 `UP <n>`
+    token 说明；`returnImm` 经 9.1 复跑确认不变。
+  - B1 `EncodingCommandExists` 注释更新（D-29 FIXED、86 vs 95 名）+
+    5 条 9.1 编码档规则（profiles / strict / -failindex / tcl8 / user）。
+- 换锚：expr / variables / trace / error-deep / io 五份头部改
+  `Oracle: tclsh 9.1.0 (core-9-1-0)`，并注明 C 类未覆盖范围；其余 9 份
+  仍为 8.6.17，待各自 C 类完成后再换。
+- C 类：未开始。下一期顺序 T1 → T5 → T3 → T4 新命令面 → T6 → T2/T7。
+- 门禁终态：`allium check specs/` 0 error（4 warning 为 memory-lifecycle
+  既有 unused entity/binding；5 info 为既有 unused field）；
+  `allium analyse specs/` 0 finding。未改 crates/judge，未跑 judge
+  （规格-only 改动不触发代码门禁）。
+- git diff --stat 范围：`specs/{expr,variables,trace,error-deep,io}.allium`
+  + 本文件，符合 §4 边界。

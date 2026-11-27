@@ -2,10 +2,12 @@
 -- trace.allium
 -- Behaviour spec: the trace command — variable traces (read/write/
 -- unset/array), command traces (rename/delete), execution traces
--- (enter/leave/enterstep/leavestep), and the legacy rwua forms.
--- Oracle: tclsh 8.6.17. 2026-11-03 distillation round (trace-deep
--- probes live in specs/trace-deep.probes; divergences D-36 … D-39 in
--- DIVERGENCES.md).
+-- (enter/leave/enterstep/leavestep). The legacy `trace variable|vdelete|
+-- vinfo` forms were removed in Tcl 9.0 and are pinned here as errors.
+-- Oracle: tclsh 9.1.0 (core-9-1-0). A/B rules re-anchored 2026-11-27;
+-- remaining C-class coverage tracked in HANDOFF-SPEC-910.md §8.
+-- 2026-11-03 distillation round (trace-deep probes live in
+-- specs/trace-deep.probes; divergences D-36 … D-39 in DIVERGENCES.md).
 
 use "./interp.allium" as interp
 
@@ -27,12 +29,15 @@ rule TraceOnUncreatedVariableAllowed {
 
 rule TraceInfoRoundTripsAndOrdersOps {
     -- trace info variable returns re-listable {{opList callback} ...};
-    -- the op list renders in the fixed order read, write, unset, array
-    -- regardless of registration order (legacy vinfo likewise: ua, not au).
-    when: Evaluates("trace info variable x    -- after: trace add variable x {write unset} cb")
+    -- the op list renders in the fixed order array, read, write, unset
+    -- regardless of registration order (2026-11-27 re-probed on both
+    -- 8.6.17 and 9.1.0; the earlier "read, write, unset, array" note was
+    -- wrong for 8.6 as well).
+    when: Evaluates("lindex [trace info variable x] 0    -- after: trace add variable x {write unset} cb")
     ensures: completion.code = ok
     ensures: completion.value = "{write unset} cb"
-    -- rtcl: FIXED 2026-11-05（legacy 渲染序 r,w,u,a）
+    -- the full command returns a list of such pairs: {{write unset} cb}
+    -- full set probe: {{array read write unset} cb}
 }
 
 rule TraceRemoveRemovesOneExactMatch {
@@ -140,22 +145,25 @@ rule UpvarLinkedAccessFiresTraces {
     -- rtcl: FIXED 2026-11-05（aliased 槽分支 trace 时回落名路径）
 }
 
-rule LegacyElementTraceFires {
-    -- The legacy form `trace variable a(k) w cb` registers an element
-    -- trace and fires on element writes.
-    when: Evaluates("set log    -- after: trace variable a(k) w cb; set a(k) 1")
+rule LegacyVariableFormRemoved {
+    -- 9.1 keeps only `trace add|info|remove`; the legacy
+    -- `trace variable a(k) w cb` spelling is rejected as a bad option.
+    when: Evaluates("catch {trace variable a(k) w cb} m; set m")
     ensures: completion.code = ok
-    ensures: completion.value = "R"
-    -- rtcl: FIXED 2026-11-05（legacy 三子命令 split_elem 路由）
+    ensures: completion.value = "bad option \"variable\": must be add, info, or remove"
+    -- probe 2026-11-27 tclsh9.1: catch {trace variable a(k) w cb} m; puts $m
+    -- rtcl: 仍暴露 legacy split_elem 路由（迁移面；不为它立 ensures）
 }
 
-rule LegacyBadOpsMessage {
-    -- Legacy non-rwua operations: bad operations "q": should be one or
-    -- more of rwua; an empty op string is also an error.
-    when: Evaluates("catch {trace variable x q cb} m; set m")
+rule LegacyTraceSubcommandsAllRemoved {
+    -- vinfo and vdelete are gone under the same bad-option error; there is
+    -- no legacy rwua op validation path left to reach.
+    when: Evaluates("list [catch {trace vinfo a(k)} m1] $m1 [catch {trace vdelete a(k) w cb} m2] $m2")
     ensures: completion.code = ok
-    ensures: completion.value = "bad operations \"q\": should be one or more of rwua"
-    -- rtcl: FIXED 2026-11-05（bad operations 文本 + 空 op 同报错）
+    ensures: completion.value = "1 {bad option \"vinfo\": must be add, info, or remove} 1 {bad option \"vdelete\": must be add, info, or remove}"
+    -- probe 2026-11-27 tclsh9.1
+    -- 8.6 spec pinned the legacy "bad operations \"q\": should be one or
+    -- more of rwua" message, which no longer exists.
 }
 
 -- ── command traces ───────────────────────────────────────────────

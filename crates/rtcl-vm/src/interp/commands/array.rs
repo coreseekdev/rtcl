@@ -367,14 +367,15 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let listed = {
                 let (owner_fi, base) = interp.array_owner(array_name);
                 let prefix = format!("{}(", base);
-                // D1 步骤 1：元素在席扫描经 arena（帧域不变；全局域
-                // order_entries 前缀过滤——序不承载语义）。
+                // D1 步骤 1/2：元素在席扫描经表（帧域走 vt order_entries
+                // 有值过滤——镜像迭代序不承载语义；全局域同）。
                 interp.is_array_semantic(array_name)
                     || match owner_fi {
-                        Some(i) => interp.frames[i]
-                            .locals
-                            .keys()
-                            .any(|k| k.starts_with(&prefix) && k.ends_with(')')),
+                        Some(i) => interp.frames[i].vt.order_entries().any(|(k, v)| {
+                            v.has_value()
+                                && k.as_ref().starts_with(&prefix)
+                                && k.as_ref().ends_with(')')
+                        }),
                         None => interp
                             .var_arena
                             .root()
@@ -662,20 +663,26 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // 真源）。逐元素 unset trace 的触发序随之 = 插入序（与旧映
             // 射迭代序不同源——judge 语料钉形验证）。
             let elements_to_remove: Vec<String> = match owner_fi {
+                // D1 步骤 2：帧域元素枚举走 vt（插入序——全局域 D1 步
+                // 骤 1 已同换；逐元素 unset trace 触发序 = 插入序，与旧
+                // 映射迭代序不同源——judge 语料钉形验证）。
                 Some(i) => interp.frames[i]
-                    .locals
-                    .keys()
-                    .filter(|k| {
-                        if k.starts_with(&prefix) && k.ends_with(')') {
-                            match pattern {
+                    .vt
+                    .order_entries()
+                    .filter(|(k, v)| {
+                        let k = k.as_ref();
+                        v.has_value()
+                            && k.starts_with(&prefix)
+                            && k.ends_with(')')
+                            && match pattern {
                                 Some(pat) => glob_match(pat, &k[prefix.len()..k.len() - 1]),
                                 None => true,
                             }
-                        } else {
-                            false
-                        }
                     })
-                    .map(|k| k[prefix.len()..k.len() - 1].to_string())
+                    .map(|(k, _)| {
+                        let k = k.as_ref();
+                        k[prefix.len()..k.len() - 1].to_string()
+                    })
                     .collect(),
                 None => interp
                     .var_arena

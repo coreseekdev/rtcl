@@ -186,12 +186,30 @@ pub(crate) struct CachedCmd {
 /// A procedure call frame.
 #[derive(Debug, Clone)]
 pub(crate) struct CallFrame {
+    /// 帧变量表（D1 步骤 2，specs/ARCH-DESIGN-20261126.md D1）：名键面
+    /// 的权威存储——`locals` 平表 + `array_locals` 位集（数组基位）的
+    /// 三合一，形状 = 步骤 1 的 [`vararena::VarTable`]（TableId::Frame
+    /// (帧栈下标) 身份）。读路径经 `vars.rs` 的 frame_local_* 咽喉
+    /// （debug 双读对拍下平表镜像）；写双写（vt 权威 + 镜像同步）。
+    /// 生命周期随帧：池化归还/尾调重绑/trace 清场走
+    /// [`CallFrame::reset_var_state`]（表清空 + 代数递增——池化复用
+    /// 不冲突）；协程排水随帧整体进出 record（表随帧，无需对拍桥）。
+    /// 插入序向量与 `locals_order` 日志同语义（debug 下逐列对拍——
+    /// T3 直列的迁移期并存）。
+    pub vt: vararena::VarTable,
+    /// D1 步骤 2 起：`vt` 的平表镜像（debug 对拍域——release 不维护、
+    /// 无人读；迁移期保留至步骤 5 删除）。权威读写在 `vt`。
     pub locals: VarMap<Value>,
     /// Tcl hash-order log for this frame's var table (`info locals` /
     /// `info vars` in proc scope replay it; reset with `locals` on
     /// frame recycle so every call rebuilds it from param order).
+    /// 双域结构（release 特性 T3 直列仍读它重放）——`vt` 插入序的对
+    /// 拍在 debug 下并跑（顺序语义红线）。
     pub locals_order: Vec<String>,
     /// Names in `locals` that are arrays (scalar/array distinction).
+    /// D1 步骤 2 起：数组基标记的 debug 镜像（权威 = `vt` 的 ARRAY 位
+    /// + 数组基快索引）；帧元素计数（`elem_counts`）保持 release 权威
+    /// ——步骤 3 随数组元素表并入。
     pub array_locals: VarSet,
     /// Live element counts of this frame's arrays, keyed by the array's
     /// base name (`array size`/`exists` read it instead of scanning every
@@ -285,6 +303,29 @@ pub(crate) struct CallFrame {
 }
 
 impl CallFrame {
+    /// 帧名键面清空（D1 步骤 2）：`vt` 整表重置（代数逐槽递增——池化
+    /// 复用旧句柄全灭）+ 插入日志清空（双域）+ 元素计数清空（帧域
+    /// elem_counts 保持既有权威）+ 平表/位集镜像同步（debug 对拍域
+    /// ——release 镜像此后无人读，读全走 vt）。帧池归还、尾调重绑、
+    /// trace 清场三处共用。
+    pub(crate) fn reset_var_state(&mut self) {
+        self.vt.reset();
+        self.locals_order.clear();
+        self.elem_counts.clear();
+        #[cfg(debug_assertions)]
+        {
+            self.locals.clear();
+            self.array_locals.clear();
+        }
+    }
+
+    /// 刷新帧表的表身份（推栈点——池化帧可换帧栈深度复用；协程 resume
+    /// 重推同款）。句柄产出据此携带当次栈位。
+    pub(crate) fn bind_var_table(&mut self, frame_idx: usize) {
+        self.vt
+            .set_owner(vararena::TableId::Frame(frame_idx as u32));
+    }
+
     /// Slot index of `name` in this frame's compiled locals table, when
     /// the frame is slot-compiled (`None` for name-keyed/degraded frames
     /// or table misses — the caller then takes its ordinary path).  A
@@ -1914,6 +1955,9 @@ impl Interp {
 
     /// Reference to variable storage for the current scope (for iteration).
     /// Does NOT follow upvar links.
+    /// （D1 步骤 2 起无消费者且权威面在 `CallFrame::vt`/arena——保留
+    /// 只读镜像访问，勿新用。）
+    #[allow(dead_code)]
     pub(crate) fn scope_vars(&self) -> &VarMap<Value> {
         if let Some(frame) = self.frames.last() {
             &frame.locals

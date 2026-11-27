@@ -922,21 +922,30 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // （S1 钉形）；全局同名不顶替（S3：链落帧局部占位）。宿主
             // unset 后别名转 dangling（deaden_element_links → Dead），
             // 写报 element in deleted array（var-1.17/trv_p11 ③④）。
-            if let Some(paren) = var_name.find('(') {
-                let base = var_name[..paren].to_string();
-                if let Some(f) = interp.frames.get_mut(*frame_index) {
-                    if f.locals.contains_key(&base) && !f.array_locals.contains(&base) {
-                        set_error_code(interp, &format!("TCL LOOKUP VARNAME {}", base));
-                        return Err(Error::runtime(
-                            format!("can't access \"{}\": variable isn't array", other_var),
-                            crate::error::ErrorCode::Generic,
-                        ));
-                    }
-                    if !f.array_locals.contains(&base) {
-                        f.array_locals.insert(base);
+                if let Some(paren) = var_name.find('(') {
+                    let base = var_name[..paren].to_string();
+                    if let Some(f) = interp.frames.get_mut(*frame_index) {
+                        // D1 步骤 2：在席/数组基位走帧 vt 咽喉（debug 双
+                        // 读对拍）。占位（flag-only 数组基）入日志——
+                        // 日志 ⊇ vt 条目不变式恢复（array_elements 的
+                        // 快径守卫 log.len == 活条目数在占位在场时不再
+                        // 误判；重放的 in_table 过滤按有值域把占位滤
+                        // 出——列举输出不变）。
+                        if super::super::vars::frame_local_contains(f, &base)
+                            && !super::super::vars::frame_local_is_array(f, &base)
+                        {
+                            set_error_code(interp, &format!("TCL LOOKUP VARNAME {}", base));
+                            return Err(Error::runtime(
+                                format!("can't access \"{}\": variable isn't array", other_var),
+                                crate::error::ErrorCode::Generic,
+                            ));
+                        }
+                        if !super::super::vars::frame_local_is_array(f, &base) {
+                            super::super::vars::frame_local_mark_array(f, &base);
+                            super::super::vars::frame_log_link(f, &base);
+                        }
                     }
                 }
-            }
         }
 
         // Self-reference, direct or through a link chain.
@@ -976,8 +985,8 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // alias re-resolve through the upvar guards.
         let has_link = interp.frames[current_idx].upvars.contains_key(local_var.as_str());
         if !has_link
-            && (interp.frames[current_idx].locals.contains_key(&local_var)
-                || interp.frames[current_idx].array_locals.contains(&local_var)
+            && (super::super::vars::frame_local_contains(&interp.frames[current_idx], &local_var)
+                || super::super::vars::frame_local_is_array(&interp.frames[current_idx], &local_var)
                 || interp.frames[current_idx].slot_value(&local_var).is_some())
         {
             set_error_code(interp, "TCL UPVAR EXISTS");
@@ -1013,10 +1022,11 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let mirror: Option<Value> = match &link {
             // D1 步骤 1：读经 arena。
             UpvarLink::Global(gname) => interp.global_get(&**gname).cloned(),
+            // D1 步骤 2：帧目标值读走 vt（frame_local_get）。
             UpvarLink::Frame { frame_index, var_name } => interp
                 .frames
                 .get(*frame_index)
-                .and_then(|f| f.locals.get(var_name.as_str()))
+                .and_then(|f| super::super::vars::frame_local_get(f, var_name.as_str()))
                 .cloned(),
             UpvarLink::Dead { .. } => None,
         };
@@ -1027,7 +1037,8 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 v,
             );
         } else {
-            interp.frames[current_idx].locals.remove(&local_var);
+            // D1 步骤 2：种子摘除走 vt（全量）。
+            super::super::vars::frame_local_remove(&mut interp.frames[current_idx], &local_var);
             // Nothing to mirror, but the link is a frame-table entry all
             // the same (tclsh: `upvar #0 alsomissing y; info vars` lists
             // y): log its creation for the hash-order replay.
@@ -1124,8 +1135,8 @@ pub fn cmd_global(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // exists").  Checked before the alias touches the slot.
         let has_link = interp.frames[current_idx].upvars.contains_key(local.as_str());
         if !has_link
-            && (interp.frames[current_idx].locals.contains_key(&local)
-                || interp.frames[current_idx].array_locals.contains(&local)
+            && (super::super::vars::frame_local_contains(&interp.frames[current_idx], &local)
+                || super::super::vars::frame_local_is_array(&interp.frames[current_idx], &local)
                 || interp.frames[current_idx].slot_value(&local).is_some())
         {
             set_error_code(interp, "TCL UPVAR EXISTS");

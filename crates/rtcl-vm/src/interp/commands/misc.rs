@@ -2255,21 +2255,37 @@ pub fn cmd_append(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             && interp.ns_transient.iter().all(|(k, _)| k != array_name)
         {
             let slot = if let Some(frame) = interp.var_frame_mut() {
-                if frame.array_locals.contains(array_name)
+                // D1 步骤 2：数组基位/权威格走帧 vt 咽喉（改格 ⟺ Some
+                // ——rep 前置拒绝都在改格前；镜像重放 debug 并跑）。
+                if crate::interp::vars::frame_local_is_array(frame, array_name)
                     && (frame.upvars.is_empty()
                         || !frame.upvars.contains_key(array_name))
                 {
-                    frame.locals.get_mut(var_name).map(|c| {
-                        // 帧局部格：闭包单次施加。
-                        let mut in_place = true;
-                        for arg in &args[2..] {
-                            if !c.append_str_in_place(arg.as_str()) {
-                                in_place = false;
-                                break;
+                    let r = crate::interp::vars::frame_local_get_mut(frame, var_name)
+                        .map(|c| {
+                            let mut in_place = true;
+                            for arg in &args[2..] {
+                                if !c.append_str_in_place(arg.as_str()) {
+                                    in_place = false;
+                                    break;
+                                }
                             }
+                            in_place.then(|| c.clone())
+                        });
+                    #[cfg(debug_assertions)]
+                    if r.is_some() {
+                        if let Some(c) = frame.locals.get_mut(var_name) {
+                            let mut in_place = true;
+                            for arg in &args[2..] {
+                                if !c.append_str_in_place(arg.as_str()) {
+                                    in_place = false;
+                                    break;
+                                }
+                            }
+                            let _ = in_place;
                         }
-                        in_place.then(|| c.clone())
-                    })
+                    }
+                    r
                 } else {
                     None
                 }

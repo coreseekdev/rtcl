@@ -268,6 +268,11 @@ fn resume_coro(interp: &mut Interp, name: &str, resume_arg: Value) -> Result<Val
     interp.call_depth += depth;
     let frames_base = interp.frames.len();
     interp.frames.extend(frames);
+    // D1 步骤 2：帧表身份随栈位刷新（resume 的栈位不必与挂起时同——
+    // 池化/协程帧换深度复用同款语义）。
+    for (i, f) in interp.frames.iter_mut().enumerate().skip(frames_base) {
+        f.bind_var_table(i);
+    }
     {
         let rec = interp.coroutines.get_mut(name).unwrap();
         rec.on_stack = true;

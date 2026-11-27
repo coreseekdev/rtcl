@@ -19,9 +19,13 @@
 //! - **嵌入兼容**：`embedded` 特性下键索引退化为 `BTreeMap`（同
 //!   `varmap.rs` 的既有模式），无桶链与哈希器。
 //!
-//! 注：本批每张 [`VarTable`] 只服务 0 号全局表（`::`，平键域与现
-//! `globals` 同域），句柄的 [`TableId::Global`] 下标因此恒 0；步骤 2/3
-//! 接入帧/数组元素表时表实例将携带自己的 arena 下标。
+//! 表实例身份：每张 [`VarTable`] 携带自己的 [`TableId`]——0 号根表
+//! （`::`，平键域与现 `globals` 同域）为 [`TableId::Global`]；步骤 2
+//! 的帧表驻 [`super::CallFrame`]（池化归还时 [`VarTable::reset`] 清空
+//! + 代数递增；协程排水随帧整体进出 record），实例携带
+//! [`TableId::Frame`]（帧栈下标，推栈时刷新）——句柄的读/写对帧表经
+//! 帧自身（arena 不持有帧表；[`VarArena::get`] 的 Frame 臂保持 None
+//! 占位）。
 
 #[cfg(not(feature = "embedded"))]
 use super::varmap::VarHasher;
@@ -53,17 +57,31 @@ const NO_SLOT: u32 = u32::MAX;
 // 句柄
 // ---------------------------------------------------------------------------
 
-/// 表身份（D1：三类表）。步骤 1 只用 `Global(0)`；`Frame`/`Array` 为
-/// 步骤 2/3 的占位臂。
-#[allow(dead_code)] // 步骤 2/3 接线后移除（Frame/Array 臂占位）
+/// 表身份（D1：三类表）。`Global(0)` = arena 根表；`Frame(i)` = 帧表
+/// （步骤 2：表实例驻 [`super::CallFrame`]，i = 帧栈下标）；`Array`
+/// 为步骤 3 的占位臂。
+#[allow(dead_code)] // Array 臂步骤 3 接线
 #[derive(Debug, Clone)]
 pub(crate) enum TableId {
     /// 全局（命名空间）表：[`VarArena::tables`] 的下标。
     Global(u32),
-    /// 帧变量表（步骤 2 迁移；占位）。
+    /// 帧变量表（步骤 2 迁移；表实例驻帧，句柄经帧侧访问）。
     Frame(u32),
     /// 数组元素表（步骤 3 迁移；占位）——基变量的句柄。
     Array(Box<VarRef>),
+}
+
+impl TableId {
+    /// 同表判定（句柄读的代数守卫前置——张冠李戴的句柄一律 miss）。
+    /// `Array` 臂在步骤 3 拆元素表前不参与句柄访问。
+    #[inline]
+    pub(crate) fn matches(&self, other: &TableId) -> bool {
+        match (self, other) {
+            (TableId::Global(a), TableId::Global(b)) => a == b,
+            (TableId::Frame(a), TableId::Frame(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 /// 「解析一次」返回的句柄：表 + 槽 + 代数。槽删除后代数递增，持旧
@@ -86,8 +104,9 @@ pub(crate) struct VarRef {
 pub(crate) struct VarFlags(u8);
 
 impl VarFlags {
-    /// 数组容器。步骤 1 语义：全局平键域的数组基标记（镜像
-    /// `array_globals`）；帧域数组标记随步骤 2 迁入。
+    /// 数组容器。全局平键域的数组基标记（镜像 `array_globals`）；
+    /// 帧域随步骤 2 迁入（帧表的数组基同位——帧 `array_locals` 的
+    /// debug 镜像；帧元素计数仍归帧 `elem_counts`，步骤 3 并入）。
     pub(crate) const ARRAY: Self = Self(1 << 0);
     /// 无值条目（phantom：trace/`global`/`upvar #0` 链接占位——镜像
     /// `phantom_globals`）。与「有值」独立：链接目标先 phantom 后
@@ -132,8 +151,8 @@ pub(crate) struct Var {
     /// phantom 成员位）。
     pub value: Value,
     pub flags: VarFlags,
-    /// ARRAY 时：存活元素数（T7 `elem_counts` 的 Var 内化——本批全局
-    /// 域；帧域随步骤 2/3）。
+    /// ARRAY 时：存活元素数（T7 `elem_counts` 的 Var 内化——全局域；
+    /// 帧域计数仍归帧 `elem_counts`，步骤 3 随元素表并入）。
     pub elem_count: u32,
     /// 变量/元素 trace 集（步骤 4 挂载；本批恒 `None`）。
     #[allow(dead_code)]
@@ -180,6 +199,7 @@ impl Var {
 
 /// arena 槽：删除只置洞 + 代数 +1——槽地址永不搬移，`&Var` 指针稳定；
 /// 空洞槽位可复用（代数防护旧句柄）。
+#[derive(Debug, Clone)]
 struct Slot {
     /// 代数：分配时从 0 起；每次 remove +1。句柄命中要求
     /// `ref.gen == gen`；复用槽的新条目继承递增后的代数。
@@ -207,7 +227,11 @@ struct Slot {
 /// （`global_var_order`/`compact_order` 的既有语义）一致，经
 /// `tclhash::tcl_order` 重放即 tclsh 的表枚举序。`embedded` 后备：
 /// 键索引退化为 `BTreeMap`（无桶链、无哈希器——同 varmap.rs 模式）。
+#[derive(Debug, Clone)]
 pub(crate) struct VarTable {
+    /// 表身份（句柄产出与句柄读的归属校验）。根表 = Global(0)；帧表
+    /// = Frame(帧栈下标，推栈时刷新——池化帧可换深度复用）。
+    owner: TableId,
     /// 槽 arena（只增；删除置洞，空洞槽位入 free 复用）。
     slots: Vec<Slot>,
     /// 桶链头（槽下标；[`NO_SLOT`] = 空桶）。embedded 后备不用。
@@ -243,8 +267,21 @@ impl Default for VarTable {
 }
 
 impl VarTable {
+    /// 空表（根表身份：Global(0)）。
     pub(crate) fn new() -> Self {
+        Self::with_owner(TableId::Global(0))
+    }
+
+    /// 帧表（Frame(帧栈下标) 身份）。
+    #[allow(dead_code)] // 步骤 2 帧表构造（call.rs）
+    pub(crate) fn new_frame(frame_idx: u32) -> Self {
+        Self::with_owner(TableId::Frame(frame_idx))
+    }
+
+    /// 指定身份的空表。
+    pub(crate) fn with_owner(owner: TableId) -> Self {
         Self {
+            owner,
             slots: Vec::new(),
             #[cfg(not(feature = "embedded"))]
             buckets: vec![NO_SLOT; 8],
@@ -259,6 +296,46 @@ impl VarTable {
             #[cfg(feature = "embedded")]
             arr_index: alloc::collections::BTreeMap::new(),
         }
+    }
+
+    /// 刷新表身份（池化帧换深度复用时——推栈点调用）。
+    #[allow(dead_code)] // 步骤 2 推栈点（call.rs / coro.rs）
+    pub(crate) fn set_owner(&mut self, owner: TableId) {
+        self.owner = owner;
+    }
+
+    /// 整表清空（**池化重置语义**——帧归还/尾调重绑/trace 清场共用的
+    /// 「表清空」）：全部条目摘除、代数逐槽 +1（旧句柄即使槽号被复用
+    /// 也因代数不符 miss——「代数不冲突」）、桶链/插入序/数组基索引/
+    /// 复用队复位；槽与桶的分配容量保留（池化帧的表重置成本 = 逐槽
+    /// gen 自增 + 桶清零 + 复用队重填，均为 O(槽数) 无重分配）。
+    pub(crate) fn reset(&mut self) {
+        for slot in &mut self.slots {
+            slot.gen = slot.gen.wrapping_add(1);
+            slot.key = None;
+            slot.var = None;
+            #[cfg(not(feature = "embedded"))]
+            {
+                slot.next = NO_SLOT;
+            }
+            slot.order_pos = NO_SLOT;
+        }
+        #[cfg(not(feature = "embedded"))]
+        {
+            self.buckets.fill(NO_SLOT);
+        }
+        #[cfg(feature = "embedded")]
+        {
+            self.index.clear();
+        }
+        self.order.clear();
+        self.live = 0;
+        self.free.clear();
+        // 复用队重填（栈序：0 号槽最先复用——局部性友好；插入序语义
+        // 不依赖槽号，只依赖 order 向量）。
+        self.free.extend((0..self.slots.len() as u32).rev());
+        self.arrays = 0;
+        self.arr_index.clear();
     }
 
     /// 活条目数。
@@ -389,13 +466,19 @@ impl VarTable {
         self.index.get(key).copied()
     }
 
-    /// 槽下标 → VarRef（代数入柄）。
+    /// 槽下标 → VarRef（表身份 + 代数入柄）。
     fn ref_of(&self, idx: u32) -> VarRef {
         VarRef {
-            table: TableId::Global(0),
+            table: self.owner.clone(),
             slot: idx,
             gen: self.slots[idx as usize].gen,
         }
+    }
+
+    /// 句柄归属校验（张冠李戴的句柄——别的表的槽号——一律 miss）。
+    #[inline]
+    fn owns(&self, r: &VarRef) -> bool {
+        self.owner.matches(&r.table)
     }
 
     // -- 读写 ----------------------------------------------------------------
@@ -460,7 +543,7 @@ impl VarTable {
                         self.arrays -= u32::from(was_array);
                         self.reconcile_arr_index(&key, sidx, was_array);
                     }
-                    VarRef { table: TableId::Global(0), slot: sidx, gen: self.slots[sidx as usize].gen }
+                    self.ref_of(sidx)
                 }
                 None => {
                     let sidx = self.alloc_slot(key.clone());
@@ -666,9 +749,12 @@ impl VarTable {
         self.slot_of(key).map(|i| self.ref_of(i))
     }
 
-    /// 句柄读（代数守卫：不符/空洞 → None）。
+    /// 句柄读（表归属 + 代数守卫：不符/空洞 → None）。
     #[allow(dead_code)] // 句柄 API——步骤 2/3 接线
     pub(crate) fn get_ref(&self, r: &VarRef) -> Option<&Var> {
+        if !self.owns(r) {
+            return None;
+        }
         let slot = self.slots.get(r.slot as usize)?;
         if slot.gen != r.gen {
             return None;
@@ -676,9 +762,12 @@ impl VarTable {
         slot.var.as_ref()
     }
 
-    /// 句柄写（代数守卫同上）。
+    /// 句柄写（守卫同上）。
     #[allow(dead_code)] // 句柄 API——步骤 2/3 接线
     pub(crate) fn get_ref_mut(&mut self, r: &VarRef) -> Option<&mut Var> {
+        if !self.owns(r) {
+            return None;
+        }
         let slot = self.slots.get_mut(r.slot as usize)?;
         if slot.gen != r.gen {
             return None;
@@ -686,9 +775,12 @@ impl VarTable {
         slot.var.as_mut()
     }
 
-    /// 句柄的键（代数守卫同上）。
+    /// 句柄的键（守卫同上）。
     #[allow(dead_code)] // 句柄 API——步骤 2/3 接线
     pub(crate) fn key_of(&self, r: &VarRef) -> Option<&str> {
+        if !self.owns(r) {
+            return None;
+        }
         let slot = self.slots.get(r.slot as usize)?;
         if slot.gen != r.gen {
             return None;
@@ -858,9 +950,12 @@ fn bucket_of(key: &str, n_buckets: usize) -> usize {
 // VarArena
 // ---------------------------------------------------------------------------
 
-/// 句柄 arena：表集合 + 按 [`TableId`] 分派的句柄读/写。步骤 1 只装配
-/// 根表（`::`，平键域与现 `globals` 同域）；每命名空间一张的拆分与
-/// Frame/Array 臂随步骤 2/3 接入。
+/// 句柄 arena：**全局表**集合 + 按 [`TableId`] 分派的句柄读/写。步骤 1
+/// 装配根表（`::`，平键域与现 `globals` 同域）；每命名空间一张的拆分
+/// 随后续步骤接入。步骤 2 的帧表不驻此处——它们随
+/// [`super::CallFrame`] 生命周期（池化 reset / 协程整体进出 record），
+/// Frame 句柄的读/写经帧自身的 [`VarTable`]（此处的 Frame 臂保持
+/// None 占位）；`Array` 臂步骤 3 接线。
 pub(crate) struct VarArena {
     tables: Vec<VarTable>,
 }
@@ -888,8 +983,9 @@ impl VarArena {
         &mut self.tables[0]
     }
 
-    /// 句柄读（代数守卫在表内）。Frame/Array 臂步骤 2/3 接入前恒 None。
-    #[allow(dead_code)] // 句柄 API——步骤 2/3 接线
+    /// 句柄读（代数守卫在表内）。Frame 臂：帧表驻帧（见结构注），
+    /// 经帧侧 [`VarTable::get_ref`] 访问——此处恒 None；Array 臂步骤 3。
+    #[allow(dead_code)] // 句柄 API——步骤 3 接线
     pub(crate) fn get(&self, r: &VarRef) -> Option<&Var> {
         match &r.table {
             TableId::Global(i) => self.tables.get(*i as usize).and_then(|t| t.get_ref(r)),
@@ -898,7 +994,7 @@ impl VarArena {
     }
 
     /// 句柄写（代数守卫同上）。
-    #[allow(dead_code)] // 句柄 API——步骤 2/3 接线
+    #[allow(dead_code)] // 句柄 API——步骤 3 接线
     pub(crate) fn get_mut(&mut self, r: &VarRef) -> Option<&mut Var> {
         match &r.table {
             TableId::Global(i) => {
@@ -1034,10 +1130,57 @@ mod tests {
         assert_eq!(a.get(&r).map(|v| v.value.as_str()), Some("9"));
         a.get_mut(&r).unwrap().value = Value::from_int(10);
         assert_eq!(a.root().get("g").map(|v| v.value.as_str()), Some("10"));
-        // Frame 臂（步骤 2 前占位）：恒 None。
+        // Frame 臂：帧表驻帧（步骤 2），经帧侧 VarTable 访问——arena 恒 None。
         let fr = VarRef { table: TableId::Frame(0), slot: 0, gen: 0 };
         assert!(a.get(&fr).is_none());
         assert!(a.get_mut(&fr).is_none());
+    }
+
+    #[test]
+    fn frame_table_identity_and_handle() {
+        // 帧表身份：句柄携带 Frame(idx)；归属校验把别的表的槽号挡在门外。
+        let mut t = VarTable::new_frame(2);
+        let r = t.insert(Rc::from("x"), v("1"));
+        assert!(matches!(r.table, TableId::Frame(2)));
+        assert_eq!(t.get_ref(&r).map(|v| v.value.as_str()), Some("1"));
+        assert_eq!(t.key_of(&r), Some("x"));
+        // 换了身份的表（池化帧换深度复用）不认旧句柄。
+        t.set_owner(TableId::Frame(5));
+        assert!(t.get_ref(&r).is_none());
+        // Global 句柄对帧表同样 miss。
+        let g = VarRef { table: TableId::Global(0), slot: r.slot, gen: r.gen };
+        assert!(t.get_ref(&g).is_none());
+    }
+
+    #[test]
+    fn reset_clears_and_kills_stale_handles() {
+        let mut t = VarTable::new_frame(0);
+        let ra = t.insert(Rc::from("a"), v("1"));
+        let rb = t.insert(Rc::from("b"), v("2"));
+        let mut av = v("arr");
+        av.flags.insert(VarFlags::ARRAY);
+        av.elem_count = 3;
+        t.insert(Rc::from("arr"), av);
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.array_count(), 1);
+        t.reset();
+        // 全清：无活条目、无数组、顺序为空；分配容量保留（槽只增不减）。
+        assert_eq!(t.len(), 0);
+        assert_eq!(t.array_count(), 0);
+        assert_eq!(t.order_entries().count(), 0);
+        assert_eq!(t.slots.len(), 3);
+        // 代数不冲突：旧句柄全部 miss（含从未删除过的条目——reset 逐槽
+        // bump 代数，槽号复用也不会让旧柄复活）。
+        assert!(t.get_ref(&ra).is_none());
+        assert!(t.get_ref(&rb).is_none());
+        assert!(t.key_of(&ra).is_none());
+        // 重置后重建：新条目落复用槽、代数已递增，序语义从零开始。
+        let ra2 = t.insert(Rc::from("a"), v("A"));
+        assert_eq!(ra2.slot, ra.slot);
+        assert_ne!(ra2.gen, ra.gen);
+        assert_eq!(t.get_ref(&ra2).map(|v| v.value.as_str()), Some("A"));
+        let seq: Vec<&str> = t.order_entries().map(|(k, _)| k.as_ref()).collect();
+        assert_eq!(seq, vec!["a"]);
     }
 
     #[test]

@@ -2014,6 +2014,18 @@ pub fn parse_list_full(s: &str) -> std::result::Result<Vec<Value>, ListParseErro
     parse_elements(s, false)
 }
 
+/// TclParseNumber 的报错尾注（tclStrToD.c formaterr，9.1 钉形）：解析
+/// 失败的值若按空白切分 ≥2 词（即一个列表样串——`incr x {20 x}`、
+/// `format %d {1 2}`），报 `but got a list` 而不是引号原文；单词值仍
+/// 引原文（`incr x "  -  "` → `got "  -  "`）。
+pub fn value_report(expected: &str, s: &str) -> String {
+    if s.split_whitespace().count() >= 2 {
+        format!("expected {} but got a list", expected)
+    } else {
+        format!("expected {} but got \"{}\"", expected, s)
+    }
+}
+
 /// Parse a string as a Tcl dictionary's element sequence, reporting Tcl's
 /// dict-specific error texts and errorCodes. `tclDictObj.c` shares the
 /// list element scanner but says "dict element in braces followed by ..."

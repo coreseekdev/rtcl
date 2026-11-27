@@ -4913,6 +4913,32 @@ mod tests {
     }
 
     #[test]
+    fn test_oo_9_1_bootstrap_objects() {
+        // Obj11-14 property slots, Obj15-19 additional classes.
+        assert_eq!(
+            eval("list [info object creationid ::oo::configuresupport::readableproperties] [info object creationid ::oo::configuresupport::writableproperties] [info object creationid ::oo::configuresupport::objreadableproperties] [info object creationid ::oo::configuresupport::objwritableproperties]"),
+            "11 12 13 14"
+        );
+        assert_eq!(
+            eval("list [info object creationid oo::singleton] [info object creationid oo::SingletonInstance] [info object creationid oo::abstract] [info object creationid oo::configuresupport::configurable] [info object creationid oo::configurable]"),
+            "15 16 17 18 19"
+        );
+        assert_eq!(
+            eval("list [info class superclasses oo::singleton] [info class superclasses oo::SingletonInstance] [info class superclasses oo::abstract] [info class superclasses oo::configurable] [info class superclasses oo::configuresupport::configurable]"),
+            "::oo::class ::oo::object ::oo::class ::oo::class ::oo::object"
+        );
+        assert_eq!(eval("llength [info class instances oo::Slot]"), "11");
+        assert_eq!(
+            eval_err("oo::abstract create A {}; A create x"),
+            "unknown method \"create\": must be destroy"
+        );
+        assert_eq!(
+            eval("oo::singleton create S {}; expr {[S new] eq [S new]}"),
+            "1"
+        );
+    }
+
+    #[test]
     fn test_oo_class_methods_and_inheritance() {
         assert_eq!(
             eval("oo::class create A {method m {a b} {return \"$a-$b\"}}; A create i; i m x y"),

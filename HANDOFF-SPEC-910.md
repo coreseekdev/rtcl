@@ -247,8 +247,8 @@ doc/*.n 章节）。
 7. `expr` 的 `017` 是十进制 17，而 `scan %i`/`%o` 的 `017` 仍是八进制
    15（C 语义）。两处都已按 oracle 分别钉死，勿当同一套字面量语法。
 8. 规则数口径：§2 写的「447 条规则」与实测不符——交接基线 `442f4ff`
-   上 `grep '^rule ' specs/*.allium` 为 242 条；本轮结束为 349 条
-   （新增 107 条）。§2 的 447 可能是含 probe/其他分支的旧数，后续以
+   上 `grep '^rule ' specs/*.allium` 为 242 条；本轮结束为 359 条
+   （新增 117 条）。§2 的 447 可能是含 probe/其他分支的旧数，后续以
    grep 计数为准。
 9. T7 指令面修正：9.1 的 `assemble` 菜单仍保留 `lshift`，移除的是
    `land`/`lor`；§3-C 写的「移除 land/lor/lshift」应改为「移除
@@ -293,6 +293,18 @@ doc/*.n 章节）。
       可观察对象（推荐，因为 `info class instances oo::Slot`、
       `oo::singleton` 等都可观察），要么至少把计数器推到 19。本任务
       不改码，登记为 T6 实现缺口。
+16. `chan configure -inputmode` 在 9.1.0 **不存在**（option 清单是
+    -blocking/-buffering/-buffersize/-encoding/-eofchar/-profile/
+    -translation/-stat）。§3-C 的 T4 清单此处应删。
+17. `clock add` 第一参是 epoch 秒（或 now），不是日期串；
+    `-format` 是 `clock format` 的选项，不是 `clock add` 的。已按实测
+    钉 `clock add $t 5 weekdays`。`clock scan -validate 0` 只对范围
+    越界做归一化（2020-02-31 -> 2020-03-02），语法错误仍报错。
+18. T4 工具/内省面实测：`info loaded` 空；`info cmdtype set` = native；
+    `tcl::build-info` 以 9.1.0 开头；`::tcl::pkgconfig list` 19 键
+    （debug=0/threaded=1/64bit=0）；`unicode` 仅归一化四子命令；
+    `zipfs root` = `//zipfs:/`；`timerate` 只宜钉形状。`exec -encoding`
+    可用。
 
 ## 8. 交接记录
 
@@ -347,10 +359,13 @@ doc/*.n 章节）。
     三条既有规则的注释；interp 补 assemble 指令面（swap 可用、land
     移除、lshift 仍在）与栈平衡错误；matching 补 binary 浮点
     Inf/NaN/-0.0 的 IEEE-754 位形（R/r/Q/q）。binary 不再挂裁定项。
-  - T4 余项未做：timerate 细节、unicode（仅归一化）、zipfs、socket
-    新选项、info loaded、package files、::tcl 命令集 27 vs 23、
-    pkgconfig 键集（实测 19 键）。清单中的 readFile/writeFile/
-    foreachLine/tcl::idna 在 9.1.0 不存在（§7-11）。
+  - T4 余项：本轮又补 clock add weekdays / clock scan -validate、
+    exec -encoding、info loaded/cmdtype、tcl::build-info、
+    ::tcl::pkgconfig 键集、unicode 归一化、zipfs root、timerate 形状。
+    仍未做：socket -nodelay/-keepalive（需连通的本地 socket）、
+    package files 的实例面、::tcl 命令集 27 vs 23。清单中的
+    readFile/writeFile/foreachLine/tcl::idna 在 9.1.0 不存在（§7-11），
+    chan configure -inputmode 也不存在（§7-16）。
   - T6：已钉 abstract/singleton/private method/classmethod/
     info class variables（5 条）+ 匿名对象首基准 Obj20、名字/creationid
     关系、命名/类共用计数器、info object isa（4 条）。

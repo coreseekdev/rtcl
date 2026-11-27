@@ -2187,18 +2187,8 @@ impl ChannelTable {
     }
 
     fn close_with(&mut self, id: &str, at_exit: bool) -> io::Result<()> {
-        // tclsh：out-eofchar 在 close 时一次性写出（flush 后、底层关闭
-        // 前；不是逐 puts/flush）——`fconfigure $f -eofchar {{} \x03}` +
-        // puts "X" + close → "X\x03"。
-        let eofc = self.configs.get(id).and_then(|c| c.eofchar_out);
-        if let Some(c) = eofc {
-            if let Some(ch) = self.channels.get_mut(id) {
-                if ch.is_writable() {
-                    let _ = ch.write_bytes(&[c as u8]);
-                    let _ = ch.flush();
-                }
-            }
-        }
+        // 8.6 的 out-eofchar close 时一次性写出已随 9.x 移除（9.0 起写
+        // 侧 eofchar 消失；eofchar_out 不再落值，见 fconfigure set 路径）。
         self.configs.remove(id);
         self.untrack(id);
         match self.channels.remove(id) {

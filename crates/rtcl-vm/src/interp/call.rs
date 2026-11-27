@@ -127,6 +127,8 @@ impl Interp {
         let mut frame = match self.frame_pool.pop() {
             Some(f) => f,
             None => Box::new(CallFrame {
+                // D1 步骤 2：帧变量表（TableId::Frame(帧栈下标) 身份）。
+                vt: super::vararena::VarTable::new_frame(self.frames.len() as u32),
                 locals: VarMap::default(),
                 locals_order: Vec::new(),
                 array_locals: VarSet::default(),
@@ -161,6 +163,9 @@ impl Interp {
         }
         frame.ns_depth = self.ns_level0.len();
         self.frames.push(frame);
+        // D1 步骤 2：帧表身份随栈位刷新（池化帧可换深度复用）。
+        let frame_idx = self.frames.len() - 1;
+        self.frames[frame_idx].bind_var_table(frame_idx);
 
         // First pass through the tail-call loop: the frame came off the
         // pool (or fresh) fully cleared per the invariant above, so the
@@ -266,10 +271,7 @@ impl Interp {
                 // a tail-call rebind pass must empty the previous target's
                 // maps before binding its own.
                 if !first {
-                    frame.locals.clear();
-                    frame.locals_order.clear();
-                    frame.array_locals.clear();
-                    frame.elem_counts.clear();
+                    frame.reset_var_state();
                     frame.consts = None;
                     frame.upvars.clear();
                 }
@@ -776,10 +778,7 @@ impl Interp {
                 .collect();
             if !traced.is_empty() {
                 if let Some(frame) = self.frames.last_mut() {
-                    frame.locals.clear();
-                    frame.locals_order.clear();
-                    frame.array_locals.clear();
-                    frame.elem_counts.clear();
+                    frame.reset_var_state();
                     frame.consts = None;
                 }
                 // Trace callbacks must not disturb the error (if any) that is
@@ -815,10 +814,7 @@ impl Interp {
             let prefix = format!("F{}:", popped_idx);
             self.array_defaults.retain(|k, _| !k.starts_with(&prefix));
         }
-        popped.locals.clear();
-        popped.locals_order.clear();
-        popped.array_locals.clear();
-        popped.elem_counts.clear();
+        popped.reset_var_state();
         popped.consts = None;
         popped.upvars.clear();
         popped.local_procs.clear();
@@ -1293,6 +1289,8 @@ impl Interp {
         let mut frame = match self.frame_pool.pop() {
             Some(f) => f,
             None => Box::new(CallFrame {
+                // D1 步骤 2：帧变量表（TableId::Frame(帧栈下标) 身份）。
+                vt: super::vararena::VarTable::new_frame(self.frames.len() as u32),
                 locals: VarMap::default(),
                 locals_order: Vec::new(),
                 array_locals: VarSet::default(),
@@ -1319,6 +1317,9 @@ impl Interp {
         }
         frame.ns_depth = self.ns_level0.len();
         self.frames.push(frame);
+        // D1 步骤 2：帧表身份随栈位刷新（call_proc 同款）。
+        let frame_idx = self.frames.len() - 1;
+        self.frames[frame_idx].bind_var_table(frame_idx);
 
         // slot-locals 门 + 种子（call_proc 同款——params 对齐 + 无
         // statics；OO prelink 槽的 LOAD-BEARING 不变量同源）。池不变式：
@@ -1558,10 +1559,7 @@ impl Interp {
                 .collect();
             if !traced.is_empty() {
                 if let Some(frame) = self.frames.last_mut() {
-                    frame.locals.clear();
-                    frame.locals_order.clear();
-                    frame.array_locals.clear();
-                    frame.elem_counts.clear();
+                    frame.reset_var_state();
                     frame.consts = None;
                 }
                 let saved_info = self.err_info.take();
@@ -1664,10 +1662,7 @@ impl Interp {
             let prefix = format!("F{}:", popped_idx);
             self.array_defaults.retain(|k, _| !k.starts_with(&prefix));
         }
-        popped.locals.clear();
-        popped.locals_order.clear();
-        popped.array_locals.clear();
-        popped.elem_counts.clear();
+        popped.reset_var_state();
         popped.consts = None;
         popped.upvars.clear();
         popped.local_procs.clear();

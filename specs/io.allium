@@ -2,7 +2,8 @@
 -- io.allium
 -- Behaviour spec: channels, IO, file, encoding — open/puts/gets/read/
 -- seek/eof/close/fconfigure/chan/file/glob/source, CLI exit semantics.
--- Oracle: tclsh 8.6.17. 2026-11-03 deep-water round.
+-- Oracle: tclsh 9.1.0 (core-9-1-0). A/B rules re-anchored 2026-11-27;
+-- remaining C-class coverage tracked in HANDOFF-SPEC-910.md §8.
 -- rtcl divergences from this spec are tracked in DIVERGENCES.md
 -- (D-29 … D-34；glob 归 D-26；台账为准).
 
@@ -101,12 +102,71 @@ rule FconfigureEncodingMustBeKnown {
 }
 
 rule EncodingCommandExists {
-    -- The encoding command exists with convertfrom/convertto/names/system.
+    -- The encoding command exists with convertfrom/convertto/dirs/names/
+    -- profiles/system/user. 9.1's names table has 95 entries: the 8.6 set
+    -- (86) plus utf-16/-le/-be, utf-32/-le/-be, ucs-2/-le/-be, cesu-8,
+    -- minus identity. Profiles default to strict (see the rules below).
     when: Evaluates("llength [encoding names]")
     ensures: completion.code = ok
-    -- oracle: 90+ encodings
-    -- rtcl: invalid command name "encoding" — command entirely missing,
-    --   fconfigure -encoding is stored but never used for transcoding  [D-30]
+    ensures: completion.value = "95"
+    -- probe 2026-11-27 tclsh9.1: llength [encoding names] => 95
+    -- rtcl: command implemented (D-29 FIXED 2026-11-05), but the .enc
+    --   table is the 86-name 8.6 set (identity kept; no utf-16/utf-32/
+    --   ucs-2/cesu-8) — 9.1 name-table coverage is T3 migration work.
+}
+
+rule EncodingProfilesAreReplaceStrictTcl8 {
+    -- encoding profiles lists the three TIP 656 profiles; strict is the
+    -- default when -profile is omitted.
+    when: Evaluates("encoding profiles")
+    ensures: completion.code = ok
+    ensures: completion.value = "replace strict tcl8"
+    -- probe 2026-11-27 tclsh9.1
+    -- rtcl: subcommand absent (convertfrom/convertto only take name data).
+}
+
+rule EncodingStrictProfileRejectsUnmappable {
+    -- With the default strict profile, a character the target encoding
+    -- cannot represent raises and names the source character index.
+    when: Evaluates("catch {encoding convertto ascii \"hé\"} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unexpected character at index 1: 'U+0000E9'"
+    -- probe 2026-11-27 tclsh9.1
+    -- rtcl: replaces with '?' (8.6-style) and never raises.
+}
+
+rule EncodingFailIndexReturnsPrefixAndIndex {
+    -- -failindex turns a conversion error into a partial result: the prefix
+    -- converted before the offending source byte/character, plus the index
+    -- in var. A clean conversion stores -1.
+    when: Evaluates("list [encoding convertto -failindex i ascii \"hé\"] $i")
+    ensures: completion.code = ok
+    ensures: completion.value = "h 1"
+    -- probe 2026-11-27 tclsh9.1; successful form stores -1:
+    --   set i X; encoding convertto -failindex i ascii "hi"; set i => -1
+    -- decode direction: encoding convertfrom -failindex i utf-8
+    --   [binary format H* ff] => "" and i = 0
+    -- rtcl: -profile/-failindex not parsed (wrong # args).
+}
+
+rule EncodingTcl8ProfileReplaces {
+    -- -profile tcl8 restores 8.6 behaviour: unrepresentable characters
+    -- become '?' and no error/failindex is signalled (-1).
+    when: Evaluates("encoding convertto -profile tcl8 ascii \"é\"")
+    ensures: completion.code = ok
+    ensures: completion.value = "?"
+    -- probe 2026-11-27 tclsh9.1; with -failindex i, i = -1
+    -- rtcl: replaces with '?' by default (matches tcl8, not strict).
+}
+
+rule EncodingUserMatchesSystem {
+    -- encoding user returns the user-preference encoding; on non-Windows
+    -- platforms it is the same as encoding system (utf-8 here).
+    when: Evaluates("list [encoding user] [encoding system]")
+    ensures: completion.code = ok
+    ensures: completion.value = "utf-8 utf-8"
+    -- probe 2026-11-27 tclsh9.1 on Linux
+    -- rtcl: user subcommand absent.
 }
 
 -- ── file ──────────────────────────────────────────────────────────

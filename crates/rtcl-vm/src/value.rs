@@ -2015,15 +2015,47 @@ pub fn parse_list_full(s: &str) -> std::result::Result<Vec<Value>, ListParseErro
 }
 
 /// TclParseNumber 的报错尾注（tclStrToD.c formaterr，9.1 钉形）：解析
-/// 失败的值若按空白切分 ≥2 词（即一个列表样串——`incr x {20 x}`、
-/// `format %d {1 2}`），报 `but got a list` 而不是引号原文；单词值仍
-/// 引原文（`incr x "  -  "` → `got "  -  "`）。
+/// 失败的值若「词元数上界估计 >1 且确为合法列表」→ `but got a list`
+/// （`incr x {20 x}`、`format %d {1 2}`）；否则引原文——含尾部空白
+/// 的单词串（`" x "` → `got " x "`）、含未闭合引号/括号的串
+///（`isqrt({1 2 "})` → `got "1 2 \""`）。移植 tclUtil.c
+/// TclMaxListLength（词元上界：首非空白 +1、每个空白游程 +1、尾空白
+/// -1）+ Tcl_SplitList 合法性双闸。
 pub fn value_report(expected: &str, s: &str) -> String {
-    if s.split_whitespace().count() >= 2 {
+    if max_list_length(s) > 1 && parse_list_full(s).is_ok() {
         format!("expected {} but got a list", expected)
     } else {
         format!("expected {} but got \"{}\"", expected, s)
     }
+}
+
+/// TclMaxListLength（tclUtil.c 421）：列表元素数的上界估计。
+fn max_list_length(s: &str) -> usize {
+    let b = s.as_bytes();
+    if b.is_empty() {
+        return 0;
+    }
+    // 首字符空白前没有元素。
+    let mut count = if is_tcl_space(b[0]) { 0 } else { 1 };
+    let mut i = 0;
+    while i < b.len() {
+        if is_tcl_space(b[i]) {
+            // 每个空白游程是一个潜在分隔符。
+            count += 1;
+            while i < b.len() && is_tcl_space(b[i]) {
+                i += 1;
+            }
+            if i >= b.len() {
+                break;
+            }
+        }
+        i += 1;
+    }
+    // 尾空白后面没有元素。
+    if is_tcl_space(b[b.len() - 1]) {
+        count -= 1;
+    }
+    count
 }
 
 /// Parse a string as a Tcl dictionary's element sequence, reporting Tcl's

@@ -27,9 +27,11 @@ pub(crate) fn float_value(f: f64) -> Value {
 
 /// Tcl boolean word parsing: case-insensitive, any unique-prefix
 /// abbreviation of true/false/yes/no/on/off. Returns `None` for ambiguous
-/// ("o" — on/off) or unrecognized strings.
+/// ("o" — on/off) or unrecognized strings.  9.1 起不再 trim：带首尾空白
+/// 的串不是布尔（`expr {" true " && 1}` → expected boolean value but
+/// got " true "；裸词 ` true ` 由词法空白跳过处理，不受影响）。
 pub(crate) fn bool_from_string(s: &str) -> Option<bool> {
-    let lower = s.trim().to_ascii_lowercase();
+    let lower = s.to_ascii_lowercase();
     if lower.is_empty() {
         return None;
     }
@@ -86,6 +88,14 @@ pub fn strict_bool(v: &Value) -> Result<bool> {
 /// `cannot use non-numeric string "a" as operand of "!"`; NaN →
 /// `cannot use non-numeric floating-point value …`; a list →
 /// `cannot use a list as operand of "!"`).
+
+/// `expected <what> but got …` 数值实参报错（9.1 钉形：值按空白切分
+/// ≥2 词 → `but got a list`，否则引原文——`hypot("a b", 2)` /
+/// `isqrt([lseq 1 3])` 钉形）。
+fn value_arg_err(expected: &str, v: &Value) -> Error {
+    Error::Msg(crate::value::value_report(expected, v.as_str()))
+}
+
 pub(crate) fn not_operand(v: &Value) -> Result<bool> {
     if let Some(i) = v.as_int() {
         return Ok(i != 0);
@@ -179,10 +189,7 @@ fn abs_value(v: &Value) -> Result<Value> {
         // 9.1: no "(looks like invalid octal number)" suffix anywhere —
         // `018`-shaped strings are numbers now, so this arm only fires
         // for genuinely non-numeric text.
-        None => Err(Error::Msg(format!(
-            "expected number but got \"{}\"",
-            v.as_str()
-        ))),
+        None => Err(value_arg_err("number", v)),
     }
 }
 
@@ -227,10 +234,7 @@ fn int_or_entier(v: &Value, keep_big: bool) -> Result<Value> {
                 })
             }
         }
-        None => Err(Error::Msg(format!(
-            "expected number but got \"{}\"",
-            v.as_str()
-        ))),
+        None => Err(value_arg_err("number", v)),
     }
 }
 
@@ -282,10 +286,7 @@ pub(crate) fn f64_arg(v: &Value) -> Result<f64> {
             "floating point value is Not a Number".to_string(),
         )),
         Some(f) => Ok(f),
-        None => Err(Error::Msg(format!(
-            "expected floating-point number but got \"{}\"",
-            v.as_str()
-        ))),
+        None => Err(value_arg_err("floating-point number", v)),
     }
 }
 
@@ -381,10 +382,7 @@ fn fp_class(v: &Value) -> Result<FpClass> {
     }
     match v.as_float() {
         Some(d) => Ok(classify(d)),
-        None => Err(Error::Msg(format!(
-            "expected number but got \"{}\"",
-            v.as_str()
-        ))),
+        None => Err(value_arg_err("number", v)),
     }
 }
 
@@ -498,10 +496,7 @@ pub(crate) fn call_c99_math_func(name: &str, args: Vec<Value>) -> Result<Value> 
                 Some(IntRep::Big(b)) => Ok(Value::from_int(b.is_negative() as i64)),
                 None => match args[0].as_float() {
                     Some(d) => Ok(Value::from_int(d.is_sign_negative() as i64)),
-                    None => Err(Error::Msg(format!(
-                        "expected number but got \"{}\"",
-                        args[0].as_str()
-                    ))),
+                    None => Err(value_arg_err("number", &args[0])),
                 },
             }
         }
@@ -605,10 +600,7 @@ pub(crate) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
             match args[0].as_float() {
                 Some(n) if n >= 0.0 => Ok(float_value(n.sqrt())),
                 Some(_) => Err(domain_error()),
-                None => Err(Error::Msg(format!(
-                    "expected number but got \"{}\"",
-                    args[0].as_str()
-                ))),
+                None => Err(value_arg_err("floating-point number", &args[0])),
             }
         }
         "pow" => {
@@ -618,7 +610,8 @@ pub(crate) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
                 // domain error (integer exponents are exact).
                 (Some(a), Some(b)) if a < 0.0 && b.fract() != 0.0 => Err(domain_error()),
                 (Some(a), Some(b)) => Ok(float_value(a.powf(b))),
-                _ => Err(Error::type_mismatch("number", "non-numeric value")),
+                (None, _) => Err(value_arg_err("floating-point number", &args[0])),
+                (_, None) => Err(value_arg_err("floating-point number", &args[1])),
             }
         }
         "fmod" => {
@@ -630,21 +623,24 @@ pub(crate) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
                 // error, pinned in expr_tests).
                 (Some(_), Some(0.0)) => Err(domain_error()),
                 (Some(a), Some(b)) => Ok(float_value(a % b)),
-                _ => Err(Error::type_mismatch("number", "non-numeric value")),
+                (None, _) => Err(value_arg_err("floating-point number", &args[0])),
+                (_, None) => Err(value_arg_err("floating-point number", &args[1])),
             }
         }
         "atan2" => {
             require_args(name, 2, args.len())?;
             match (args[0].as_float(), args[1].as_float()) {
                 (Some(a), Some(b)) => Ok(float_value(a.atan2(b))),
-                _ => Err(Error::type_mismatch("number", "non-numeric value")),
+                (None, _) => Err(value_arg_err("floating-point number", &args[0])),
+                (_, None) => Err(value_arg_err("floating-point number", &args[1])),
             }
         }
         "hypot" => {
             require_args(name, 2, args.len())?;
             match (args[0].as_float(), args[1].as_float()) {
                 (Some(a), Some(b)) => Ok(float_value(a.hypot(b))),
-                _ => Err(Error::type_mismatch("number", "non-numeric value")),
+                (None, _) => Err(value_arg_err("floating-point number", &args[0])),
+                (_, None) => Err(value_arg_err("floating-point number", &args[1])),
             }
         }
         "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "log" | "log10" | "exp"
@@ -678,19 +674,29 @@ pub(crate) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
                     };
                     Ok(float_value(result))
                 }
-                None => Err(Error::type_mismatch("number", "non-numeric value")),
+                None => Err(value_arg_err("floating-point number", &args[0])),
             }
         }
         "min" | "max" => {
             if args.is_empty() {
-                return Err(Error::wrong_args(format!("{}()", name), 1, args.len()));
+                // 9.1：零实参走 mathfunc 参数不足口径（expr-old-40.3：
+                // not enough arguments for math function "min"），
+                // 不是 wrong # args。
+                return Err(Error::Msg(format!(
+                    "not enough arguments for math function \"{name}\""
+                )));
             }
             // Tcl returns the winning operand itself, preserving its type:
             // min(2.0, 3) => 2.0 but min(2, 3.0) => 2.
             let mut best = args[0].clone();
             for v in &args[1..] {
-                let ord = numeric_cmp(v, &best)
-                    .ok_or_else(|| Error::type_mismatch("number", "non-numeric value"))?;
+                let ord = numeric_cmp(v, &best).ok_or_else(|| {
+                    // min/max 实参非数字按 9.1 数值口径报首个失败者
+                    // （`min("a", 1)` → expected number but got "a"）。
+                    let v_numeric = super::bignum::int_rep(v).is_some()
+                        || v.as_float().is_some();
+                    value_arg_err("number", if v_numeric { &best } else { v })
+                })?;
                 let take = if name == "min" {
                     ord == Ordering::Less
                 } else {
@@ -767,7 +773,7 @@ pub(crate) fn call_math_func(name: &str, args: Vec<Value>, rand_seed: usize) -> 
                     crate::error::ErrorCode::InvalidOp,
                 )),
                 None => Err(Error::runtime(
-                    format!("expected number but got \"{}\"", args[0].as_str()),
+                    crate::value::value_report("number", args[0].as_str()),
                     crate::error::ErrorCode::Generic,
                 )),
             }

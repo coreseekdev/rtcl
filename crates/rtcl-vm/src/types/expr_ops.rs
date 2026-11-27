@@ -627,6 +627,20 @@ pub fn op_bitnot(val: &Value) -> Result<Value> {
     Ok(Value::from_int(!n))
 }
 
+/// Unary `+` — 9.1 语义 = 数值断言：整数/浮点原样通过（NaN 报浮点
+/// 操作数类错误），非数字串报操作数类错误（`+"a"` → cannot use
+/// non-numeric string "a" as operand of "+"——tclsh 9.1 实测）。
+pub fn op_pos(val: &Value) -> Result<Value> {
+    if bignum::int_rep(val).is_some() {
+        return Ok(val.clone());
+    }
+    match val.as_float() {
+        Some(n) if n.is_nan() => Err(operand_class_error(val, "+", Side::Unary)),
+        Some(_) => Ok(val.clone()),
+        None => Err(operand_class_error(val, "+", Side::Unary)),
+    }
+}
+
 /// Unary `-` — integer operands stay integers (bignum-exact on
 /// overflow), float operands stay floats (NaN errors).
 pub fn op_neg(val: &Value) -> Result<Value> {

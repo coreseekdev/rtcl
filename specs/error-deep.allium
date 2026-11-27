@@ -3,7 +3,8 @@
 -- Behaviour spec: exception semantics deep water — catch options dict,
 -- return -code/-level interplay, exit, throw (TIP 388), try trap,
 -- errorInfo frames, errorCode lifecycle.
--- Oracle: tclsh 8.6.17. 2026-11-03 deep-water round.
+-- Oracle: tclsh 9.1.0 (core-9-1-0). A/B rules re-anchored 2026-11-27;
+-- remaining C-class coverage tracked in HANDOFF-SPEC-910.md §8.
 -- Known rtcl divergences from this spec are tracked in DIVERGENCES.md
 -- (D-3 … D-10；台账为准).
 
@@ -33,8 +34,13 @@ rule ErrorstackEntries {
     -- -errorstack = flat list [INNER, <body>, CALL, <name>, ...]:
     --   error boom => INNER {returnImm boom {}}
     --   proc p1 {error x}; catch p1 => INNER {returnImm x {}} CALL p1
-    --   nosuchcmd a => INNER {invokeStk1 nosuchcmd a}
-    --   two-proc => INNER {invokeStk1 nosuch z} CALL p1 CALL outer
+    --   nosuchcmd a => INNER {invokeStk nosuchcmd a}
+    --   two-proc => INNER {invokeStk nosuch z} CALL p1 CALL outer
+    -- 9.1 dropped the narrow opcode spellings: invokeStk1 -> invokeStk
+    -- (whole family). returnImm is unchanged. 2026-11-27 oracle re-run.
+    -- The separate UP <n> token marks unwinding across uplevel (n is the
+    -- relative level, as in uplevel; catch.n); it is not part of these
+    -- top-level probes.
     -- (2026-11-05 pinned; rtcl FIXED — err_pending_inner one-shot +
     --  call_proc error-exit CALL collection.)
     when: Evaluates("dict get $o -errorstack    -- after: proc p1 {} {error x}; catch {p1} m o")

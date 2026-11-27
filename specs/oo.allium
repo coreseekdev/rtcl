@@ -3,9 +3,10 @@
 -- Behaviour spec: TclOO — oo::object / oo::class / oo::define /
 -- oo::objdefine / oo::copy, method resolution (C3), next, filters,
 -- unknown dispatch, info object / info class, object lifecycle and
--- rename interop.  Oracle: tclsh 8.6.17.  2026-11-03 distillation
--- round (probes: specs/oo-deep.probes; divergences D-40 … D-43 in
--- DIVERGENCES.md).
+-- rename interop.  Oracle: tclsh 9.1.0 (core-9-1-0). T6 measured subset
+-- re-anchored 2026-11-27; object-count question is §6.1 (open).
+-- 2026-11-03 distillation round (probes: specs/oo-deep.probes; divergences
+-- D-40 … D-43 in DIVERGENCES.md).
 
 use "./interp.allium" as interp
 
@@ -260,4 +261,53 @@ rule InfoStubbedSubcommands {
     ensures: completion.value = ""
     -- rtcl: FIXED 2026-11-05（filters/constructor/destructor；
     --   恒空形状为 oracle 实测）[D-43]
+}
+
+-- ── 9.1 TclOO surface (T6, 2026-11-27) ──────────────────────────
+-- Measured on tclsh 9.1.0. The object-numbering/count question stays an
+-- open question (§6.1); no ensures pins ::oo::ObjN values here.
+
+rule AbstractClassForbidsCreateAndNew {
+    -- oo::abstract removes create/new from the class's method surface;
+    -- both calls fail with the standard unknown-method text.
+    when: Evaluates("oo::abstract create AbsX {method m {} {return m}}; list [catch {AbsX create x} m] $m [catch {AbsX new} n] $n")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {unknown method \"create\": must be destroy} 1 {unknown method \"new\": must be destroy}"
+    -- probe: 2026-11-27 tclsh9.1 (subclasses still instantiate)
+}
+
+rule SingletonReturnsSameInstance {
+    -- oo::singleton's new returns the one instance; create is not offered.
+    when: Evaluates("oo::singleton create SingX {method m {} {return m}}; set a [SingX new]; set b [SingX new]; list [expr {$a eq $b}] [catch {SingX create z} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 {unknown method \"create\": must be destroy or new}"
+    -- probe: 2026-11-27 tclsh9.1 (name of the instance is not pinned)
+}
+
+rule PrivateMethodHiddenFromOutside {
+    -- A method defined under `private` is callable from siblings via my,
+    -- but invisible to outside dispatch (unknown method).
+    when: Evaluates("oo::class create PrivX {}; oo::define PrivX {private method secret {} {return s}; method pub {} {return [my secret]}}; PrivX create px; list [px pub] [catch {px secret} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "s 1 {unknown method \"secret\": must be destroy or pub}"
+    -- probe: 2026-11-27 tclsh9.1 (TIP 500)
+}
+
+rule ClassMethodCallableOnClass {
+    -- classmethod is callable on the class object itself; instances do not
+    -- gain it directly (k4 cm succeeds because the class command is in the
+    -- object's command namespace, not because it is an instance method).
+    when: Evaluates("oo::class create ClsX {classmethod cm {} {return ok}}; list [ClsX cm] [catch {ClsX create cx; cx cm} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "ok 0 ok"
+    -- probe: 2026-11-27 tclsh9.1
+}
+
+rule InfoClassVariablesSplitsPrivate {
+    -- info class variables returns public and private declarations
+    -- separately (-private selects the latter).
+    when: Evaluates("oo::class create VarX {variable x; private variable y}; list [info class variables VarX] [info class variables VarX -private]")
+    ensures: completion.code = ok
+    ensures: completion.value = "x y"
+    -- probe: 2026-11-27 tclsh9.1
 }

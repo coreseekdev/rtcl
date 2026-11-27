@@ -1323,7 +1323,7 @@ impl Interp {
             // name1=别名名）。被 trace 的帧局部在注册时已移出槽模型，
             // 此处只有链接直写需要拦。move 变体的 Err(value) 就是调用方
             // 名路径的值句柄。
-            if !self.var_traces.is_empty() {
+            if self.n_trace_hosts != 0 {
                 return false;
             }
             // Global link: write the target directly through the cached
@@ -1389,7 +1389,7 @@ impl Interp {
             // ——set_var 以别名名触发 trace 并承担写后重读语义（tclsh
             // name1=别名名）。被 trace 的帧局部在注册时已移出槽模型，
             // 此处只有链接直写需要拦。
-            if !self.var_traces.is_empty() {
+            if self.n_trace_hosts != 0 {
                 return Err(value);
             }
             // Global link: write the target directly through the cached
@@ -1431,7 +1431,7 @@ impl Interp {
     /// (creation, string-rep parse, link write-through — its exact
     /// semantics).
     pub(crate) fn lappend_slot_fast(&mut self, slot: usize, value: &Value) -> bool {
-        if !self.var_traces.is_empty() {
+        if self.n_trace_hosts != 0 {
             return false;
         }
         // 顶层 slot 单元（C2'）：ts 读改写——**仅 list rep 直推**。
@@ -1475,8 +1475,9 @@ impl Interp {
     /// `incr` on a frame slot, mutating the int rep in place
     /// (the slot analogue of [`Interp::incr_var_fast`]; `None` falls back
     /// to the real `incr`, which owns creation and the exact errors).
+    #[inline(always)]
     pub(crate) fn frame_slot_incr(&mut self, slot: usize, amount: i64) -> Option<Value> {
-        if !self.var_traces.is_empty() {
+        if self.n_trace_hosts != 0 {
             return None;
         }
         if let Some(ts) = self.top_slots.as_mut() {
@@ -1818,7 +1819,7 @@ impl Interp {
 
     /// Whether the :: table has an entry for the bare global `key`, with
     /// a value or without.  One without a value is there from the moment
-    /// a trace is put on the variable ([`Interp::note_global_entry`]) or
+    /// a trace is put on the variable (D1 步骤 4 的注册宿主占位) or
     /// the `variable` command declares it in `::`; tclsh keeps such a Var
     /// undefined but present.  Asked by the valueless-entry errorCode
     /// probe for bare names at the :: level: reads and `info exists` of
@@ -1837,49 +1838,11 @@ impl Interp {
                 .is_some_and(|i| i.variables.contains(key))
     }
 
-    /// The :: table's key for a name that is a scalar of the global
-    /// namespace and is being looked at from outside any proc — `::x`, or
-    /// `x` at the top level — and `None` for every other name (a proc's
-    /// local, an element, another namespace's variable).
-    fn global_scalar_key<'a>(&self, name: &'a str) -> Option<&'a str> {
-        if name.contains('(') || self.var_frame_idx().is_some() {
-            return None;
-        }
-        if let Some(k) = name.strip_prefix("::") {
-            if k.contains("::") {
-                return None;
-            }
-            return Some(k);
-        }
-        if self.current_namespace.as_ref() == "::" {
-            Some(name)
-        } else {
-            None
-        }
-    }
-
-    /// Record an entry without a value in the :: table (see
-    /// [`Self::global_entry_exists`]) for a name looked at from outside
-    /// any proc.
-    pub(crate) fn note_global_entry(&mut self, name: &str) {
-        if let Some(key) = self.global_scalar_key(name) {
-            self.note_global_key(key);
-        }
-    }
-
     /// The same for a key known to be a scalar of the :: table — the
     /// target of a proc's `global` or `upvar #0` link.
     pub(crate) fn note_global_key(&mut self, key: &str) {
         if !key.contains('(') && !key.contains("::") && !self.global_has(key) {
             self.global_note_phantom(key);
-        }
-    }
-
-    /// Drop such an entry: the variable was unset, or its last trace went
-    /// while it still had no value.
-    pub(crate) fn forget_global_entry(&mut self, name: &str) {
-        if let Some(key) = self.global_scalar_key(name) {
-            self.global_forget_phantom(key);
         }
     }
 
@@ -1911,7 +1874,20 @@ impl Interp {
                         .values()
                         .any(|l| matches!(l, UpvarLink::Global(g) if g.as_ref() == k.as_str()))
             });
-            if !still_linked {
+            if still_linked {
+                continue;
+            }
+            // D1 步骤 4：链接目标仍承载 trace 注册时只撤 UNDEFINED 位、
+            // 条目随 trace 留存（旧形：phantom 位随链接离场、trace 记录
+            // 独立存活——值less 可见性与 trace 存活性分别复刻）。
+            let traced = self
+                .var_arena
+                .root()
+                .get(&k)
+                .is_some_and(|v| v.traces.is_some());
+            if traced {
+                self.trace_host_relax(&k);
+            } else {
                 self.global_forget_phantom(&k);
             }
         }
@@ -3122,11 +3098,6 @@ impl Interp {
                     }
                 }
                 if wrote {
-                    // Phantom cleanup is a no-op on an empty map — skip
-                    // the stamp-key allocation with it (state identical).
-                    if !self.trace_phantoms.is_empty() {
-                        self.clear_phantom(array_name, index);
-                    }
                     // Same tail as the slow path: traces fire after the
                     // write; a fired write trace returns the variable's
                     // new value (D-36).
@@ -3184,7 +3155,6 @@ impl Interp {
                 self.loc_elem_insert(&loc, index, value.clone());
                 self.env_proc_sync(&base, &idx, Some(&value));
             }
-            self.clear_phantom(&base, &idx);
             // Write traces fire after the write lands; a trace error is
             // reported as the set's failure (trace-0.0) but the write
             // itself persists.
@@ -3258,7 +3228,7 @@ impl Interp {
                     }
                 }
                 if wrote {
-                    if !self.var_traces.is_empty() {
+                    if self.n_trace_hosts != 0 {
                         let fired = self.fire_traces(name, None, "write").map_err(|e| {
                             Error::runtime(format!("can't set \"{}\": {}", name, e), ErrorCode::Generic)
                         })?;
@@ -3333,7 +3303,7 @@ impl Interp {
     ) -> Option<Option<R>> {
         if has_ns_sep(name)
             || name.contains('(')
-            || !self.var_traces.is_empty()
+            || self.n_trace_hosts != 0
             || !self.dead_flat.is_empty()
         {
             return None;
@@ -3441,7 +3411,7 @@ impl Interp {
         f: impl FnMut(&mut Value) -> Option<R>,
     ) -> Option<Option<R>> {
         if name.contains('(')
-            || !self.var_traces.is_empty()
+            || self.n_trace_hosts != 0
             || !self.dead_flat.is_empty()
         {
             return None;
@@ -3707,7 +3677,7 @@ impl Interp {
         // VALUE INTEGER, bignum widening all replay unchanged).
         if let Some((array_name, index)) = split_array_ref(name) {
             if has_ns_sep(name)
-                || !self.var_traces.is_empty()
+                || self.n_trace_hosts != 0
                 || self.dead_flat.iter().any(|k| k == array_name)
                 || self.flat_aliases.iter().any(|(k, _)| k == array_name)
                 || self.ns_transient.iter().any(|(k, _)| k == array_name)
@@ -3767,9 +3737,6 @@ impl Interp {
                     cell.set_int_rep(next);
                 }
             }
-            if !self.trace_phantoms.is_empty() {
-                self.clear_phantom(array_name, index);
-            }
             return Some(Value::from_int(next));
         }
         // D1 步骤 1：with_var_slot（全局臂双写 arena + 镜像重放）。
@@ -3808,12 +3775,12 @@ impl Interp {
                     // Removed element: mutation invalidates searches
                     // （D1 步骤 3：计数 −1 在摘除咽喉内）。
                     self.bump_stamp(&loc);
-                    self.clear_phantom(&base, &idx);
                     self.env_proc_sync(&base, &idx, None);
                     // Unset traces fire after deletion; errors are
                     // discarded (tclsh: the unset still succeeds).
                     // 9.1：元素 unset 的 name1 = unset 写下的全名
-                    // （ta(k) / ::ta(k)），n2 = 元素。
+                    // （ta(k) / ::ta(k)），n2 = 元素。宿主 Var 在席——
+                    // trace 挂宿主（元素摘除不摘 trace——基线钉形）。
                     let _ = if elem_trace_full {
                         self.fire_traces_name1(&base, Some(&idx), "unset", name)
                     } else {
@@ -3823,23 +3790,14 @@ impl Interp {
                 } else {
                     // tclsh：对缺失元素的 unset 仍触发 unset trace（且抹
                     // 该元素的记录——trace-14.17 族，D-37⑤）。name1 形
-                    // 同上（全名 / 裸名按调用方）。
-                    let sk = stamp_key(&loc);
+                    // 同上（全名 / 裸名按调用方）。宿主在席（在席火），
+                    // 火后抹该元素的记录。
                     let _ = if elem_trace_full {
                         self.fire_traces_name1(&base, Some(&idx), "unset", name)
                     } else {
                         self.fire_traces(&base, Some(&idx), "unset")
                     };
-                    if let Some(map) = self.elem_traces.get_mut(&sk) {
-                        map.remove(&idx);
-                        if map.is_empty() {
-                            self.elem_traces.remove(&sk);
-                        }
-                    }
-                    self.trace_phantoms
-                        .entry(sk)
-                        .or_default()
-                        .remove(&idx);
+                    self.trace_wipe_elem(&base, &idx);
                     crate::interp::commands::list::set_error_code(
                         self,
                         &format!("TCL LOOKUP ELEMENT {}", idx),
@@ -3875,10 +3833,14 @@ impl Interp {
             if self.loc_is_array(&loc) {
                 // tclsh：整数组 unset 逐元素触发 {a k unset}（D-37③，
                 // per-Var 销毁序——元素 trace 先于整变量 trace）。元素名
-                // 必须在删除前枚举。
+                // 必须在删除前枚举。D1 步骤 4：快照先行——TraceSet 随宿
+                // 主摘除离场，逐元素/整变量火从快照触发（记录在自身
+                // unset 触发期间对 trace info 不可见——oracle 钉形）。
+                let (sk, snap) = self.take_trace_set(&given);
                 let elems = self.array_element_names(&given);
                 for e in elems {
-                    let _ = self.fire_traces_elem_only(&given, &e, "unset");
+                    let _ =
+                        self.fire_trace_snapshot(&sk, &given, Some(&e), "unset", snap.as_deref(), false);
                 }
                 // D1 步骤 3：搜索/戳键 = 宿主 VarRef——宿主句柄须在摘
                 // 除前解出（摘除后代数即失效）。
@@ -3889,19 +3851,17 @@ impl Interp {
                 // "element in deleted array").
                 self.deaden_element_links(&loc);
                 // Whole-array unset kills its searches and stamp. Unset
-                // traces fire after the deletion, so drop the tables after
-                // firing them.
-                let sk = stamp_key(&loc);
+                // traces fire after the deletion.
                 if let Some(r) = &host {
                     self.array_searches.remove(r);
                     self.array_stamps.remove(r);
                 }
-                let _ = self.fire_traces(&given, None, "unset");
-                self.var_traces.remove(&sk);
-                self.elem_traces.remove(&sk);
-                self.trace_phantoms.remove(&sk);
-                Ok(())
+                let _ = self.fire_trace_snapshot(&sk, &given, None, "unset", snap.as_deref(), true);
+                                Ok(())
             } else if self.loc_base_exists(&loc) {
+                // D1 步骤 4：快照先行（值条目随 remove_var 离场——trace
+                // 记录挂在它上面），火从快照触发。
+                let (sk, snap) = self.take_trace_set(&given);
                 self.remove_var(name);
                 // set-old-7.7..7.9: removing the target retires every
                 // frame's seeded mirror (stale reads) while the links
@@ -3915,16 +3875,14 @@ impl Interp {
                 }
                 // The key from where the variable WAS: by name it would
                 // no longer resolve there (the chain needs the variable).
-                let sk = stamp_key(&loc);
-                let _ = self.fire_traces_key(&sk, &given, None, "unset", true, None);
-                self.var_traces.remove(&sk);
-                self.elem_traces.remove(&sk);
-                self.trace_phantoms.remove(&sk);
-                Ok(())
+                let _ = self.fire_trace_snapshot(&sk, &given, None, "unset", snap.as_deref(), true);
+                                Ok(())
             } else if self.current_namespace.as_ref() != "::" && self.ns_var_declared(&given) {
                 // `variable`-declared but valueless (or declared with the
                 // value living in the namespace's own slot): unset removes
-                // the declaration and succeeds (tclsh 8.6.17).
+                // the declaration and succeeds (tclsh 8.6.17).  占位条目
+                // 经 global_remove（只摘有值）原样保留——trace 宿主随条
+                // 目留存（与旧字符串表留痕逐字同）。
                 self.remove_var(&given);
                 Ok(())
             } else {
@@ -3937,12 +3895,9 @@ impl Interp {
                 // `TCL UNSET VARNAME`; a name no table knows is
                 // `TCL LOOKUP VARNAME <name>`.
                 let found_entry = self.has_valueless_entry(name);
-                let _ = self.fire_traces(&given, None, "unset");
-                let sk = stamp_key(&loc);
-                self.var_traces.remove(&sk);
-                self.elem_traces.remove(&sk);
-                self.trace_phantoms.remove(&sk);
-                // The failed `unset` still takes the valueless entry with
+                let (sk, snap) = self.take_trace_set(&given);
+                let _ = self.fire_trace_snapshot(&sk, &given, None, "unset", snap.as_deref(), true);
+                                // The failed `unset` still takes the valueless entry with
                 // it, traces and declaration alike: the next read or
                 // `unset` of the name is a lookup failure.  By where the
                 // name resolved to, not by the name: the entry may be a
@@ -4224,24 +4179,134 @@ impl Interp {
         (scope, base)
     }
 
-    /// Fire variable traces for `op` on (base, elem). Callback scripts run
-    /// in the current scope with `name1 name2 op` appended (tclsh passes
-    /// name2 as an empty string for whole-variable ops).
+    // ── D1 步骤 4：trace 挂 Var（vars.rs 的语义层）────────────────
+    //
+    // 挂靠点：整变量族与元素族都在**基 Var** 的 [`vararena::TraceSet`]
+    // 上（元素族挂宿主是生命周期语义：元素摘除后 trace 仍在——基线钉
+    // 形；phantom 元素与已落值元素同域存放——旧 elem_traces 逐字同）。
+    // 「解析一次」：收集走 `resolve_loc(base)` → Var.trace_set()，键字
+    // 符串退役；重入守卫键（VAR_TRACE_ACTIVE，D-36）保持 stamp 串形——
+    // 守卫语义（整/元素独立、per-exact-target）逐字不变。
+    //
+    // 移除后火的形态（unset 四臂 + ns delete + 帧清场）：**快照火**——
+    // 先 `take_trace_set` 把 TraceSet 摘出（记录随摘除离场），再从快照
+    // 触发。oracle 实测（2026-11-28 probe6b/probe7）：trace 记录在自身
+    // unset 触发期间对 `trace info` 已不可见（tclsh 随 Var 摘除先行撤
+    // 记录）；基线的字符串表形态（火中可见）为预存分歧，本形态随迁移
+    // 收敛到 oracle（未钉路径，judge/probes 双绿验证）。
+
+    /// 名字的 trace 守卫键（stamp）——注册时算定的 F{idx}: 形与清场时
+    /// 重解析形（跟链后可能已变 G:) 的对拍用。
+    pub(crate) fn trace_stamp_of(&self, name: &str) -> String {
+        stamp_key(&self.resolve_loc(name))
+    }
+
+    /// base 的宿主 TraceSet（在席 Var；缺席 → None——注册面保证有
+    /// trace 必有宿主）。
+    fn trace_set_of(&self, base: &str) -> Option<&super::vararena::TraceSet> {
+        match self.resolve_loc(base) {
+            VarLoc::Global(n) => self.var_arena.root().get(&n).and_then(|v| v.trace_set()),
+            VarLoc::Frame(i, n) => self
+                .frames
+                .get(i)
+                .and_then(|f| f.vt.get(&n))
+                .and_then(|v| v.trace_set()),
+        }
+    }
+
+    /// base 的宿主 TraceSet 就地确保（注册面）：全局域建无值 UNDEFINED
+    /// 占位条目（bare-:: 与旧 note_global_entry 同形；限定名/ns 体裸名
+    /// 为本步扩展——host 必须在席），帧域建无值 vt 条目（列举/在席探
+    /// 针按有值域过滤——不可见）。返回（stamp 守卫键, &mut TraceSet）。
+    /// `phantom`：true = 新式 `trace add` 的 keep-alive 占位（无值宿主
+    /// 置 UNDEFINED 位——bare-:: 与旧 note_global_entry 同形；有值宿主
+    /// 不动——旧 note_global_key 的 `!global_has` 守卫）；false = legacy
+    /// `trace variable` 的 plain 无值宿主（基线不建 phantom——`info
+    /// exists`/unset errorCode 形逐字同）。
+    fn trace_set_ensure(&mut self, base: &str, phantom: bool) -> (String, &mut super::vararena::TraceSet) {
+        let stamp = stamp_key(&self.resolve_loc(base));
+        match self.resolve_loc(base) {
+            VarLoc::Global(n) => {
+                if phantom {
+                    if !self.global_has(&n) {
+                        self.global_note_phantom(&n);
+                    }
+                } else if self.var_arena.root().get(&n).is_none() {
+                    self.var_arena.root_mut().entry_ensure(&n);
+                    #[cfg(debug_assertions)]
+                    self.dcheck_global_mirror(&n);
+                }
+                let var = self
+                    .var_arena
+                    .root_mut()
+                    .get_mut(&n)
+                    .expect("host ensured");
+                let (created, set) = var.traces_ensure();
+                if created {
+                    self.n_trace_hosts += 1;
+                }
+                (stamp, set)
+            }
+            VarLoc::Frame(i, n) => {
+                let var = self
+                    .frames
+                    .get_mut(i)
+                    .expect("frame alive at registration")
+                    .vt
+                    .entry_ensure(&n);
+                let (created, set) = var.traces_ensure();
+                if created {
+                    self.n_trace_hosts += 1;
+                }
+                (stamp, set)
+            }
+        }
+    }
+
+    /// 快照火：把 base 的 TraceSet 摘出（记录随摘离场；宿主计数随
+    /// Some→None 结清）。返回（stamp 守卫键, 快照——None = 本就无
+    /// 记录）。
+    pub(crate) fn take_trace_set(
+        &mut self,
+        base: &str,
+    ) -> (String, Option<Box<super::vararena::TraceSet>>) {
+        let stamp = stamp_key(&self.resolve_loc(base));
+        let taken = match self.resolve_loc(base) {
+            VarLoc::Global(n) => self
+                .var_arena
+                .root_mut()
+                .get_mut(&n)
+                .and_then(|v| v.traces.take()),
+            VarLoc::Frame(i, n) => self
+                .frames
+                .get_mut(i)
+                .and_then(|f| f.vt.get_mut(&n))
+                .and_then(|v| v.traces.take()),
+        };
+        if taken.is_some() {
+            debug_assert!(self.n_trace_hosts > 0, "trace 宿主计数下溢");
+            self.n_trace_hosts -= 1;
+        }
+        (stamp, taken)
+    }
+
+    /// 在席火的统一入口：`op` 在 (base, elem) 上的变量 trace。回调脚本
+    /// 以 `name1 name2 op` 尾参求值（tclsh 整变量 op 的 name2 为空串）。
     ///
-    /// Returns whether any script actually fired (callers use this to
-    /// re-read the written value, tclsh: a write trace that modifies the
-    /// variable changes `set`'s result, D-36).
+    /// 返回是否确有脚本触发（调用方据此重读写入值——tclsh write trace
+    /// 改写变量后 set 返回改写值，D-36）。
     ///
-    /// Re-entrancy guard (tclsh VAR_TRACE_ACTIVE): while a target's
-    /// traces fire, a nested fire on the SAME target is skipped — a
-    /// callback writing its own traced variable must not recurse into
-    /// the trace machinery (native stack overflow without this, D-36).
-    /// The guard is per exact target: whole-var fires and element fires
-    /// guard independently (tclsh guards per Var record), so a whole-var
-    /// write inside an element's callback still fires the whole-var
-    /// traces, and vice versa.
+    /// 重入守卫（tclsh VAR_TRACE_ACTIVE）：目标在火中时同目标再火被跳
+    /// 过——回调写自己的被追踪变量不再递归（D-36 原生栈溢出）。守卫按
+    /// 精确目标：整变量/元素各自独立（tclsh per-Var）——元素回调里的
+    /// 整变量写仍触发整组，反之亦然。
     pub(crate) fn fire_traces(&mut self, base: &str, elem: Option<&str>, op: &str) -> Result<bool> {
-        self.fire_traces_impl(base, elem, op, true)
+        let stamp = stamp_key(&self.resolve_loc(base));
+        let (whole, elems) = match self.trace_set_of(base) {
+            Some(set) => set.firing_scripts(elem, op),
+            None => (Vec::new(), Vec::new()),
+        };
+        self.fire_scripts(&stamp, base, elem, op, true, None, whole, elems)
     }
 
     /// [`Self::fire_traces`] with an explicit trace-callback name1
@@ -4253,7 +4318,12 @@ impl Interp {
         op: &str,
         name1: &str,
     ) -> Result<bool> {
-        self.fire_traces_impl_name1(base, elem, op, true, name1)
+        let stamp = stamp_key(&self.resolve_loc(base));
+        let (whole, elems) = match self.trace_set_of(base) {
+            Some(set) => set.firing_scripts(elem, op),
+            None => (Vec::new(), Vec::new()),
+        };
+        self.fire_scripts(&stamp, base, elem, op, true, Some(name1), whole, elems)
     }
 
     /// Element-only fire：不触发整变量组（tclsh 整数组 unset 的逐元素
@@ -4267,125 +4337,276 @@ impl Interp {
         elem: &str,
         op: &str,
     ) -> Result<bool> {
-        self.fire_traces_impl(base, Some(elem), op, false)
+        let stamp = stamp_key(&self.resolve_loc(base));
+        let (_, elems) = match self.trace_set_of(base) {
+            Some(set) => set.firing_scripts(Some(elem), op),
+            None => (Vec::new(), Vec::new()),
+        };
+        self.fire_scripts(&stamp, base, Some(elem), op, false, None, Vec::new(), elems)
     }
 
-    fn fire_traces_impl(
+    /// 快照火（移除后）：整变量组 + 指定元素组，从已摘除的快照触发。
+    /// `include_whole=false` = 元素扫描专用（D-37③）。触发序语义与在
+    /// 席火逐字同（组内 latest-first、整组先于元素组 A1E1）。
+    pub(crate) fn fire_trace_snapshot(
         &mut self,
-        base: &str,
+        stamp: &str,
+        n1: &str,
         elem: Option<&str>,
         op: &str,
+        snap: Option<&super::vararena::TraceSet>,
         include_whole: bool,
     ) -> Result<bool> {
-        self.fire_traces_key(&self.array_stamp_key(base), base, elem, op, include_whole, None)
-    }
-
-    fn fire_traces_impl_name1(
-        &mut self,
-        base: &str,
-        elem: Option<&str>,
-        op: &str,
-        include_whole: bool,
-        name1: &str,
-    ) -> Result<bool> {
-        self.fire_traces_key(
-            &self.array_stamp_key(base),
-            base,
+        let (whole, elems) = match snap {
+            Some(set) => set.firing_scripts(elem, op),
+            None => (Vec::new(), Vec::new()),
+        };
+        self.fire_scripts(
+            stamp,
+            n1,
             elem,
             op,
             include_whole,
-            Some(name1),
+            Some(n1),
+            whole,
+            elems,
         )
     }
 
-    /// [`Self::fire_traces`] with the key of the variable's table given:
-    /// for a fire that comes after the variable itself is gone, when the
-    /// name would no longer resolve to it (an `unset` of a global from
-    /// inside a namespace body).
-    fn fire_traces_key(
+    /// 注册（整变量族）：宿主确保 + 记录入集（注册序）+ 计数器 +1。
+    pub(crate) fn trace_register_var(
         &mut self,
-        key: &str,
+        name: &str,
+        t: crate::interp::VarTrace,
+        phantom: bool,
+    ) {
+        let (_, set) = self.trace_set_ensure(name, phantom);
+        set.push_var(t);
+    }
+
+    /// 注册（元素族）：宿主 = 基 Var。新式 `trace add` 的元素形先
+    /// mark_array（宿主在席）；legacy `trace variable a(k)` 不标数组——
+    /// 宿主缺席时建 **plain** 无值条目承载记录（`array exists`/在席探
+    /// 针不动——基线钉形），后续 `set a(k)` 的建组路径在既有条目上落
+    /// ARRAY 位。宿主计数随集合新建 +1。
+    pub(crate) fn trace_register_elem(
+        &mut self,
+        base: &str,
+        elem: &str,
+        t: crate::interp::VarTrace,
+    ) {
+        match self.resolve_loc(base) {
+            VarLoc::Global(n) => {
+                if self.var_arena.root().get(&n).is_none() {
+                    self.var_arena.root_mut().entry_ensure(&n);
+                    #[cfg(debug_assertions)]
+                    self.dcheck_global_mirror(&n);
+                }
+                let var = self
+                    .var_arena
+                    .root_mut()
+                    .get_mut(&n)
+                    .expect("array host entry");
+                let (created, set) = var.traces_ensure();
+                if created {
+                    self.n_trace_hosts += 1;
+                }
+                set.elem_entry_mut(elem).push(t);
+            }
+            VarLoc::Frame(i, n) => {
+                let var = self
+                    .frames
+                    .get_mut(i)
+                    .expect("frame alive at registration")
+                    .vt
+                    .entry_ensure(&n);
+                let (created, set) = var.traces_ensure();
+                if created {
+                    self.n_trace_hosts += 1;
+                }
+                set.elem_entry_mut(elem).push(t);
+            }
+        }
+    }
+
+    /// 末条 trace 摘净后的 keep-alive 撤位：宿主的 UNDEFINED 位（旧
+    /// forget_global_entry 的 bare-:: 域；限定名占位宿主同位撤——
+    /// 值less 可见性两域一致）。条目本体与（已空的）trace 集留存——
+    /// upvar-8.7 的「被追踪」判定按在席记录键（lingering 键形，基线
+    /// 钉形；oracle 9.1 摘净即允许为预存分歧）。
+    pub(crate) fn trace_host_relax(&mut self, name: &str) {
+        match self.resolve_loc(name) {
+            VarLoc::Global(n) => {
+                if let Some(var) = self.var_arena.root_mut().get_mut(&n) {
+                    var.flags.remove(VarFlags::UNDEFINED);
+                }
+                #[cfg(debug_assertions)]
+                {
+                    self.phantom_globals.remove(&n);
+                }
+            }
+            // 帧域无 UNDEFINED 占位（宿主为 plain/有值条目）；旧
+            // forget_global_entry 在帧内本就是 no-op。
+            VarLoc::Frame(..) => {}
+        }
+    }
+
+    /// 摘除（整变量族，remove 逐条删语义）：第一条精确匹配（ops+
+    /// script）。返回是否摘到（计数器 −1 由调用方据返回值处理——不，
+    /// 这里直接结清：返回值供「末条摘净」判定）。
+    pub(crate) fn trace_unregister_var(
+        &mut self,
+        name: &str,
+        ops: &[String],
+        script: &str,
+    ) -> bool {
+        let removed = match self.resolve_loc(name) {
+            VarLoc::Global(n) => self
+                .var_arena
+                .root_mut()
+                .get_mut(&n)
+                .and_then(|v| v.traces.as_deref_mut())
+                .is_some_and(|set| set.remove_first_var(ops, script)),
+            VarLoc::Frame(i, n) => self
+                .frames
+                .get_mut(i)
+                .and_then(|f| f.vt.get_mut(&n))
+                .and_then(|v| v.traces.as_deref_mut())
+                .is_some_and(|set| set.remove_first_var(ops, script)),
+        };
+        let _ = removed;
+        removed
+    }
+
+    /// 摘除（元素族，remove 逐条删语义）。
+    pub(crate) fn trace_unregister_elem(
+        &mut self,
+        base: &str,
+        elem: &str,
+        ops: &[String],
+        script: &str,
+    ) -> bool {
+        let removed = match self.resolve_loc(base) {
+            VarLoc::Global(n) => self
+                .var_arena
+                .root_mut()
+                .get_mut(&n)
+                .and_then(|v| v.traces.as_deref_mut())
+                .is_some_and(|set| set.remove_first_elem(elem, ops, script)),
+            VarLoc::Frame(i, n) => self
+                .frames
+                .get_mut(i)
+                .and_then(|f| f.vt.get_mut(&n))
+                .and_then(|v| v.traces.as_deref_mut())
+                .is_some_and(|set| set.remove_first_elem(elem, ops, script)),
+        };
+        let _ = removed;
+        removed
+    }
+
+    /// 元素族整条摘除（缺失元素 unset 抹记录——trace-14.17 族）。
+    /// 返回摘掉的记录数。
+    pub(crate) fn trace_wipe_elem(&mut self, base: &str, elem: &str) -> usize {
+        let removed = match self.resolve_loc(base) {
+            VarLoc::Global(n) => self
+                .var_arena
+                .root_mut()
+                .get_mut(&n)
+                .and_then(|v| v.traces.as_deref_mut())
+                .map(|set| set.remove_elem_entry(elem))
+                .unwrap_or(0),
+            VarLoc::Frame(i, n) => self
+                .frames
+                .get_mut(i)
+                .and_then(|f| f.vt.get_mut(&n))
+                .and_then(|v| v.traces.as_deref_mut())
+                .map(|set| set.remove_elem_entry(elem))
+                .unwrap_or(0),
+        };
+        removed
+    }
+
+    /// base 的整变量族信息读取（trace info / vinfo——注册序）。
+    pub(crate) fn trace_info_var(&self, name: &str) -> Vec<crate::interp::VarTrace> {
+        self.trace_set_of(name)
+            .map(|s| s.var.clone())
+            .unwrap_or_default()
+    }
+
+    /// base 的指定元素族信息读取（注册序）。
+    pub(crate) fn trace_info_elem(&self, base: &str, elem: &str) -> Vec<crate::interp::VarTrace> {
+        self.trace_set_of(base)
+            .and_then(|s| s.elem_vec(elem).map(|v| v.to_vec()))
+            .unwrap_or_default()
+    }
+
+    /// base 的宿主是否仍持有任何 trace 记录（末条摘净判定）。
+    pub(crate) fn trace_set_empty_at(&self, name: &str) -> bool {
+        self.trace_set_of(name).is_none_or(|s| s.is_empty())
+    }
+
+    /// 火循环（收集已完成）：守卫 + 组序 + 求值。整变量组先于元素组
+    /// （A1E1，D-37⑦），组内 latest-first（T2 T1）；name1 缺省 = 裸基
+    /// 名（元素 unset 全名形由调用方显式传，9.1 钉形）。
+    fn fire_scripts(
+        &mut self,
+        stamp: &str,
         base: &str,
         elem: Option<&str>,
         op: &str,
         include_whole: bool,
         name1: Option<&str>,
+        whole: Vec<String>,
+        elems: Vec<String>,
     ) -> Result<bool> {
         let guard = match elem {
-            Some(e) => format!("E\x00{}\x00{}", key, e),
-            None => format!("W\x00{}", key),
+            Some(e) => format!("E\x00{}\x00{}", stamp, e),
+            None => format!("W\x00{}", stamp),
         };
         if !self.trace_active.insert(guard.clone()) {
             return Ok(false);
         }
-        let fired = self.fire_traces_inner(key, base, elem, op, include_whole, name1);
+        let whole: Vec<String> = if include_whole { whole } else { Vec::new() };
+        let fired = !(whole.is_empty() && elems.is_empty());
+        // The script string gets the args appended (so scripts can end in
+        // `;#` to swallow them) and is evaluated as a script.  name1
+        // override：元素 unset 的全名形（ta(k)/::ta(k)——unset 写下的名
+        // 字，9.1 钉形）；缺省 = 裸基名。
+        let n1 = name1.unwrap_or(base);
+        let q = |v: &str| Value::from_list(&[Value::from_str(v)]).as_str().to_string();
+        // 守卫位恒撤（旧形：fire_traces_inner 的 Result 原样回传，守卫
+        // 在外层摘）——回调出错也不得把 VAR_TRACE_ACTIVE 留在场（留场
+        // 即永久哑火：trace-5.6→5.8 序列实证）。
+        let run = || -> Result<bool> {
+            for s in whole.into_iter().rev().chain(elems.into_iter().rev()) {
+                let cmd = format!("{} {} {} {}", s, q(n1), q(elem.unwrap_or("")), op);
+                // The callback writes another traced variable, which fires
+                // again from inside this frame: one nesting level per fire.
+                self.enter_nested()?;
+                let r = self.eval(&cmd);
+                self.leave_nested();
+                r?;
+            }
+            Ok(fired)
+        };
+        let result = run();
         self.trace_active.remove(&guard);
-        fired
+        result
     }
 
-    fn fire_traces_inner(
-        &mut self,
-        key: &str,
+    /// Trace scripts registered for `op` on (base, optional element):
+    /// (whole-var scripts, element scripts), each in stored (oldest-first)
+    /// order.
+    fn collect_trace_scripts(
+        &self,
         base: &str,
         elem: Option<&str>,
         op: &str,
-        include_whole: bool,
-        name1: Option<&str>,
-    ) -> Result<bool> {
-        let (whole, elems) = self.collect_trace_scripts(key, elem, op);
-        let whole: Vec<String> = if include_whole { whole } else { Vec::new() };
-        let fired = !(whole.is_empty() && elems.is_empty());
-        // Most-recent-registered fires first within each group (tclsh
-        // prepends to the trace list: T2 T1 for two write traces), and
-        // the whole-variable group fires BEFORE the element group
-        // (tclsh order A1E1, D-37).  The script string gets the args
-        // appended (so scripts can end in `;#` to swallow them) and is
-        // evaluated as a script.  name1 override：元素 unset 的全名形
-        // （ta(k)/::ta(k)——unset 写下的名字，9.1 钉形）；缺省 = 裸基名。
-        let n1 = name1.unwrap_or(base);
-        let q = |v: &str| Value::from_list(&[Value::from_str(v)]).as_str().to_string();
-        for s in whole.into_iter().rev().chain(elems.into_iter().rev()) {
-            let cmd = format!("{} {} {} {}", s, q(n1), q(elem.unwrap_or("")), op);
-            // The callback writes another traced variable, which fires
-            // again from inside this frame: one nesting level per fire.
-            self.enter_nested()?;
-            let r = self.eval(&cmd);
-            self.leave_nested();
-            r?;
-        }
-        Ok(fired)
-    }
-
-    /// Trace scripts registered for `op` on (base-key `key`, optional
-    /// element): (whole-var scripts, element scripts), each in stored
-    /// (oldest-first) order.
-    fn collect_trace_scripts(
-        &self,
-        key: &str,
-        elem: Option<&str>,
-        op: &str,
     ) -> (Vec<String>, Vec<String>) {
-        let mut whole: Vec<String> = Vec::new();
-        if let Some(trs) = self.var_traces.get(key) {
-            for t in trs {
-                if t.ops.iter().any(|o| o == op) {
-                    whole.push(t.script.clone());
-                }
-            }
+        match self.trace_set_of(base) {
+            Some(set) => set.firing_scripts(elem, op),
+            None => (Vec::new(), Vec::new()),
         }
-        let mut elems: Vec<String> = Vec::new();
-        if let Some(e) = elem {
-            if let Some(map) = self.elem_traces.get(key) {
-                if let Some(trs) = map.get(e) {
-                    for t in trs {
-                        if t.ops.iter().any(|o| o == op) {
-                            elems.push(t.script.clone());
-                        }
-                    }
-                }
-            }
-        }
-        (whole, elems)
     }
 
     /// Read one element for `array get`: fire its read traces one script
@@ -4408,14 +4629,14 @@ impl Interp {
         base: &str,
         elem: &str,
     ) -> std::result::Result<Option<Value>, Error> {
-        let key = self.array_stamp_key(base);
         let gen0 = self.array_generation;
         let alive = |t: &Self| match owner_fi {
             // D1 步骤 2：宿主在席判定走 vt（frame_local_contains）。
             Some(i) => t.frames.get(i).map(|f| frame_local_contains(f, base)),
             None => Some(t.global_has(base)),
         };
-        let (whole, elems) = self.collect_trace_scripts(&key, Some(elem), "read");
+        // D1 步骤 4：收集走宿主 Var 的 TraceSet（键字符串退役）。
+        let (whole, elems) = self.collect_trace_scripts(base, Some(elem), "read");
         let q = |v: &str| Value::from_list(&[Value::from_str(v)]).as_str().to_string();
         let mut recreated = false;
         // 元素读取 trace：整变量组先、元素组后（A1E1 同序），组内
@@ -4448,15 +4669,6 @@ impl Interp {
             Some(i) => self.frames.get(i).and_then(|f| frame_local_get(f, &ekey)).cloned(),
             None => self.global_get(&ekey).cloned(),
         })
-    }
-
-    /// A trace on an element was satisfied: the element now has a real
-    /// value, so drop its phantom marker.
-    fn clear_phantom(&mut self, base: &str, elem: &str) {
-        let key = self.array_stamp_key(base);
-        if let Some(s) = self.trace_phantoms.get_mut(&key) {
-            s.remove(elem);
-        }
     }
 
     pub(crate) fn bump_stamp_by_name(&mut self, name: &str) {
@@ -4614,14 +4826,14 @@ impl Interp {
         // T4 vars：两张 trace 表全空 → fire 一趟是可证空转（fire 也会
         // 为 stamp key 白付两次 resolve_loc 分配），base/index 拆分与
         // is-array 判定一并跳过——元素读走 get_var 的快径守卫。
-        if self.var_traces.is_empty() && self.elem_traces.is_empty() {
+        if self.n_trace_hosts == 0 {
             return self.get_var(name).cloned();
         }
         // Fast path: scalar read with no variable traces registered — the
         // loop-body `$x` case.  The base-name allocation and the read
         // trace pass are both no-ops without traces, so skip them whole
         // (tclsh: scalar reads take the var-table direct hit).
-        if !name.contains('(') && self.var_traces.is_empty() {
+        if !name.contains('(') && self.n_trace_hosts == 0 {
             return self.get_var(name).cloned();
         }
         let (base, idx) = match split_array_ref(name) {
@@ -4657,7 +4869,7 @@ impl Interp {
     pub(crate) fn read_var_scalar_top(&self, name: &str) -> Option<&Value> {
         crate::interp::dbgtrace::event("read_top", name);
         if name.contains('(')
-            || !self.var_traces.is_empty()
+            || self.n_trace_hosts != 0
             || !self.dead_flat.is_empty()
             || !self.frames.is_empty()
         {
@@ -4715,7 +4927,7 @@ impl Interp {
     pub(crate) fn scalar_top_write_ok(&self, name: &str) -> bool {
         if name.contains('(')
             || has_ns_sep(name)
-            || !self.var_traces.is_empty()
+            || self.n_trace_hosts != 0
             || !self.dead_flat.is_empty()
             || !self.frames.is_empty()
         {
@@ -4743,7 +4955,7 @@ impl Interp {
     }
 
     /// 顶层标量直写（守卫由 scalar_top_write_ok 前置；写 trace 已被
-    /// var_traces 空守卫排除）。set_var 返回语义 = Ok(新值)。
+    /// trace 空守卫（n_trace_hosts——宿主在席形，含 lingering 空集）排除）。set_var 返回语义 = Ok(新值)。
     ///
     /// T4：ns 体臂按守卫同一构造取 `get_mut` 原地写（键已存在，键串
     /// 不动、不进堆）；防御臂 store_var 即 9.1 的落点语义。

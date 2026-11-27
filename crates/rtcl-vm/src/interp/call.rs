@@ -771,16 +771,32 @@ impl Interp {
         // propagating out, and a trace error stays a background error that
         // leaves the in-flight errorInfo untouched).  Whole-array traces
         // fire once for the array; element-only registrations do not.
-        // The per-call `F{i}:` prefix allocation only happens when there
-        // are traces at all to find.
-        if !self.var_traces.is_empty() {
-            let teardown_prefix = format!("F{}:", self.frames.len() - 1);
-            let traced: Vec<String> = self
-                .var_traces
-                .keys()
-                .filter(|k| k.starts_with(&teardown_prefix))
-                .map(|k| k[teardown_prefix.len()..].to_string())
-                .collect();
+        // D1 步骤 4：trace 挂帧 vt 的 Var 上——快照（摘出 TraceSet）先
+        // 于 reset_var_state（整表清空），火从快照触发；触发序 = vt 插
+        // 入序（旧形为字符串表 HashMap 迭代序——未钉路径，随机序本就
+        // 无语义）。
+        if self.n_trace_hosts != 0 {
+            let fi = self.frames.len() - 1;
+            let traced: Vec<(String, String, Box<super::vararena::TraceSet>)> = {
+                let frame = self.frames.last_mut().expect("teardown frame");
+                let keys: Vec<Rc<str>> = frame
+                    .vt
+                    .order_entries()
+                    .filter(|(_, v)| v.traces.is_some())
+                    .map(|(k, _)| Rc::clone(k))
+                    .collect();
+                let mut out = Vec::new();
+                for k in keys {
+                    if let Some(v) = frame.vt.get_mut(k.as_ref()) {
+                        if let Some(t) = v.traces.take() {
+                            out.push((k.to_string(), format!("F{}:{}", fi, k), t));
+                        }
+                    }
+                }
+                // 摘出即宿主消亡（含 lingering 空集）——宿主计数对账。
+                self.n_trace_hosts -= out.len();
+                out
+            };
             if !traced.is_empty() {
                 if let Some(frame) = self.frames.last_mut() {
                     frame.reset_var_state();
@@ -793,8 +809,17 @@ impl Interp {
                 let saved_raised = std::mem::take(&mut self.err_code_raised);
                 let saved_pending = self.err_pending_top.take();
                 let saved_chain = std::mem::take(&mut self.err_pending_chain);
-                for name in traced {
-                    let _ = self.fire_traces(&name, None, "unset");
+                for (name, stamp, set) in &traced {
+                    // 注册后链接过的名字（variable/global 装 link 不查
+                    // trace——upvar-8.7 只拦 upvar/global 命令）在清场时
+                    // 的解析键已不是 F{idx}:name：旧形的火经 resolve_loc
+                    // 跟链，F 记录 miss（随表清场离场），解析目标上的记
+                    // 录照旧在席触发——两形分别复刻。
+                    if self.trace_stamp_of(name) == *stamp {
+                        let _ = self.fire_trace_snapshot(stamp, name, None, "unset", Some(set), true);
+                    } else {
+                        let _ = self.fire_traces(name, None, "unset");
+                    }
                 }
                 self.err_info = saved_info;
                 self.err_fresh = saved_fresh;
@@ -842,26 +867,14 @@ impl Interp {
         if self.frame_pool.len() < 32 {
             self.frame_pool.push(popped);
         }
-        // Frame-local trace tables keyed F{idx}:... must not leak into the
-        // next call that reuses this frame index.  (The retain only runs
-        // when a table is non-empty — the format! below was a per-call
-        // allocation that `p` on an empty table didn't pay for in tclsh.)
-        if !self.var_traces.is_empty()
-            || !self.elem_traces.is_empty()
-            || !self.trace_phantoms.is_empty()
-            || !self.array_searches.is_empty()
-            || !self.array_stamps.is_empty()
-        {
-            let fkey = format!("F{}:", self.frames.len());
-            self.var_traces.retain(|k, _| !k.starts_with(&fkey));
-            self.elem_traces.retain(|k, _| !k.starts_with(&fkey));
-            self.trace_phantoms.retain(|k, _| !k.starts_with(&fkey));
-            // `array startsearch` iterations and mutation stamps belong to
-            // the frame: a proc that returns without `donesearch` must not
-            // leak them into the next call reusing this frame index.
-            // D1 步骤 3：搜索/戳键 = 宿主 VarRef——帧宿主（Frame(idx)）
-            // 的条目随帧出清（旧 F{idx}: 前缀扫描的键形对应）；全局宿主
-            // 条目不受影响。
+        // Frame-local trace state died with the frame table reset above
+        // (D1 步骤 4：trace 挂 vt 的 Var——快照火后随 reset 清空，无键
+        // 可漏)。`array startsearch` iterations and mutation stamps belong
+        // to the frame: a proc that returns without `donesearch` must not
+        // leak them into the next call reusing this frame index.
+        // D1 步骤 3：搜索/戳键 = 宿主 VarRef——帧宿主（Frame(idx)）的
+        // 条目随帧出清；全局宿主条目不受影响。
+        if !self.array_searches.is_empty() || !self.array_stamps.is_empty() {
             let dead = super::vararena::TableId::Frame(self.frames.len() as u32);
             let frame_host = |k: &super::vararena::VarRef| {
                 matches!(&k.table, super::vararena::TableId::Array(h) if h.table == dead)
@@ -1561,14 +1574,30 @@ impl Interp {
                 self.note_cmd_mutation();
             }
         }
-        if !self.var_traces.is_empty() {
-            let teardown_prefix = format!("F{}:", self.frames.len() - 1);
-            let traced: Vec<String> = self
-                .var_traces
-                .keys()
-                .filter(|k| k.starts_with(&teardown_prefix))
-                .map(|k| k[teardown_prefix.len()..].to_string())
-                .collect();
+        // D1 步骤 4：trace 挂帧 vt 的 Var——快照（摘出 TraceSet）先于
+        // reset_var_state，火从快照触发（同 call_proc 清场形态）。
+        if self.n_trace_hosts != 0 {
+            let fi = self.frames.len() - 1;
+            let traced: Vec<(String, String, Box<super::vararena::TraceSet>)> = {
+                let frame = self.frames.last_mut().expect("teardown frame");
+                let keys: Vec<Rc<str>> = frame
+                    .vt
+                    .order_entries()
+                    .filter(|(_, v)| v.traces.is_some())
+                    .map(|(k, _)| Rc::clone(k))
+                    .collect();
+                let mut out = Vec::new();
+                for k in keys {
+                    if let Some(v) = frame.vt.get_mut(k.as_ref()) {
+                        if let Some(t) = v.traces.take() {
+                            out.push((k.to_string(), format!("F{}:{}", fi, k), t));
+                        }
+                    }
+                }
+                // 摘出即宿主消亡（含 lingering 空集）——宿主计数对账。
+                self.n_trace_hosts -= out.len();
+                out
+            };
             if !traced.is_empty() {
                 if let Some(frame) = self.frames.last_mut() {
                     frame.reset_var_state();
@@ -1579,8 +1608,14 @@ impl Interp {
                 let saved_raised = std::mem::take(&mut self.err_code_raised);
                 let saved_pending = self.err_pending_top.take();
                 let saved_chain = std::mem::take(&mut self.err_pending_chain);
-                for tname in traced {
-                    let _ = self.fire_traces(&tname, None, "unset");
+                for (tname, stamp, set) in &traced {
+                    // 同 call_proc 清场：注册后链接过的名字解析键已变，
+                    // F 记录不触发（离场），解析目标上的记录在席触发。
+                    if self.trace_stamp_of(tname) == *stamp {
+                        let _ = self.fire_trace_snapshot(stamp, tname, None, "unset", Some(set), true);
+                    } else {
+                        let _ = self.fire_traces(tname, None, "unset");
+                    }
                 }
                 self.err_info = saved_info;
                 self.err_fresh = saved_fresh;
@@ -1692,20 +1727,12 @@ impl Interp {
         if self.frame_pool.len() < 32 {
             self.frame_pool.push(popped);
         }
-        if !self.var_traces.is_empty()
-            || !self.elem_traces.is_empty()
-            || !self.trace_phantoms.is_empty()
-            || !self.array_searches.is_empty()
-            || !self.array_stamps.is_empty()
-        {
-            let fkey = format!("F{}:", self.frames.len());
-            self.var_traces.retain(|k, _| !k.starts_with(&fkey));
-            self.elem_traces.retain(|k, _| !k.starts_with(&fkey));
-            self.trace_phantoms.retain(|k, _| !k.starts_with(&fkey));
-            // `array startsearch` iterations and mutation stamps belong to
-            // the frame: a proc that returns without `donesearch` must not
-            // leak them into the next call reusing this frame index.
-            // D1 步骤 3：搜索/戳键 = 宿主 VarRef——帧宿主随帧出清。
+        // D1 步骤 4：帧 trace 随 reset_var_state 清空（挂 vt 的 Var），
+        // 无键可漏。`array startsearch` iterations and mutation stamps
+        // belong to the frame: a proc that returns without `donesearch`
+        // must not leak them into the next call reusing this frame index.
+        // D1 步骤 3：搜索/戳键 = 宿主 VarRef——帧宿主随帧出清。
+        if !self.array_searches.is_empty() || !self.array_stamps.is_empty() {
             let dead = super::vararena::TableId::Frame(self.frames.len() as u32);
             let frame_host = |k: &super::vararena::VarRef| {
                 matches!(&k.table, super::vararena::TableId::Array(h) if h.table == dead)

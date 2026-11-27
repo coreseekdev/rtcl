@@ -1135,7 +1135,7 @@ fn exec_bytecode_with(
     let top_active = code.toplevel_slots
         && interp.frames.is_empty()
         && interp.current_namespace.as_ref() == "::"
-        && interp.var_traces.is_empty()
+        && interp.n_trace_hosts == 0
         && interp.dead_flat.is_empty()
         && interp.flat_aliases.is_empty();
     if top_active {
@@ -1345,7 +1345,7 @@ fn exec_inner(interp: &mut Interp, code: &ByteCode, st: &mut VmState) -> Result<
         // fail-safe：未列举 op 默认非纯。另：单元中途注册 trace →
         // flush + 永久降级（ts 写绕过 trace 触发不可接受）。
         if interp.top_slots.is_some() {
-            if !interp.var_traces.is_empty() || !interp.dead_flat.is_empty() {
+            if interp.n_trace_hosts != 0 || !interp.dead_flat.is_empty() {
                 interp.top_flush();
                 interp.top_slots = None;
             } else {

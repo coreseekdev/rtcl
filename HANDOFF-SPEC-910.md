@@ -202,11 +202,10 @@ doc/*.n 章节）。
 
 ## 6. 裁定项（2026-11-27 用户口径：2 按 9.1 对齐，3 允许加探针）
 
-1. **oo 对象计数口径**：已按“关系语义”处理，不钉绝对基准。9.1.0 的
-   匿名对象从 `::oo::Obj20` 起（启动预建 20 个内部对象），rtcl 的
-   预建集不同；规格只钉名字形如 `::oo::Obj<digits>`、`creationid`
-   等于后缀且对同一对象稳定、后创建严格递增（destroy 后也不复用）。
-   绝对基准作为 `open question` 留在 `oo.allium` 末尾。
+1. **oo 对象计数口径**：已按用户 2026-11-27 裁定——**首个用户对象固定
+   为 `::oo::Obj20` / `creationid 20`**。9.1.0 核心预建 20 个对象；
+   rtcl 预建少但用户可见起点保持 20（计数对齐）。规格钉绝对首对象 +
+   名字形 + 后续递增/不复用关系，不再作为 open question。
 2. **binary 浮点 Inf/NaN 位保真**：已按 tclsh 9.1.0 实测字节钉死
    （`pbr6_float_bits`）：float32 Inf `7f800000`、-Inf `ff800000`、
    NaN `7fc00000`、-0.0 `80000000`；double 对应 `7ff0…/fff0…/
@@ -248,8 +247,8 @@ doc/*.n 章节）。
 7. `expr` 的 `017` 是十进制 17，而 `scan %i`/`%o` 的 `017` 仍是八进制
    15（C 语义）。两处都已按 oracle 分别钉死，勿当同一套字面量语法。
 8. 规则数口径：§2 写的「447 条规则」与实测不符——交接基线 `442f4ff`
-   上 `grep '^rule ' specs/*.allium` 为 242 条；本轮结束为 347 条
-   （新增 105 条）。§2 的 447 可能是含 probe/其他分支的旧数，后续以
+   上 `grep '^rule ' specs/*.allium` 为 242 条；本轮结束为 349 条
+   （新增 107 条）。§2 的 447 可能是含 probe/其他分支的旧数，后续以
    grep 计数为准。
 9. T7 指令面修正：9.1 的 `assemble` 菜单仍保留 `lshift`，移除的是
    `land`/`lor`；§3-C 写的「移除 land/lor/lshift」应改为「移除
@@ -267,10 +266,11 @@ doc/*.n 章节）。
     9.1.0 实测不存在；`info commandtype/line` 实际名为 `info cmdtype`，
     没有 `info line`。`unicode` 只有 tonfc/tonfd/tonfkc/tonfkd 四个
     归一化子命令，没有 version/names。后续不要再按旧清单硬造规则。
-12. OO 对象基准：9.1.0 首个匿名对象是 `::oo::Obj20`，`creationid`
-    等于数字后缀且全局递增、destroy 后不复用。绝对基准不写进 ensures，
-    只作为 `oo.allium` 的 open question；探针 `oo_objcount91.tcl`
-    用归一化名 + 关系断言。
+12. OO 对象基准：9.1.0 首个用户对象（new/create/class）是
+    `::oo::Obj20` / `creationid 20`，命名对象与类共用同一计数器。
+    用户确认 rtcl 虽预建少但用户可见起点保持 20；规格已钉绝对首对象
+    （`AnonymousObjectCounterStartsAt20`、`NamedAndClassObjectsShareCounter`）
+    与递增/不复用关系，探针 `oo_objcount91.tcl` 断言 Obj20。
 13. binary 浮点位形：9.1.0 为规范 IEEE-754（float32 Inf `7f800000`，
     double Inf `7ff0000000000000`），rtcl 的 `7f7fffff` 饱和是实现
     分歧；规格已钉 oracle（`pbr6_float_bits.tcl`），代码待修。
@@ -335,11 +335,12 @@ doc/*.n 章节）。
     pkgconfig 键集（实测 19 键）。清单中的 readFile/writeFile/
     foreachLine/tcl::idna 在 9.1.0 不存在（§7-11）。
   - T6：已钉 abstract/singleton/private method/classmethod/
-    info class variables（5 条）+ 匿名对象名/creationid 关系 +
-    info object isa（3 条）。properties/classvariable 因文档超前于
-    9.1.0 实现未写（§7-10）；对象计数绝对基准作为 open question，
-    不再阻塞。新增探针 `oo_objcount91.tcl`、`oo_features91.tcl`、
-    `pbr6_float_bits.tcl`（§4 授权）。
+    info class variables（5 条）+ 匿名对象首基准 Obj20、名字/creationid
+    关系、命名/类共用计数器、info object isa（4 条）。
+    properties/classvariable 因文档超前于 9.1.0 实现未写（§7-10）；
+    对象计数绝对基准已按用户裁定钉死，不再留 open question。新增探针
+    `oo_objcount91.tcl`、`oo_features91.tcl`、`pbr6_float_bits.tcl`
+    （§4 授权）。
 - 门禁终态：`allium check specs/` 0 error（4 warning 为 memory-lifecycle
   既有 unused entity/binding；5 info 为既有 unused field）；
   `allium analyse specs/` 0 finding。未改 crates/judge，未跑 judge

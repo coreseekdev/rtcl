@@ -950,11 +950,11 @@ mod tests {
         let ops = compile_expr_with_peephole("1 << -1").unwrap();
         assert!(ops
             .iter()
-            .any(|o| matches!(o, OpCode::ExprFoldError(b'<', _, _))));
+            .any(|o| matches!(o, OpCode::ExprFoldError(c, _, _) if *c == u16::from(b'<'))));
         let ops = compile_expr_with_peephole("1 >> -1").unwrap();
         assert!(ops
             .iter()
-            .any(|o| matches!(o, OpCode::ExprFoldError(b'>', _, _))));
+            .any(|o| matches!(o, OpCode::ExprFoldError(c, _, _) if *c == u16::from(b'>'))));
     }
 
     #[test]

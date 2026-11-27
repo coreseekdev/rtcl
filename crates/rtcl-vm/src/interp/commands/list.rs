@@ -445,7 +445,6 @@ pub fn cmd_lrepeat(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             args[1].as_str()
         )));
     }
-    let count = count as usize;
     let elements: Vec<Value> = args[2..].to_vec();
     if elements.is_empty() {
         return Ok(Value::empty());
@@ -460,13 +459,19 @@ pub fn cmd_lrepeat(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         set_error_code(interp, "TCL MEMORY");
         tcl_err(format!("max length ({max}) of a Tcl list exceeded"))
     };
-    let total = match count.checked_mul(elements.len()) {
-        Some(t) if t as u64 <= TCL91_LIST_MAX => t,
-        _ => return Err(over(interp, TCL91_LIST_MAX)),
-    };
-    if total > MAX_LIST_ELEMENTS {
+    // S21 wasm32 兼容：count×elements 的守卫留在 u128 域——usize=u32
+    // 时 `count as usize` 先窄化会把 2^32 截成 0，守卫全被绕过且循环
+    // 体静默产出空列表（silently wrong）。预算内（≤ MAX_LIST_ELEMENTS
+    // < u32::MAX）再窄化，两个目标都安全。
+    let total_wide = (count as u128) * (elements.len() as u128);
+    if total_wide > TCL91_LIST_MAX as u128 {
+        return Err(over(interp, TCL91_LIST_MAX));
+    }
+    if total_wide > MAX_LIST_ELEMENTS as u128 {
         return Err(over(interp, MAX_LIST_ELEMENTS as u64));
     }
+    let count = count as usize;
+    let total = total_wide as usize;
     let mut result = Vec::new();
     result
         .try_reserve(total)

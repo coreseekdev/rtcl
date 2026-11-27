@@ -155,14 +155,19 @@ await check('recursion: limit message and code',  'proc a {} {a}; catch {a} e; l
 await check('panic: unicode compare',             'set name 张三; if {$name < "x"} {set r lt} else {set r ge}; set r', /ok:"ge/);
 await check('panic: unicode eq',                  'expr {"日本語" == "x"}', /ok:"0/);
 await check('panic: format precision',            'string length [format %.65536f 1.5]', /ok:"65538"|tcl/);
-await check('panic: string repeat 2^32',          'catch {string repeat x 4294967296} e; set e', /integer value too large/);
-await check('panic: lrepeat 2^32',                'catch {lrepeat 4294967296 x} e; set e', /integer value too large/);
+// E1 批重钉（S21 wasm32 守卫修复）：旧期望 /integer value too large/
+// 是 M3 时代（129966d）的钉形——TIP 626 后 2^32 是合法 64 位 count，
+// oracle 同款catchable 拒绝形是预算错误（native crash-probe a11 对同
+// 形已按 9.1 容量中性化）。wasm32 上守卫在 usize 窄化前用 wide 域
+// 比较：string repeat 走 "string size overflow"（同 native rtcl），
+// lrepeat 走 "max length (536870909)"（同 native rtcl）。
+await check('panic: string repeat 2^32',          'catch {string repeat x 4294967296} e; set e', /string size overflow/);
+await check('panic: lrepeat 2^32',                'catch {lrepeat 4294967296 x} e; set e', /max length/);
 await check('silent: + overflows exactly',        '+ 9223372036854775807 1', /ok:"9223372036854775808/);
-// C16（9.1 对齐批 B1）：018 形旧式八进制串的算术错误消息换 9.1 词
-// （cannot use non-numeric string "018" as left operand of "+"，oracle
-// 实测同词面——rtcl 的 018 仍按 8.6 旧式八进制解析失败（数字字面量
-// 9 语法迁移是另一批），故错误仍在、词面随 C16 换新）。
-await check('silent: octal 018 is invalid',       'catch {set v 018; expr {$v + 0}} e; set e', /non-numeric string/);
+// E1 批重钉：018 在 9.1 是合法十进制（digits91 批后 oracle 实测
+// `expr {018 + 0}` → 18，无错误）——旧期望 /non-numeric string/ 是
+// C16 时代（数字字面量 9 语法落地前）的钉形，已过期。
+await check('silent: octal 018 is decimal now',   'catch {set v 018; expr {$v + 0}} e; set e', /ok:"18/);
 // A `#` in an expression: the checker scanned it as a comment and looped.
 await check('hang: # in an expression',           'catch {expr {3 #}} e; set e', new RegExp(String.raw`invalid character \\"#\\"`));
 await check('hang: # after an operand',           'catch {expr {1 + #}} e; set e', new RegExp(String.raw`invalid character \\"#\\"`));

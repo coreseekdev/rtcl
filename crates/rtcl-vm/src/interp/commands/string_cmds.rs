@@ -726,7 +726,7 @@ pub fn cmd_string(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         crate::error::ErrorCode::Generic,
                     ));
                 }
-                Some(t) => t as usize,
+                Some(t) => t,
                 None => {
                     super::list::set_error_code(interp, "TCL MEMORY");
                     return Err(Error::runtime(
@@ -738,13 +738,18 @@ pub fn cmd_string(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     ));
                 }
             };
-            if total > super::list::MAX_VALUE_BYTES {
+            // S21 wasm32 兼容：预算比较留在 u128 域（usize=u32 时
+            // `t as usize` 先窄化会把 2^32 截成 0、守卫被绕过，随后逐
+            // push 撑爆线性内存 → 不可捕获 trap）。预算内再窄化（≤
+            // i32::MAX 两个目标都放得下）。
+            if total > super::list::MAX_VALUE_BYTES as u128 {
                 super::list::set_error_code(interp, "TCL MEMORY");
                 return Err(Error::runtime(
                     format!("string size overflow: unable to alloc {total} bytes"),
                     crate::error::ErrorCode::Generic,
                 ));
             }
+            let total = total as usize;
             let mut out = String::new();
             out.try_reserve(total)
                 .map_err(|_| super::list::out_of_memory(interp, total))?;

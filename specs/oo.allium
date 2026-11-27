@@ -333,6 +333,44 @@ rule AnonymousObjectCounterStartsAt20 {
     --   share the same counter and also start at 20)
 }
 
+rule BootstrapPropertySlotObjects {
+    -- Obj11-14 are the four property slots used by oo::configurable;
+    -- each is an instance of oo::Slot.
+    when: Evaluates("list [info object creationid ::oo::configuresupport::readableproperties] [info object creationid ::oo::configuresupport::writableproperties] [info object creationid ::oo::configuresupport::objreadableproperties] [info object creationid ::oo::configuresupport::objwritableproperties]")
+    ensures: completion.code = ok
+    ensures: completion.value = "11 12 13 14"
+    -- probe: 2026-11-27 tclsh9.1 (info class instances oo::Slot has 11)
+}
+
+rule BootstrapAdditionalClassObjects {
+    -- Obj15-19 are the 9.1 TclOO additions: singleton,
+    -- SingletonInstance, abstract, configuresupport::configurable,
+    -- configurable.
+    when: Evaluates("list [info object creationid oo::singleton] [info object creationid oo::SingletonInstance] [info object creationid oo::abstract] [info object creationid oo::configuresupport::configurable] [info object creationid oo::configurable]")
+    ensures: completion.code = ok
+    ensures: completion.value = "15 16 17 18 19"
+    -- probe: 2026-11-27 tclsh9.1
+}
+
+rule BootstrapClassHierarchy {
+    -- singleton/abstract/configurable are metaclasses (superclass
+    -- oo::class); SingletonInstance and configuresupport::configurable
+    -- are plain classes (superclass oo::object).
+    when: Evaluates("list [info class superclasses oo::singleton] [info class superclasses oo::SingletonInstance] [info class superclasses oo::abstract] [info class superclasses oo::configurable] [info class superclasses oo::configuresupport::configurable]")
+    ensures: completion.code = ok
+    ensures: completion.value = "::oo::class ::oo::object ::oo::class ::oo::class ::oo::object"
+    -- probe: 2026-11-27 tclsh9.1
+}
+
+rule BootstrapSlotInventory {
+    -- oo::Slot has 11 instances: the 7 definition slots plus the 4
+    -- property slots.
+    when: Evaluates("list [llength [info class instances oo::Slot]] [expr {[lsearch -exact [info class instances oo::Slot] ::oo::configuresupport::readableproperties] >= 0}] [info object class ::oo::configuresupport::readableproperties]")
+    ensures: completion.code = ok
+    ensures: completion.value = "11 1 ::oo::Slot"
+    -- probe: 2026-11-27 tclsh9.1
+}
+
 rule NamedAndClassObjectsShareCounter {
     -- The counter is shared across object/class creation.
     when: Evaluates("oo::object create N20; oo::class create C20; list [info object creationid N20] [info object creationid C20]")

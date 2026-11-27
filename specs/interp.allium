@@ -19,8 +19,8 @@ entity Completion {
 }
 
 entity Script {
-    -- A Tcl script as presented to the interpreter.
-    text: String
+    -- A Tcl script as presented to the interpreter.  The text is opaque
+    -- to this vocabulary; domain specs talk about the completion instead.
 }
 
 surface Interpreter {

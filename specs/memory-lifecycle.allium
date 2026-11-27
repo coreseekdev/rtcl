@@ -22,6 +22,9 @@ entity Runtime {
     live_objects: Integer
     live_jit_modules: Integer
     caches: List<Cache>
+    frames: List<Frame>
+    objects: List<OoObject>
+    jit_modules: List<JitModule>
 }
 
 entity ValueHandle {
@@ -58,6 +61,13 @@ surface RuntimeResources {
     -- The host boundary: a host creates a runtime, evaluates scripts
     -- through it, and eventually drops it.
     facing host: Runtime
+
+    exposes:
+        host.live_values
+        host.live_channels
+        host.live_frames
+        host.live_objects
+        host.live_jit_modules
 
     provides:
         CreatesValue(runtime, value)
@@ -154,6 +164,15 @@ rule ShutdownReleasesEverything {
     ensures:
         for c in runtime.caches:
             c.entries = 0
+    ensures:
+        for f in runtime.frames:
+            f.state = popped
+    ensures:
+        for o in runtime.objects:
+            o.state = destroyed
+    ensures:
+        for m in runtime.jit_modules:
+            m.state = unloaded
 }
 
 -- ── invariants ─────────────────────────────────────────────────────
@@ -172,4 +191,14 @@ invariant CachesStayBounded {
     for runtime in Runtime:
         for cache in runtime.caches:
             cache.entries <= cache.limit
+}
+
+invariant ChannelKindIsKnown {
+    for channel in Channel:
+        channel.kind in {file, pipe, reflected, transform, std}
+}
+
+invariant CacheHasName {
+    for cache in Cache:
+        cache.name != ""
 }

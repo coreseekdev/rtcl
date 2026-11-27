@@ -2885,3 +2885,40 @@ probe VM=999 vs tree/oracle=998，sweep 13（12 既有 + 该探针）。已修
 跨分支合并解时，对含行为语义的小 hunk（门比较式）要逐个 diff 核对，
 不能只看冲突区域——自动合并也可能因基线差丢 hunk。objquad.tcl 墙钟
 断言同批容差化（与 objsec 同款）。
+
+## E2/E3 语义对齐批（task/e2-ooinfo + task/e3-exprfmt，2026-11-27 合并，子代理施工）
+
+### E2（oo/info/ns/uplevel/lseq，gen_oo 17→0、gen_info 3→0、gen_namespace-old 3→0、gen_basic 1→0、gen_uplevel 7→0）
+- gen_oo 17：creationid/definitionnamespace/self/private 词/Slot 引导态×11
+  （oo 单测对象编号 Obj11→Obj15 随引导态）；gen_info 3：cmdtype 的 ::
+  前缀归一；gen_namespace-old 3：自删体帧窗口的复活语义；gen_basic 1：
+  自删 ns 复活窗口；gen_uplevel 7：层级词解析对齐 TclObjGetFrame
+  （upvar_levels 探针转绿）。lseq-4.11 记账（arithseries 惰性 rep 需
+  Value 层 series 表示，归 Value 模型批）。
+- **主树发现并登记**：rtcl OO bootstrap 少 9 个对象（根因 3b82bc1，
+  首个用户 OO 对象 = ::oo::Obj20 的裁定 37907d0 + specs 登记 6bd2b19）。
+
+### E3（format/expr/incr，gen_format 15→0、gen_expr 11→0、gen_expr-old 5→0、gen_parseExpr 1→0、gen_incr 2→0、gen_incr-old 1→0、gen_get 2→0）
+- format：9.1 截断口径（无 size 修饰符 %b/%d/%o/%x/%X/%u 截 32 位、h
+  16 位、l/lq/j/z/t 64 位、ll/L 全精度 bignum、%llu 负值
+  TCL FORMAT BADUNSIGNED）；`#` 前缀 9 化（%#x 恒小写 0x、%#o→0o、
+  %#b→0b、%#d→0d、零值无前缀、%p 恒 0x）；精度对整数生效且压 0 旗
+  标；零填充位置（符号+前缀后）；%c 全 Unicode（E1 侧超集保留：
+  bignum ARITH IOVERFLOW + [INT_MIN,UINT_MAX] 界）；`%*d` 星宽
+  errorCode → TCL VALUE NUMBER。
+- expr：**TIP582 注释**（`#` 到行尾词法等价空白，token 边界均可，双
+  引擎同步）；一元 ± 语义修正（-"a" 报 non-numeric operand of "-"、
+  一元 + 数值断言、±NaN 浮点类）；布尔不 trim（`! " true "` 报错）；
+  mathfunc 报错分族（浮点族 expected floating-point number、min/max
+  not enough arguments）；数组下标非法字符（`(" { }` → invalid
+  character in array index，28 字节 display 对齐）。
+- incr：列表样值报 expected integer but got a list（incr-2.32/2.33 帧
+  保留）。
+- **附**：E3 发现并修复 expr_compile.rs cfg(test) 自基线（8908749）
+  起编译红（D2 宽操作数的测试模式字面）——非其引入，主树同红。
+
+### 门禁（合并树终态，全部独立复验）
+judge **94/95**（余 gen_lseq 1 = arithseries rep 记账项）、crash-gate
+128/128、probes **398/76**（known 2/10：objsec/objquad 容差化后转绿）、
+sweep 12 既有、workspace **cargo exit 0**（rtcl-vm 871/0）、wasm32 ✓、
+五特性 ✓。案例链：语料 9.1 重提取基线 4157 → 各批累计 **4817/4849=99.3%**。

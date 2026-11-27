@@ -247,8 +247,8 @@ doc/*.n 章节）。
 7. `expr` 的 `017` 是十进制 17，而 `scan %i`/`%o` 的 `017` 仍是八进制
    15（C 语义）。两处都已按 oracle 分别钉死，勿当同一套字面量语法。
 8. 规则数口径：§2 写的「447 条规则」与实测不符——交接基线 `442f4ff`
-   上 `grep '^rule ' specs/*.allium` 为 242 条；本轮结束为 359 条
-   （新增 117 条）。§2 的 447 可能是含 probe/其他分支的旧数，后续以
+   上 `grep '^rule ' specs/*.allium` 为 242 条；本轮结束为 362 条
+   （新增 120 条）。§2 的 447 可能是含 probe/其他分支的旧数，后续以
    grep 计数为准。
 9. T7 指令面修正：9.1 的 `assemble` 菜单仍保留 `lshift`，移除的是
    `land`/`lor`；§3-C 写的「移除 land/lor/lshift」应改为「移除
@@ -313,6 +313,9 @@ doc/*.n 章节）。
     期望 `\ya+/\ma+` = 1；实测（8.6/9.1 同）是 0（'a' 不在词首）。
     已改为 " aa" + `a\M`，得 1 1 1。`LookbehindRejectedIn86` 改名
     `LookbehindRejected`（9.1 仍无 lookbehind）。
+21. `::tcl::*` 命令集实测 18 条（含 tcl::process），不是旧清单写的
+    27 vs 23；socket `-nodelay/-keepalive` 默认 0、可置 1；
+    `package files msgcat` 为 2 个脚本路径。均已按实测钉死。
 
 ## 8. 交接记录
 
@@ -373,13 +376,11 @@ doc/*.n 章节）。
     三条既有规则的注释；interp 补 assemble 指令面（swap 可用、land
     移除、lshift 仍在）与栈平衡错误；matching 补 binary 浮点
     Inf/NaN/-0.0 的 IEEE-754 位形（R/r/Q/q）。binary 不再挂裁定项。
-  - T4 余项：本轮又补 clock add weekdays / clock scan -validate、
+  - T4 余项：已补 clock add weekdays / clock scan -validate、
     exec -encoding、info loaded/cmdtype、tcl::build-info、
-    ::tcl::pkgconfig 键集、unicode 归一化、zipfs root、timerate 形状。
-    仍未做：socket -nodelay/-keepalive（需连通的本地 socket）、
-    package files 的实例面、::tcl 命令集 27 vs 23。清单中的
-    readFile/writeFile/foreachLine/tcl::idna 在 9.1.0 不存在（§7-11），
-    chan configure -inputmode 也不存在（§7-16）。
+    ::tcl::pkgconfig 键集、unicode 归一化、zipfs root、timerate 形状、
+    socket -nodelay/-keepalive、package files、::tcl 命令集 18 条。
+    T4 主面到此完成；timerate/zipfs 的文件/数值清单仍不钉（环境相关）。
   - T6：已钉 abstract/singleton/private method/classmethod/
     info class variables（5 条）+ 匿名对象首基准 Obj20、名字/creationid
     关系、命名/类共用计数器、info object isa（4 条）。

@@ -22,6 +22,10 @@ mod vm_bridge;
 mod vm_exec;
 pub(crate) mod util;
 mod varmap;
+// D1 变量表重写步骤 1（specs/ARCH-DESIGN-20261126.md D1）：基础设施先
+// 落（本模块自带测试）；读写面接线在步骤 1 迁移提交接入——接线后该
+// 模块顶部的 dead_code 暂免收窄到未接线句柄 API。
+pub(crate) mod vararena;
 pub(crate) mod tclhash;
 pub(crate) mod dbgtrace;
 

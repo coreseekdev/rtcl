@@ -59,26 +59,27 @@ const NO_SLOT: u32 = u32::MAX;
 
 /// 表身份（D1：三类表）。`Global(0)` = arena 根表；`Frame(i)` = 帧表
 /// （步骤 2：表实例驻 [`super::CallFrame`]，i = 帧栈下标）；`Array`
-/// 为步骤 3 的占位臂。
-#[allow(dead_code)] // Array 臂步骤 3 接线
-#[derive(Debug, Clone)]
+/// = 数组元素表（步骤 3：宿主基 Var 的子表，按宿主 [`VarRef`] 寻址
+/// ——宿主在全局/帧表里，子表实例驻宿主 [`Var::elements`]）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum TableId {
     /// 全局（命名空间）表：[`VarArena::tables`] 的下标。
     Global(u32),
     /// 帧变量表（步骤 2 迁移；表实例驻帧，句柄经帧侧访问）。
     Frame(u32),
-    /// 数组元素表（步骤 3 迁移；占位）——基变量的句柄。
+    /// 数组元素表（步骤 3）——基变量的句柄（寻址经宿主 Var 的
+    /// `elements` 子表；生命周期随宿主：宿主摘除/帧池重置即回收）。
     Array(Box<VarRef>),
 }
 
 impl TableId {
     /// 同表判定（句柄读的代数守卫前置——张冠李戴的句柄一律 miss）。
-    /// `Array` 臂在步骤 3 拆元素表前不参与句柄访问。
     #[inline]
     pub(crate) fn matches(&self, other: &TableId) -> bool {
         match (self, other) {
             (TableId::Global(a), TableId::Global(b)) => a == b,
             (TableId::Frame(a), TableId::Frame(b)) => a == b,
+            (TableId::Array(a), TableId::Array(b)) => a == b,
             _ => false,
         }
     }
@@ -86,9 +87,8 @@ impl TableId {
 
 /// 「解析一次」返回的句柄：表 + 槽 + 代数。槽删除后代数递增，持旧
 /// 句柄的读取一律 miss（返回 None）——指针稳定与 ABA 防护并存。
-/// （句柄 API 的消费面在步骤 2/3 接线——「解析一次」替代平键快径。）
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
+/// （步骤 3 起 `Array` 身份的句柄寻址宿主 Var 的子表。）
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct VarRef {
     pub table: TableId,
     pub slot: u32,
@@ -143,7 +143,8 @@ pub(crate) enum TraceSet {}
 #[derive(Debug, Clone)]
 pub(crate) enum LinkTarget {}
 
-/// 表项（D1 目标形状）：值 + 形态位 + 存活元素数 + trace/链接占位。
+/// 表项（D1 目标形状）：值 + 形态位 + 存活元素数 + 元素子表 +
+/// trace/链接占位。
 #[derive(Debug, Clone)]
 pub(crate) struct Var {
     /// 值。无值条目为 [`Value::unset`] 哨兵——「有值 ⟺ 旧路径
@@ -151,9 +152,17 @@ pub(crate) struct Var {
     /// phantom 成员位）。
     pub value: Value,
     pub flags: VarFlags,
-    /// ARRAY 时：存活元素数（T7 `elem_counts` 的 Var 内化——全局域；
-    /// 帧域计数仍归帧 `elem_counts`，步骤 3 随元素表并入）。
+    /// ARRAY 时：存活元素数（T7 `elem_counts` 的 Var 内化——全局域步
+    /// 骤 1、帧域步骤 3 并入；镜像 `elem_counts` 退 debug 对拍域）。
     pub elem_count: u32,
+    /// ARRAY 时：本数组的元素表（步骤 3——D1 的第三类表，按宿主
+    /// [`VarRef`] 寻址：子表实例携带 `TableId::Array(宿主句柄)` 身份，
+    /// 句柄读写经 [`VarArena::get`] 的 Array 臂或宿主所在表的
+    /// [`VarTable::get_ref`]。生命周期随宿主 Var：数组 unset（宿主摘
+    /// 除）、帧池重置（[`VarTable::reset`] 清槽）、 ARRAY 位撤销时
+    /// 整表回收）。不变式：`is_array() ⟺ elements.is_some()`——
+    /// [`VarTable`] 的写槽路径统一维护（见 `sync_elements`）。
+    pub elements: Option<Box<VarTable>>,
     /// 变量/元素 trace 集（步骤 4 挂载；本批恒 `None`）。
     #[allow(dead_code)]
     pub traces: Option<TraceSet>,
@@ -169,6 +178,7 @@ impl Var {
             value: v,
             flags: VarFlags::default(),
             elem_count: 0,
+            elements: None,
             traces: None,
             link: None,
         }
@@ -190,6 +200,17 @@ impl Var {
     #[inline]
     pub(crate) fn is_undefined(&self) -> bool {
         self.flags.contains(VarFlags::UNDEFINED)
+    }
+
+    /// 元素子表（ARRAY 时 Some）。
+    #[inline]
+    pub(crate) fn elements(&self) -> Option<&VarTable> {
+        self.elements.as_deref()
+    }
+
+    #[inline]
+    pub(crate) fn elements_mut(&mut self) -> Option<&mut VarTable> {
+        self.elements.as_deref_mut()
     }
 }
 
@@ -246,6 +267,14 @@ pub(crate) struct VarTable {
     live: usize,
     /// 空洞槽复用队列。
     free: Vec<u32>,
+    /// **元素表专属**：曾经插入过的键（下标）序——`array statistics`
+    /// 的桶轨迹重放（tclsh 的元素表保留其长成的桶）。语义 = 「自
+    /// （重）建以来插入过的每个键恰一次，在它最后一次创建的位置」，
+    /// 与共享插入日志的历史面（旧 `array_elements(live_only=false)`
+    /// 的重放域）同形；压缩按标准触发形（`len > 2*live + 64`）保留
+    /// 末次出现、活性过滤（删除键落档——桶数由此回落，与旧共享日志
+    /// 压缩后的统计面同形）。非元素表恒空。
+    history: Vec<Rc<str>>,
     /// ARRAY 标记条目数（`!array_globals.is_empty()` 守卫的 O(1) 等价）。
     arrays: u32,
     /// 数组基快索引：基键 → 槽下标。**访问路径，非平行存储**——ARRAY
@@ -278,6 +307,13 @@ impl VarTable {
         Self::with_owner(TableId::Frame(frame_idx))
     }
 
+    /// 数组元素表（步骤 3：`TableId::Array(宿主句柄)` 身份——宿主 Var
+    /// 持有的子表，宿主摘除即随之回收）。
+    #[allow(dead_code)] // 步骤 3 元素表构造（sync_elements）
+    pub(crate) fn new_array(host: VarRef) -> Self {
+        Self::with_owner(TableId::Array(Box::new(host)))
+    }
+
     /// 指定身份的空表。
     pub(crate) fn with_owner(owner: TableId) -> Self {
         Self {
@@ -290,6 +326,7 @@ impl VarTable {
             order: Vec::new(),
             live: 0,
             free: Vec::new(),
+            history: Vec::new(),
             arrays: 0,
             #[cfg(not(feature = "embedded"))]
             arr_index: super::varmap::VarMap::default(),
@@ -331,6 +368,7 @@ impl VarTable {
         self.order.clear();
         self.live = 0;
         self.free.clear();
+        self.history.clear();
         // 复用队重填（栈序：0 号槽最先复用——局部性友好；插入序语义
         // 不依赖槽号，只依赖 order 向量）。
         self.free.extend((0..self.slots.len() as u32).rev());
@@ -385,9 +423,9 @@ impl VarTable {
         Some(self.slots[sidx as usize].var.as_mut().expect("indexed slot"))
     }
 
-    /// 数组基标记（位 + 计数；快索引对账）。无条目时建无值 Var
-    /// （启动窗口：标记先于基键落表——插入序红线不动）。已标记时只
-    /// 更新计数。
+    /// 数组基标记（位 + 计数；快索引对账；子表随 ARRAY 位建立——
+    /// `sync_elements`）。无条目时建无值 Var（启动窗口：标记先于基
+    /// 键落表——插入序红线不动）。已标记时只更新计数。
     pub(crate) fn mark_array(&mut self, key: &str, count: Option<u32>) {
         if let Some(&sidx) = self.arr_index.get(key) {
             if let Some(n) = count {
@@ -413,6 +451,7 @@ impl VarTable {
                 if !was {
                     self.arrays += 1;
                     self.arr_index.insert(key.to_string(), sidx);
+                    self.sync_elements(sidx);
                 }
             }
             None => {
@@ -421,19 +460,21 @@ impl VarTable {
                 if let Some(n) = count {
                     var.elem_count = n;
                 }
-                // 走 insert（ARRAY 条目入表时快索引自动对账）。
+                // 走 insert（ARRAY 条目入表时快索引自动对账 + 子表建立）。
                 self.insert(Rc::from(key), var);
             }
         }
     }
 
-    /// 数组基摘标（计数随位同清；快索引对账）。
+    /// 数组基摘标（计数随位同清；快索引对账；子表随 ARRAY 位撤销整
+    /// 表回收）。
     pub(crate) fn unmark_array(&mut self, key: &str) {
         if let Some(&sidx) = self.arr_index.get(key) {
             let slot = &mut self.slots[sidx as usize];
             let var = slot.var.as_mut().expect("indexed slot");
             var.flags.remove(VarFlags::ARRAY);
             var.elem_count = 0;
+            var.elements = None;
             self.arrays -= 1;
             self.arr_index.remove(key);
         }
@@ -443,6 +484,63 @@ impl VarTable {
     #[allow(dead_code)] // 表 API 面（测试用；步骤 2/3 接线）
     pub(crate) fn contains(&self, key: &str) -> bool {
         self.slot_of(key).is_some()
+    }
+
+    // -- 元素子表同步（步骤 3）------------------------------------------
+    //
+    // 不变式：`is_array() ⟺ elements.is_some()`。所有「槽内 Var 整体
+    // 换入」的路径（insert/land_value/insert_moving）换入后统一过
+    // [`Self::sync_elements`]：ARRAY 条目补建子表（携带宿主句柄身份）、
+    // 换入前先从旧 Var **接管**子表（纯覆盖不得丢元素——元素读写走子
+    // 表后，宿主覆盖只发生在数组基键的空值落地，接管即保真）；非
+    // ARRAY 条目子表归 None（回收）。
+
+    /// 槽内 Var 的子表/ARRAY 位同步（写槽后调用）。
+    fn sync_elements(&mut self, sidx: u32) {
+        let host = self.ref_of(sidx);
+        let var = self.slots[sidx as usize].var.as_mut().expect("live slot");
+        if var.is_array() {
+            if var.elements.is_none() {
+                var.elements = Some(Box::new(VarTable::new_array(host)));
+            }
+        } else {
+            var.elements = None;
+        }
+    }
+
+    /// 元素键入档（元素表专属；新键才推——调用方在元素新建位点调
+    /// 用），超限压缩（活性过滤 + 末次出现保留——共享日志压缩同形，
+    /// 桶轨迹统计面的边界行为与旧日志重放一致）。
+    pub(crate) fn history_push(&mut self, index: &str) {
+        self.history.push(Rc::from(index));
+        if self.history.len() > 2 * self.live + 64 {
+            // 活性集先行（不可变阶段——history 的借用随块收口），
+            // retain 前放借用。
+            let keep: Vec<bool> = {
+                let mut seen: std::collections::HashSet<&str> =
+                    std::collections::HashSet::with_capacity(self.history.len());
+                let mut keep = vec![false; self.history.len()];
+                for (i, k) in self.history.iter().enumerate().rev() {
+                    if self.contains(k) && seen.insert(k.as_ref()) {
+                        keep[i] = true;
+                    }
+                }
+                keep
+            };
+            let mut i = 0;
+            self.history.retain(|_| {
+                let k = keep[i];
+                i += 1;
+                k
+            });
+        }
+    }
+
+    /// 历史键枚举（`array statistics` 的桶轨迹重放域——每个曾插入键
+    /// 恰一次，末次出现序；压缩后的落档语义见 [`Self::history_push`]）。
+    #[allow(dead_code)] // 步骤 3 路由接线（array statistics）
+    pub(crate) fn history_keys(&self) -> impl Iterator<Item = &str> {
+        self.history.iter().map(|k| k.as_ref())
     }
 
     // -- 键索引 ------------------------------------------------------------
@@ -498,6 +596,16 @@ impl VarTable {
                     let was_array = {
                         let slot = &mut self.slots[idx as usize];
                         let was = slot.var.as_ref().is_some_and(|v| v.is_array());
+                        // 步骤 3：接管旧 Var 的子表（纯覆盖不丢元素——
+                        // 元素读写已迁子表，宿主覆盖只发生在基键空值
+                        // 落地等少数路径；换入 Var 自带子表时以换入为
+                        // 准）。
+                        let mut var = var;
+                        if var.elements.is_none() {
+                            if let Some(old) = slot.var.as_mut() {
+                                var.elements = old.elements.take();
+                            }
+                        }
                         slot.var = Some(var);
                         was
                     };
@@ -506,6 +614,7 @@ impl VarTable {
                         self.arrays -= u32::from(was_array);
                         self.reconcile_arr_index(&key, idx, was_array);
                     }
+                    self.sync_elements(idx);
                     return self.ref_of(idx);
                 }
                 idx = self.slots[idx as usize].next;
@@ -520,6 +629,7 @@ impl VarTable {
                 self.arrays += 1;
                 self.arr_index.insert(key.as_ref().to_string(), sidx);
             }
+            self.sync_elements(sidx);
             self.order.push(sidx);
             self.slots[sidx as usize].order_pos = (self.order.len() - 1) as u32;
             self.live += 1;
@@ -535,6 +645,12 @@ impl VarTable {
                     let was_array = {
                         let slot = &mut self.slots[sidx as usize];
                         let was = slot.var.as_ref().is_some_and(|v| v.is_array());
+                        let mut var = var;
+                        if var.elements.is_none() {
+                            if let Some(old) = slot.var.as_mut() {
+                                var.elements = old.elements.take();
+                            }
+                        }
                         slot.var = Some(var);
                         was
                     };
@@ -543,6 +659,7 @@ impl VarTable {
                         self.arrays -= u32::from(was_array);
                         self.reconcile_arr_index(&key, sidx, was_array);
                     }
+                    self.sync_elements(sidx);
                     self.ref_of(sidx)
                 }
                 None => {
@@ -556,6 +673,7 @@ impl VarTable {
                         self.arrays += 1;
                         self.arr_index.insert(key, sidx);
                     }
+                    self.sync_elements(sidx);
                     self.order.push(sidx);
                     self.slots[sidx as usize].order_pos = (self.order.len() - 1) as u32;
                     self.live += 1;
@@ -579,8 +697,18 @@ impl VarTable {
                 .var
                 .as_ref()
                 .is_some_and(|v| v.is_array());
-            self.slots[sidx as usize].var = Some(var);
+            {
+                let slot = &mut self.slots[sidx as usize];
+                let mut var = var;
+                if var.elements.is_none() {
+                    if let Some(old) = slot.var.as_mut() {
+                        var.elements = old.elements.take();
+                    }
+                }
+                slot.var = Some(var);
+            }
             self.reconcile_arr_index(&key, sidx, was_array);
+            self.sync_elements(sidx);
             self.order.push(sidx);
             self.slots[sidx as usize].order_pos = (self.order.len() - 1) as u32;
             self.maybe_compact_order();
@@ -619,19 +747,33 @@ impl VarTable {
             while idx != NO_SLOT {
                 if self.slots[idx as usize].key.as_deref() == Some(key.as_str()) {
                     let sidx = idx;
-                    let (was_valued, flags) = {
+                    let (was_valued, flags, elem_count) = {
                         let var = self.slots[sidx as usize].var.as_ref().expect("live slot");
-                        (var.has_value(), var.flags)
+                        (var.has_value(), var.flags, var.elem_count)
                     };
                     let mut var = Var::with_value(v);
                     var.flags = flags;
+                    // 步骤 3：元素计数与子表随条目接管（ARRAY 基键的
+                    // 值落地不得清账——计数/子表挂宿主 Var）。
+                    var.elem_count = elem_count;
+                    let old_elements = self.slots[sidx as usize]
+                        .var
+                        .as_mut()
+                        .expect("live slot")
+                        .elements
+                        .take();
+                    if var.elements.is_none() {
+                        var.elements = old_elements;
+                    }
                     if was_valued {
                         self.slots[sidx as usize].var = Some(var);
+                        self.sync_elements(sidx);
                         return (self.ref_of(sidx), false);
                     }
                     let old_pos = self.slots[sidx as usize].order_pos as usize;
                     self.order[old_pos] = NO_SLOT;
                     self.slots[sidx as usize].var = Some(var);
+                    self.sync_elements(sidx);
                     self.order.push(sidx);
                     self.slots[sidx as usize].order_pos = (self.order.len() - 1) as u32;
                     self.maybe_compact_order();
@@ -641,6 +783,7 @@ impl VarTable {
             }
             let sidx = self.alloc_slot(Rc::from(key), bidx);
             self.slots[sidx as usize].var = Some(Var::with_value(v));
+            self.sync_elements(sidx);
             self.order.push(sidx);
             self.slots[sidx as usize].order_pos = (self.order.len() - 1) as u32;
             self.live += 1;
@@ -749,30 +892,51 @@ impl VarTable {
         self.slot_of(key).map(|i| self.ref_of(i))
     }
 
-    /// 句柄读（表归属 + 代数守卫：不符/空洞 → None）。
+    /// 句柄读（表归属 + 代数守卫：不符/空洞 → None）。步骤 3：`Array`
+    /// 身份的句柄寻址宿主 Var 的元素子表——宿主在本表时经子表下钻
+    /// （子表的归属/代数守卫照常；`TableId::matches` 的 Array 同形
+    /// 判定 + 宿主句柄校验双重防张冠李戴）。
     #[allow(dead_code)] // 句柄 API——步骤 2/3 接线
     pub(crate) fn get_ref(&self, r: &VarRef) -> Option<&Var> {
-        if !self.owns(r) {
-            return None;
+        if self.owns(r) {
+            let slot = self.slots.get(r.slot as usize)?;
+            if slot.gen != r.gen {
+                return None;
+            }
+            return slot.var.as_ref();
         }
-        let slot = self.slots.get(r.slot as usize)?;
-        if slot.gen != r.gen {
-            return None;
+        if let TableId::Array(host) = &r.table {
+            if self.owns(host) {
+                return self
+                    .get_ref(host)?
+                    .elements()
+                    .and_then(|t| t.get_ref(r));
+            }
         }
-        slot.var.as_ref()
+        None
     }
 
-    /// 句柄写（守卫同上）。
+    /// 句柄写（守卫同上；Array 句柄经宿主子表下钻）。
     #[allow(dead_code)] // 句柄 API——步骤 2/3 接线
     pub(crate) fn get_ref_mut(&mut self, r: &VarRef) -> Option<&mut Var> {
-        if !self.owns(r) {
-            return None;
+        if self.owns(r) {
+            let slot = self.slots.get_mut(r.slot as usize)?;
+            if slot.gen != r.gen {
+                return None;
+            }
+            return slot.var.as_mut();
         }
-        let slot = self.slots.get_mut(r.slot as usize)?;
-        if slot.gen != r.gen {
-            return None;
+        if let TableId::Array(host) = &r.table {
+            let host = host.as_ref().clone();
+            if self.owns(&host) {
+                return self
+                    .get_ref_mut(&host)?
+                    .elements
+                    .as_deref_mut()
+                    .and_then(|t| t.get_ref_mut(r));
+            }
         }
-        slot.var.as_mut()
+        None
     }
 
     /// 句柄的键（守卫同上）。
@@ -984,21 +1148,45 @@ impl VarArena {
     }
 
     /// 句柄读（代数守卫在表内）。Frame 臂：帧表驻帧（见结构注），
-    /// 经帧侧 [`VarTable::get_ref`] 访问——此处恒 None；Array 臂步骤 3。
+    /// 经帧侧 [`VarTable::get_ref`] 访问——此处恒 None。Array 臂（步
+    /// 骤 3）：宿主为全局（命名空间）表条目时经宿主 Var 的元素子表
+    /// 访问（子表的归属/代数守卫照常）；帧宿主不可达（帧表驻帧——
+    /// 元素句柄经帧侧访问），恒 None。
     #[allow(dead_code)] // 句柄 API——步骤 3 接线
     pub(crate) fn get(&self, r: &VarRef) -> Option<&Var> {
         match &r.table {
             TableId::Global(i) => self.tables.get(*i as usize).and_then(|t| t.get_ref(r)),
+            TableId::Array(host) => match &host.table {
+                TableId::Global(i) => self
+                    .tables
+                    .get(*i as usize)
+                    .and_then(|t| t.get_ref(host))
+                    .and_then(|v| v.elements())
+                    .and_then(|t| t.get_ref(r)),
+                _ => None,
+            },
             _ => None,
         }
     }
 
-    /// 句柄写（代数守卫同上）。
+    /// 句柄写（代数守卫同上；Array 臂同 [`Self::get`] 的寻址形）。
     #[allow(dead_code)] // 句柄 API——步骤 3 接线
     pub(crate) fn get_mut(&mut self, r: &VarRef) -> Option<&mut Var> {
         match &r.table {
             TableId::Global(i) => {
                 self.tables.get_mut(*i as usize).and_then(|t| t.get_ref_mut(r))
+            }
+            TableId::Array(host) => {
+                let host = host.clone();
+                match host.table {
+                    TableId::Global(i) => self
+                        .tables
+                        .get_mut(i as usize)
+                        .and_then(|t| t.get_ref_mut(&host))
+                        .and_then(|v| v.elements.as_deref_mut())
+                        .and_then(|t| t.get_ref_mut(r)),
+                    _ => None,
+                }
             }
             _ => None,
         }
@@ -1226,7 +1414,123 @@ mod tests {
             assert!(t.get(&format!("k{i}")).is_some(), "k{i}");
         }
         let keys: Vec<&str> = t.order_entries().map(|(k, _)| k.as_ref()).collect();
-        let want: Vec<String> = (0..n).map(|i| format!("k{i}")).collect();
+        let want: Vec<String> = (0..n).map(|i| format!("k{i}")).collect::<Vec<_>>();
         assert_eq!(keys, want.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    }
+
+    // -- D1 步骤 3：数组元素子表 ------------------------------------------
+
+    /// mark_array 建子表（Array(宿主句柄) 身份）；元素读写经子表；宿
+    /// 主摘除 → 子表随之回收（句柄全灭）；再建 → 新宿主句柄、新子表。
+    #[test]
+    fn array_subtable_lifecycle() {
+        let mut t = VarTable::new();
+        t.mark_array("a", Some(0));
+        let host = t.resolve("a").expect("marked");
+        assert!(matches!(host.table, TableId::Global(0)));
+        let sub = t.get("a").unwrap().elements().expect("subtable");
+        // 子表身份 = Array(宿主句柄)（同形同值——Eq 含 slot/gen）。
+        assert_eq!(sub.owner, TableId::Array(Box::new(host.clone())));
+        // 元素插入走子表自身形状（键 = 下标、插入序向量）。
+        {
+            let sub = t.get_mut("a").unwrap().elements_mut().unwrap();
+            let e1 = sub.insert(Rc::from("k1"), v("1"));
+            let e2 = sub.insert(Rc::from("k2"), v("2"));
+            assert_eq!(
+                sub.order_entries().map(|(k, _)| k.as_ref()).collect::<Vec<_>>(),
+                vec!["k1", "k2"]
+            );
+            // 删除重建取新位（tclsh 表序语义，与宿主表同机制）。
+            assert!(sub.remove("k1").is_some());
+            sub.insert(Rc::from("k1"), v("1b"));
+            assert_eq!(
+                sub.order_entries().map(|(k, _)| k.as_ref()).collect::<Vec<_>>(),
+                vec!["k2", "k1"]
+            );
+            assert!(t.get_ref(&e1).is_none());
+            assert_eq!(t.get_ref(&e2).map(|x| x.value.as_str()), Some("2"));
+        }
+        // 宿主摘除：子表回收，元素句柄全灭。
+        assert!(t.remove("a").is_some());
+        // 再建：新代数句柄、空子表。
+        t.mark_array("a", Some(0));
+        let host2 = t.resolve("a").unwrap();
+        assert_ne!(host.gen, host2.gen);
+        assert_eq!(t.get("a").unwrap().elements().unwrap().len(), 0);
+    }
+
+    /// land_value（值落地）不得清掉子表与元素计数；unmark 撤位回收子
+    /// 表。arena Array 臂的句柄读（宿主全局表 → 子表 → 元素）。
+    #[test]
+    fn land_value_preserves_subtable_and_arena_array_arm() {
+        let mut a = VarArena::new();
+        a.root_mut().mark_array("a", Some(0));
+        let host = a.root().resolve("a").unwrap();
+        {
+            let sub = a.root_mut().get_mut("a").unwrap().elements_mut().unwrap();
+            let er = sub.insert(Rc::from("k"), v("9"));
+            // arena Array 臂：元素句柄读经宿主。
+            assert_eq!(a.get(&er).map(|x| x.value.as_str()), Some("9"));
+            let mut er2 = er.clone();
+            er2.gen += 1;
+            assert!(a.get(&er2).is_none()); // 代数守卫
+            let mut fr = er;
+            fr.table = TableId::Frame(0);
+            assert!(a.get(&fr).is_none()); // 身份守卫
+        }
+        // 值落地（基键空值 → 有值）：子表 + 计数保持。
+        let (r, is_new) = a.root_mut().land_value("a".to_string(), Value::empty());
+        assert_eq!(r.slot, host.slot);
+        assert!(is_new); // 无值占位上值 = 新建序位
+        let var = a.root().get("a").unwrap();
+        assert_eq!(var.elem_count, 0);
+        assert_eq!(var.elements().unwrap().get("k").unwrap().value.as_str(), "9");
+        // 撤位：子表回收、计数清零。
+        a.root_mut().unmark_array("a");
+        let var = a.root().get("a").unwrap();
+        assert!(!var.is_array());
+        assert!(var.elements.is_none());
+        assert_eq!(var.elem_count, 0);
+    }
+
+    /// 历史入档/压缩：曾插入键各一次（末次出现位）；删除键落档后桶
+    /// 轨迹回落（与共享日志压缩同形）；reset 全清。
+    #[test]
+    fn subtable_history_and_reset() {
+        let mut t = VarTable::new();
+        t.mark_array("a", Some(0));
+        for i in 0..100u32 {
+            let k = format!("k{i}");
+            let sub = t.get_mut("a").unwrap().elements_mut().unwrap();
+            sub.insert(Rc::from(k.as_str()), v("x"));
+            sub.history_push(&k);
+        }
+        for i in 0..100u32 {
+            let k = format!("k{i}");
+            let sub = t.get_mut("a").unwrap().elements_mut().unwrap();
+            sub.remove(&k);
+        }
+        {
+            let sub = t.get_mut("a").unwrap().elements_mut().unwrap();
+            sub.insert(Rc::from("live"), v("L"));
+            sub.history_push("live");
+            // 压缩触发后：删除键落档，只余活键。
+            assert_eq!(sub.history_keys().collect::<Vec<_>>(), vec!["live"]);
+            let seq: Vec<&str> = sub.order_entries().map(|(k, _)| k.as_ref()).collect();
+            assert_eq!(seq, vec!["live"]);
+        }
+        // reset：子表清空（帧池重置语义——元素句柄全灭）。
+        let mut f = VarTable::new_frame(0);
+        f.mark_array("a", Some(0));
+        let h = f.resolve("a").unwrap();
+        let er = {
+            let sub = f.get_mut("a").unwrap().elements_mut().unwrap();
+            sub.insert(Rc::from("k"), v("1"))
+        };
+        assert!(f.get_ref(&er).is_some());
+        f.reset();
+        assert!(f.get_ref(&er).is_none());
+        assert!(f.get_ref(&h).is_none());
+        assert!(f.get("a").is_none());
     }
 }

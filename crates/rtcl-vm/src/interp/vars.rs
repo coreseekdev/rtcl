@@ -401,9 +401,10 @@ impl Interp {
 // 仍读；日志与 vt 插入序的对拍在 debug 下并跑，顺序语义红线）。
 // upvar/链接面不动：链接键只在日志（frame_log_link），不入 vt。
 
-/// 单键两位对拍（debug）：vt 与平表镜像的 value 在席/数组基位。（帧
-/// 元素计数不在对拍域——elem_counts 保持既有权威，步骤 3 随元素表
-/// 并入 vt 才有对拍位。）release 零成本（cfg! 常量折叠掉镜像读）。
+/// 单键两位对拍（debug）：vt 与平表镜像的 value 在席/数组基位。帧
+/// 元素计数（步骤 3 并入 vt 的 Var.elem_count——镜像 f.elem_counts 对
+/// 拍：ARRAY 位在席时计数逐字同）release 零成本（cfg! 常量折叠掉镜
+/// 像读）。
 #[inline]
 fn dcheck_frame_mirror(f: &CallFrame, key: &str) {
     if !cfg!(debug_assertions) {
@@ -419,6 +420,12 @@ fn dcheck_frame_mirror(f: &CallFrame, key: &str) {
         m.is_some_and(|v| v.is_array()),
         f.array_locals.contains(key),
         "D1 对拍: frame array flag {key:?}"
+    );
+    debug_assert_eq!(
+        m.map(|v| if v.is_array() { v.elem_count as usize } else { 0 })
+            .unwrap_or(0),
+        f.elem_counts.get(key).copied().unwrap_or(0),
+        "D1 对拍: frame elem count {key:?}"
     );
 }
 
@@ -604,25 +611,27 @@ pub(crate) fn frame_log_link(f: &mut CallFrame, key: &str) {
     }
 }
 
-/// 数组基标记（帧域）：vt 位 + 快索引（权威）+ 镜像位（debug）；帧
-/// 元素计数不在此落（保持 elem_counts 既有权威——步骤 3 随元素表并
-/// 入）。无条目时 vt 建无值占位 Var（ARRAY 位先行——基键随后由
+/// 数组基标记（帧域）：vt 位 + 快索引 + 元素计数（步骤 3 全并入
+/// Var——计数 Some(0) 落宿主 Var.elem_count）+ 镜像位/计数（debug）。
+/// 无条目时 vt 建无值占位 Var（ARRAY 位先行——基键随后由
 /// loc_insert 落表，vt 的移位插入语义与日志 map-insert-new 逐字同）。
 pub(crate) fn frame_local_mark_array(f: &mut CallFrame, key: &str) {
-    f.vt.mark_array(key, None);
+    f.vt.mark_array(key, Some(0));
     #[cfg(debug_assertions)]
     {
         f.array_locals.insert(key.to_string());
+        f.elem_counts.insert(key.to_string(), 0);
     }
     dcheck_frame_mirror(f, key);
 }
 
-/// 数组基摘标（位随标清——快索引/计数对账在 vt 内）。
+/// 数组基摘标（位随标清——快索引/计数/子表对账在 vt 内）。
 pub(crate) fn frame_local_unmark_array(f: &mut CallFrame, key: &str) {
     f.vt.unmark_array(key);
     #[cfg(debug_assertions)]
     {
         f.array_locals.remove(key);
+        f.elem_counts.remove(key);
     }
     dcheck_frame_mirror(f, key);
 }
@@ -1580,11 +1589,9 @@ impl Interp {
             }
             VarLoc::Frame(i, n) => {
                 if let Some(f) = self.frames.get_mut(*i) {
-                    // D1 步骤 2：数组基位走 vt（frame_local_mark_array
-                    // ——权威位 + debug 镜像）；元素计数保持 elem_counts
-                    // 既有权威（步骤 3 随元素表并入）。
+                    // D1 步骤 2/3：数组基位走 vt（frame_local_mark_array
+                    // ——权威位 + 计数 + 子表 + debug 镜像）。
                     frame_local_mark_array(f, n);
-                    f.elem_counts.insert(n.clone(), 0);
                 }
             }
         }
@@ -1595,6 +1602,8 @@ impl Interp {
     /// the scope's whole table).  A no-op when no count is tracked —
     /// the query then falls back to the scan, so an unmaintained entry
     /// degrades performance, never correctness.
+    /// D1 步骤 3：两域计数都挂宿主 Var.elem_count（镜像 elem_counts
+    /// 对拍域）。
     fn loc_elem_count_bump(&mut self, loc: &VarLoc, delta: i64) {
         match loc {
             VarLoc::Global(n) => {
@@ -1602,6 +1611,13 @@ impl Interp {
             }
             VarLoc::Frame(i, n) => {
                 if let Some(f) = self.frames.get_mut(*i) {
+                    if let Some(var) = f.vt.get_mut(n) {
+                        if var.is_array() {
+                            var.elem_count =
+                                ((var.elem_count as i64) + delta).max(0) as u32;
+                        }
+                    }
+                    #[cfg(debug_assertions)]
                     if let Some(c) = f.elem_counts.get_mut(n) {
                         *c = ((*c as i64) + delta).max(0) as usize;
                     }
@@ -1679,7 +1695,10 @@ impl Interp {
                     }
                     let base = loc.base_name().to_string();
                     frame_local_unmark_array(f, &base);
-                    f.elem_counts.remove(&base);
+                    #[cfg(debug_assertions)]
+                    {
+                        f.elem_counts.remove(&base);
+                    }
                     frame_local_remove(f, &base);
                 }
                 if !self.array_defaults.is_empty() {
@@ -4189,18 +4208,17 @@ impl Interp {
     /// an element key slipped in without the marker machinery): callers
     /// fall back to the table scan, so a hole degrades speed, not
     /// correctness.
+    /// D1 步骤 3：两域计数统一挂宿主 Var.elem_count（T7 语义保持——
+    /// None 形与旧「计数未跟踪」同观）。
     pub(crate) fn array_element_count(&self, name: &str) -> Option<usize> {
         let (owner_fi, base) = self.array_owner(name);
         match owner_fi {
-            // 帧域计数保持 elem_counts 既有权威（步骤 3 随元素表并入
-            // vt 的 elem_count 字段）。
             Some(i) => self
                 .frames
                 .get(i)
-                .and_then(|f| f.elem_counts.get(&base))
-                .copied(),
-            // D1 步骤 1：全局域计数 = 数组 Var 的 elem_count 字段
-            // （T7 语义保持——None 形与旧「计数未跟踪」同观）。
+                .and_then(|f| f.vt.get(&base))
+                .filter(|v| v.is_array())
+                .map(|v| v.elem_count as usize),
             None => self.global_elem_count(&base),
         }
     }

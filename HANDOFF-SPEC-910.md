@@ -305,6 +305,14 @@ doc/*.n 章节）。
     （debug=0/threaded=1/64bit=0）；`unicode` 仅归一化四子命令；
     `zipfs root` = `//zipfs:/`；`timerate` 只宜钉形状。`exec -encoding`
     可用。
+19. regexp 规格错误（8.6 也错）：`\uXXXX` 是**合法** ARE 转义
+    （`regexp {\u0041} A` = 1），不合法的是 `\x{...}`。原
+    `matching.allium:RegexpRejectsUnicodeEscapes` 已改为
+    `RegexpUnicodeEscapeIsAccepted`（1 + catch 1）。
+20. `regex-spencer.allium:WordAndWordStartAssertions` 原用 " baa" 却
+    期望 `\ya+/\ma+` = 1；实测（8.6/9.1 同）是 0（'a' 不在词首）。
+    已改为 " aa" + `a\M`，得 1 1 1。`LookbehindRejectedIn86` 改名
+    `LookbehindRejected`（9.1 仍无 lookbehind）。
 
 ## 8. 交接记录
 
@@ -337,7 +345,13 @@ doc/*.n 章节）。
 - 换锚：expr / variables / trace / error-deep / io 五份头部改
   `Oracle: tclsh 9.1.0 (core-9-1-0)`，并注明 C 类未覆盖范围；其余 9 份
   仍为 8.6.17，待各自 C 类完成后再换。
-- C 类：T1/T5/T3/T4/T2 已完成。
+- C 类：T1/T2/T3/T4/T5/T6/T7 均已完成（T4 尾巴见下）。
+  - regex-spencer：23 条规则 2026-11-27 全量复跑并换锚 9.1.0；
+    修正 `WordAndWordStartAssertions` 的错误期望与
+    `LookbehindRejectedIn86` 命名。至此 14 份规格中 12 份有 Oracle
+    行的全部为 `tclsh 9.1.0`（memory-lifecycle 无 Oracle 行，属资源
+    契约）。
+
   - T1：expr/string/matching 补 29 条（数字字面量、任意精度、
     lt/le/gt/ge、expr 注释、C99 mathfunc、新数值命令、string is 字面量、
     format/scan 32 位与 size 修饰符、format 语法错误、%c Unicode 标量）。

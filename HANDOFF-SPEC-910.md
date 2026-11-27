@@ -276,6 +276,23 @@ doc/*.n 章节）。
     分歧；规格已钉 oracle（`pbr6_float_bits.tcl`），代码待修。
 14. `oo::class new` 在 9.1.0 是 invalid method（类对象用
     `oo::class create`）；`oo::object new` 才是匿名对象入口。
+15. rtcl OO bootstrap 比 9.1.0 少 9 个内部对象（根因）：
+    - rtcl `crates/rtcl-vm/src/interp/commands/oo.rs::init` 只建
+      Obj1-3（oo::object/oo::class/oo::Slot）+ 7 个 definition slot
+      （Obj4-10），并设 `next_obj_id = 10`（注释明确写“实测 tclsh
+      8.6.17”），所以首个用户对象是 Obj11。
+    - tclsh 9.1.0 的 `generic/tclOO.c` 在同样 10 个之外，由
+      `TclOODefineSlots` 多建 4 个 property slot（Obj11-14：
+      readableproperties/writableproperties/objreadableproperties/
+      objwritableproperties），再由 `MakeAdditionalClasses` 多建 5 个
+      类对象（Obj15-19：oo::singleton、oo::SingletonInstance、
+      oo::abstract、::oo::configuresupport::configurable、
+      oo::configurable），首个用户对象才是 Obj20。
+    - rtcl 目前也没有 abstract/singleton/configurable/property 这套
+      bootstrap。规格已按用户裁定钉 Obj20；代码面要么补齐这 9 个
+      可观察对象（推荐，因为 `info class instances oo::Slot`、
+      `oo::singleton` 等都可观察），要么至少把计数器推到 19。本任务
+      不改码，登记为 T6 实现缺口。
 
 ## 8. 交接记录
 

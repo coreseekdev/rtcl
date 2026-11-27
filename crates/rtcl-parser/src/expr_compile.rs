@@ -948,13 +948,12 @@ mod tests {
         // C16：负移位窗口由折叠错误 op 承载（错误原样延迟到运行期，
         // invoked-from-within 帧），不产生值折叠。
         let ops = compile_expr_with_peephole("1 << -1").unwrap();
-        assert!(ops
-            .iter()
-            .any(|o| matches!(o, OpCode::ExprFoldError(b'<', _, _))));
+        // D2 宽操作数后首字段是 u16（opcode.rs ExprFoldError(u16,…)）。
+        assert!(ops.iter().any(|o| matches!(o,
+            OpCode::ExprFoldError(c, _, _) if *c == u16::from(b'<'))));
         let ops = compile_expr_with_peephole("1 >> -1").unwrap();
-        assert!(ops
-            .iter()
-            .any(|o| matches!(o, OpCode::ExprFoldError(b'>', _, _))));
+        assert!(ops.iter().any(|o| matches!(o,
+            OpCode::ExprFoldError(c, _, _) if *c == u16::from(b'>'))));
     }
 
     #[test]

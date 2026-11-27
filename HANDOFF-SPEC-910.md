@@ -241,6 +241,10 @@ doc/*.n 章节）。
    `FormatCRendersUnicodeScalar`（T1 批）。
 7. `expr` 的 `017` 是十进制 17，而 `scan %i`/`%o` 的 `017` 仍是八进制
    15（C 语义）。两处都已按 oracle 分别钉死，勿当同一套字面量语法。
+8. 规则数口径：§2 写的「447 条规则」与实测不符——交接基线 `442f4ff`
+   上 `grep '^rule ' specs/*.allium` 为 242 条；本轮结束为 329 条
+   （新增 87 条）。§2 的 447 可能是含 probe/其他分支的旧数，后续以
+   grep 计数为准。
 
 ## 8. 交接记录
 
@@ -273,14 +277,34 @@ doc/*.n 章节）。
 - 换锚：expr / variables / trace / error-deep / io 五份头部改
   `Oracle: tclsh 9.1.0 (core-9-1-0)`，并注明 C 类未覆盖范围；其余 9 份
   仍为 8.6.17，待各自 C 类完成后再换。
-- C 类：T1 已完成（expr/string/matching 三份补 29 条规则，含数字
-  字面量、任意精度、lt/le/gt/ge、expr 注释、C99 mathfunc、新数值命令、
-  string is 字面量、format/scan 32 位与 size 修饰符、format 语法错误、
-  %c Unicode 标量上限）。T5/T3/T4/T6/T2/T7 未开始；下一期顺序
-  T5 → T3 → T4 新命令面 → T6 → T2/T7。
+- C 类：T1/T5/T3/T4/T2 已完成。
+  - T1：expr/string/matching 补 29 条（数字字面量、任意精度、
+    lt/le/gt/ge、expr 注释、C99 mathfunc、新数值命令、string is 字面量、
+    format/scan 32 位与 size 修饰符、format 语法错误、%c Unicode 标量）。
+  - T5：variables 补 10 条（info vars 可见性、ns eval uplevel 帧、
+    variable 无值/重建、errorCode 不预置、upvar 各级错误、incr 失败、
+    父 ns 缺失、expr 数组下标解析）。
+  - T3：io/string 补 13 条（binary 编码移除、-profile/-stat、输出
+    -eofchar 移除、chan isbinary/names、TCL VALUE NUMBER、strict UTF-8、
+    source、string is dict、Unicode 18 数字类、ambiguous class）。
+  - T4：list/dict/variables/control-flow/matching/io 补 21 条
+    （lpop/lremove/ledit/lseq/lfilter、lsearch -stride、dict getdef/
+    getwithdefault、array default/for、const/info consts、switch -integer、
+    case 移除、subst 9.1 选项、regsub -command、file home/tildeexpand/
+    tempdir）。
+  - T2：string/list 补 4 条（索引表达式 1±n、end±n、进制字面量、
+    64 位不截断、bad index 文案）。
+  - T7：matching 补 regexp 编译错误文案（couldn't -> cannot；
+    quantifier operand invalid -> invalid quantifier operand），并更新
+    三条既有规则的注释。assemble TIP 720 指令面与 binary Inf/NaN 位
+    保真未做：前者需逐指令矩阵，后者仍挂 §6 裁定项。
+  - T4 余项未做：timer/timerate、tcl::process、unicode、zipfs、socket
+    新选项、info loaded、package files、::tcl 命令集 27 vs 23、
+    pkgconfig 键集。T6 未做：judge/probes 里没有 properties/abstract/
+    private 的探针，且对象计数是 §6 裁定项；待补探针后再 distill。
 - 门禁终态：`allium check specs/` 0 error（4 warning 为 memory-lifecycle
   既有 unused entity/binding；5 info 为既有 unused field）；
   `allium analyse specs/` 0 finding。未改 crates/judge，未跑 judge
   （规格-only 改动不触发代码门禁）。
-- git diff --stat 范围：`specs/{expr,string,matching,variables,trace,
-  error-deep,io}.allium` + 本文件，符合 §4 边界。
+- git diff --stat 范围：`specs/*.allium`（已换锚的 11 份）+ 本文件，
+  符合 §4 边界。

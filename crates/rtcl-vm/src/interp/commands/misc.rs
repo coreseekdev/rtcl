@@ -2249,7 +2249,7 @@ pub fn cmd_append(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // errors, same trace firing (none when no traces are registered).
     if let Some((array_name, elem_index)) = crate::interp::util::split_array_ref(var_name) {
         if !crate::interp::util::has_ns_sep(var_name)
-            && interp.var_traces.is_empty()
+            && interp.n_trace_hosts == 0
             && interp.dead_flat.iter().all(|k| k != array_name)
             && interp.flat_aliases.iter().all(|(k, _)| k != array_name)
             && interp.ns_transient.iter().all(|(k, _)| k != array_name)

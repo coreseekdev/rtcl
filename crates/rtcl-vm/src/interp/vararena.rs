@@ -136,11 +136,152 @@ impl VarFlags {
     }
 }
 
-/// trace 集占位（步骤 4：`var_traces`/`elem_traces`/`trace_phantoms`
-/// 三表收进 `Var.traces`；本批恒 `None`——不可构造类型使占位零成本）。
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub(crate) enum TraceSet {}
+/// 变量 trace 集（D1 步骤 4，specs/ARCH-DESIGN-20261126.md D1）：
+/// `trace add variable` 的挂靠点 = Var 上的直接字段（[`Var::traces`]，
+/// `Option<Box<TraceSet>>`——只有被追踪的 Var 付堆侧成本）。两个族：
+///
+/// - **整变量族**（`var`）：`trace add variable <name>`（标量/数组基
+///   同域）——注册序存放，触发时组内 latest-first。
+/// - **元素族**（`elem`）：`trace add variable <base>(<idx>)`——挂
+///   **宿主（数组基）Var**，元素名 → 该元素名下的 trace（注册序）。
+///   挂宿主而非元素 Var 是生命周期语义：元素摘除（unset/整数组扫除）
+///   后 trace 仍在（再 set 仍触发——基线钉形）、phantom 元素（trace
+///   注册在从未落值的元素上，子表无条目）同域存放——与旧
+///   `elem_traces`（stamp 键 → 元素名 → traces）的触发生命周期逐字
+///   同，键字符串退役。
+///
+/// 本结构只承载数据；收集/触发的语义层在 `vars.rs`（fire 核心）。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TraceSet {
+    /// 整变量族（注册序）。
+    pub var: Vec<super::VarTrace>,
+    /// 整变量族「键在册」位：首次整变量注册置位，此后**不随记录摘除
+    /// 复位**（旧 var_traces 字符串键的 lingering 语义——摘净后
+    /// upvar-8.7 的 contains_key 判定仍拦，基线钉形 probe8c）；宿主
+    /// 整体消亡（快照 take）随之消失。元素族注册不置位（upvar-8.7
+    /// 只看整变量族——元素 trace 走 exists 检查，oracle upvar_levels
+    /// u24 钉形）。
+    pub var_linger: bool,
+    /// 元素族：元素名 → 该元素名下的 trace（注册序）。小集合线性扫
+    /// （被追踪的元素数以个位数计；顺序确定、无哈希器依赖——嵌入
+    /// 构建同形）。
+    pub elem: Vec<(Rc<str>, Vec<super::VarTrace>)>,
+}
+
+impl TraceSet {
+    /// 无任何注册记录。
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.var.is_empty() && self.elem.is_empty()
+    }
+
+    /// 注册记录总数（整变量 + 全部元素族）——快照火的调用侧对账用
+    /// （快径守卫真源是 `Interp::n_trace_hosts` 的宿主在席计数）。
+    #[inline]
+    pub(crate) fn record_count(&self) -> usize {
+        self.var.len() + self.elem.iter().map(|(_, v)| v.len()).sum::<usize>()
+    }
+
+    /// 整变量族追加（注册；键在册位随之置位——lingering）。
+    pub(crate) fn push_var(&mut self, t: super::VarTrace) {
+        self.var.push(t);
+        self.var_linger = true;
+    }
+
+    /// 元素族追加（注册）。返回该元素的 vec（无则新建尾条目）。
+    pub(crate) fn elem_entry_mut(&mut self, elem: &str) -> &mut Vec<super::VarTrace> {
+        if let Some(pos) = self.elem.iter().position(|(k, _)| k.as_ref() == elem) {
+            let last = &mut self.elem[pos];
+            return &mut last.1;
+        }
+        self.elem.push((Rc::from(elem), Vec::new()));
+        let pos = self.elem.len() - 1;
+        let last = &mut self.elem[pos];
+        &mut last.1
+    }
+
+    /// 整变量族摘除第一条精确匹配（ops+script——remove 逐条删语义）。
+    /// 返回是否摘到。
+    pub(crate) fn remove_first_var(&mut self, ops: &[String], script: &str) -> bool {
+        if let Some(i) = self.var.iter().position(|t| t.ops == ops && t.script == script) {
+            self.var.remove(i);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 元素族摘除指定元素的第一条精确匹配；vec 摘空后条目一并退场。
+    /// 返回是否摘到。
+    pub(crate) fn remove_first_elem(
+        &mut self,
+        elem: &str,
+        ops: &[String],
+        script: &str,
+    ) -> bool {
+        let Some(pos) = self.elem.iter().position(|(k, _)| k.as_ref() == elem) else {
+            return false;
+        };
+        let v = &mut self.elem[pos].1;
+        let Some(i) = v.iter().position(|t| t.ops == ops && t.script == script) else {
+            return false;
+        };
+        v.remove(i);
+        if v.is_empty() {
+            self.elem.remove(pos);
+        }
+        true
+    }
+
+    /// 元素族的整条摘除（缺失元素 unset 抹记录——trace-14.17 族）。
+    /// 返回摘掉的记录数。
+    pub(crate) fn remove_elem_entry(&mut self, elem: &str) -> usize {
+        let Some(pos) = self.elem.iter().position(|(k, _)| k.as_ref() == elem) else {
+            return 0;
+        };
+        let n = self.elem[pos].1.len();
+        self.elem.remove(pos);
+        n
+    }
+
+    /// 元素族条目读（触发收集面）。
+    #[inline]
+    pub(crate) fn elem_vec(&self, elem: &str) -> Option<&[super::VarTrace]> {
+        self.elem
+            .iter()
+            .find(|(k, _)| k.as_ref() == elem)
+            .map(|(_, v)| v.as_slice())
+    }
+
+    /// 触发收集（`op` 下的脚本快照）：（整变量组, 元素组）——各按注册
+    /// （最旧在前）序产出；触发序（latest-first、整组先于元素组 A1E1）
+    /// 由 vars.rs 的火循环统一施加。
+    pub(crate) fn firing_scripts(
+        &self,
+        elem: Option<&str>,
+        op: &str,
+    ) -> (Vec<String>, Vec<String>) {
+        let whole: Vec<String> = self
+            .var
+            .iter()
+            .filter(|t| t.ops.iter().any(|o| o == op))
+            .map(|t| t.script.clone())
+            .collect();
+        let elems: Vec<String> = match elem {
+            Some(e) => self
+                .elem_vec(e)
+                .map(|trs| {
+                    trs.iter()
+                        .filter(|t| t.ops.iter().any(|o| o == op))
+                        .map(|t| t.script.clone())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        (whole, elems)
+    }
+}
 
 /// 链接目标占位（步骤 3/4：链接/死链面迁入；本批恒 `None`）。
 #[allow(dead_code)]
@@ -167,12 +308,32 @@ pub(crate) struct Var {
     /// 整表回收）。不变式：`is_array() ⟺ elements.is_some()`——
     /// [`VarTable`] 的写槽路径统一维护（见 `sync_elements`）。
     pub elements: Option<Box<VarTable>>,
-    /// 变量/元素 trace 集（步骤 4 挂载；本批恒 `None`）。
-    #[allow(dead_code)]
-    pub traces: Option<TraceSet>,
-    /// 链接目标（步骤 3/4 迁入；本批恒 `None`）。
+    /// 变量/元素 trace 集（D1 步骤 4 挂载——`Box` 嵌套保持 `Var` 的
+    /// 尺寸增量为一个指针宽：只有被追踪的 Var 付堆侧 TraceSet 成本）。
+    pub traces: Option<Box<TraceSet>>,
+    /// 链接目标（步骤 5 链接面迁入；本批恒 `None`）。
     #[allow(dead_code)]
     pub link: Option<LinkTarget>,
+}
+
+impl Var {
+    /// 本 Var 的 trace 集（无则 `None`）。
+    #[inline]
+    pub(crate) fn trace_set(&self) -> Option<&TraceSet> {
+        self.traces.as_deref()
+    }
+
+    /// trace 集就地确保存在（注册位点）。返回是否**新建**了集合——
+    /// `Interp` 层据此刻 n_trace_hosts 计数（宿主在席 = Box 在席，与旧
+    /// 字符串表「键一旦建立即 linger」的守卫语义逐字同）。
+    pub(crate) fn traces_ensure(&mut self) -> (bool, &mut TraceSet) {
+        if self.traces.is_none() {
+            self.traces = Some(Box::new(TraceSet::default()));
+            (true, self.traces.as_mut().unwrap())
+        } else {
+            (false, self.traces.as_mut().unwrap())
+        }
+    }
 }
 
 impl Var {
@@ -657,11 +818,17 @@ impl VarTable {
                         // 步骤 3：接管旧 Var 的子表（纯覆盖不丢元素——
                         // 元素读写已迁子表，宿主覆盖只发生在基键空值
                         // 落地等少数路径；换入 Var 自带子表时以换入为
-                        // 准）。
+                        // 准）。步骤 4：trace 集同法接管（值落地不得
+                        // 断 trace——phantom/占位宿主上值的主径）。
                         let mut var = var;
                         if var.elements.is_none() {
                             if let Some(old) = slot.var.as_mut() {
                                 var.elements = old.elements.take();
+                            }
+                        }
+                        if var.traces.is_none() {
+                            if let Some(old) = slot.var.as_mut() {
+                                var.traces = old.traces.take();
                             }
                         }
                         slot.var = Some(var);
@@ -707,6 +874,11 @@ impl VarTable {
                         if var.elements.is_none() {
                             if let Some(old) = slot.var.as_mut() {
                                 var.elements = old.elements.take();
+                            }
+                        }
+                        if var.traces.is_none() {
+                            if let Some(old) = slot.var.as_mut() {
+                                var.traces = old.traces.take();
                             }
                         }
                         slot.var = Some(var);
@@ -763,6 +935,11 @@ impl VarTable {
                         var.elements = old.elements.take();
                     }
                 }
+                if var.traces.is_none() {
+                    if let Some(old) = slot.var.as_mut() {
+                        var.traces = old.traces.take();
+                    }
+                }
                 slot.var = Some(var);
             }
             self.reconcile_arr_index(&key, sidx, was_array);
@@ -812,7 +989,8 @@ impl VarTable {
                     let mut var = Var::with_value(v);
                     var.flags = flags;
                     // 步骤 3：元素计数与子表随条目接管（ARRAY 基键的
-                    // 值落地不得清账——计数/子表挂宿主 Var）。
+                    // 值落地不得清账——计数/子表挂宿主 Var）。步骤 4：
+                    // trace 集同法接管（值落地不得断 trace）。
                     var.elem_count = elem_count;
                     let old_elements = self.slots[sidx as usize]
                         .var
@@ -823,6 +1001,12 @@ impl VarTable {
                     if var.elements.is_none() {
                         var.elements = old_elements;
                     }
+                    var.traces = self.slots[sidx as usize]
+                        .var
+                        .as_mut()
+                        .expect("live slot")
+                        .traces
+                        .take();
                     if was_valued {
                         self.slots[sidx as usize].var = Some(var);
                         self.sync_elements(sidx);
@@ -895,6 +1079,12 @@ impl VarTable {
                     if var.elements.is_none() {
                         var.elements = old_elements;
                     }
+                    var.traces = self.slots[sidx as usize]
+                        .var
+                        .as_mut()
+                        .expect("live slot")
+                        .traces
+                        .take();
                     if was_valued {
                         self.slots[sidx as usize].var = Some(var);
                         self.sync_elements(sidx);
@@ -1016,6 +1206,17 @@ impl VarTable {
     #[allow(dead_code)] // 句柄 API——步骤 2/3 的「解析一次」消费面
     pub(crate) fn resolve(&self, key: &str) -> Option<VarRef> {
         self.slot_of(key).map(|i| self.ref_of(i))
+    }
+
+    /// 就地确保条目（无则建无值占位 Var）——D1 步骤 4 的 trace 注册宿
+    /// 主（帧域）。占位条目按无值域过滤（列举/在席探针不可见）；插入
+    /// 序向量的占位条目位置随建随定（上值走 insert_moving 移位——与
+    /// 日志 map-insert-new 语义逐字同）。
+    pub(crate) fn entry_ensure(&mut self, key: &str) -> &mut Var {
+        if self.slot_of(key).is_none() {
+            self.insert(Rc::from(key), Var::with_value(Value::unset()));
+        }
+        self.get_mut(key).expect("ensured entry")
     }
 
     /// 句柄读（表归属 + 代数守卫：不符/空洞 → None）。步骤 3：`Array`

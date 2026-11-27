@@ -962,8 +962,14 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // Whole-var traces only: an element trace (`trace add variable
         // a(1) ...`) marks `a` as an existing array instead, so the
         // exists check below reports it (probed on 8.6.17).
-        let trace_key = format!("F{}:{}", current_idx, local_var);
-        if interp.var_traces.contains_key(&trace_key) {
+        // D1 步骤 4：被追踪的帧局部 = 帧 vt 条目上的 TraceSet（注册面
+        // 建 host——含摘净后的 lingering 空集，键形 contains_key 逐字同
+        // ——「摘净后仍拦」是基线钉形）。
+        if interp.frames[current_idx]
+            .vt
+            .get(local_var.as_str())
+            .is_some_and(|v| v.trace_set().is_some_and(|s| s.var_linger))
+        {
             set_error_code(interp, "TCL UPVAR TRACED");
             return Err(Error::Msg(format!(
                 "variable \"{}\" has traces: can't use for upvar",

@@ -478,8 +478,9 @@ pub(crate) struct ArraySearchList {
 
 /// One registered `trace add variable` callback: canonical ops (sorted
 /// array/read/unset/write) plus the script invoked with `name1 name2 op`
-/// appended.
-#[derive(Clone)]
+/// appended.  D1 步骤 4 起数据本体驻 [`vararena::TraceSet`]（挂 Var），
+/// 本类型是记录形状。
+#[derive(Clone, Debug)]
 pub(crate) struct VarTrace {
     pub ops: Vec<String>,
     pub script: String,
@@ -855,12 +856,16 @@ pub struct Interp {
     /// grew with array-name churn and had no removal path): `array get`
     /// snapshots are conservatively invalidated by any array mutation.
     pub(crate) array_generation: u64,
-    /// Whole-variable traces keyed by the owning scope's stamp key.
-    pub(crate) var_traces: HashMap<String, Vec<VarTrace>>,
-    /// Element-specific traces: stamp key → element name → traces.
-    pub(crate) elem_traces: HashMap<String, HashMap<String, Vec<VarTrace>>>,
-    /// Elements that exist only to carry a trace (traced but never set).
-    pub(crate) trace_phantoms: HashMap<String, std::collections::HashSet<String>>,
+    /// 持有 trace 集（`Var.traces: Option<Box<TraceSet>>` 在席）的宿主
+    /// Var 数——「任意变量 trace 在册」的 O(1) 真源（D1 步骤 4）。快径
+    /// 守卫（ts 单元、scalar_top 读写、incr/lappend/append 元素快径、
+    /// read_var 免火臂、槽 fast path……）据此让路：>0 走全语义链。
+    /// 计数形与旧字符串表的「键 linger」守卫语义逐字同：注册建集 +1；
+    /// `trace remove` 只摘记录（空集**留存**——lingering 键形，基线钉
+    /// 形：摘净后 upvar-8.7 仍拦）；宿主整体消亡（快照 take/unset 摘
+    /// 除/帧清场/ns 清扫）时 −1。方向偏差只可能偏保守（守卫多让路 =
+    /// 走全链 = 语义等价，仅慢）。
+    pub(crate) n_trace_hosts: usize,
     /// Currently-firing trace targets (tclsh's VAR_TRACE_ACTIVE, D-36):
     /// `W\0{stamp}` for whole-variable fires, `E\0{stamp}\0{elem}` for
     /// element fires.  A fire on an active target is skipped, so a
@@ -1246,9 +1251,7 @@ impl Interp {
             array_searches: HashMap::new(),
             array_stamps: HashMap::new(),
             array_generation: 0,
-            var_traces: HashMap::new(),
-            elem_traces: HashMap::new(),
-            trace_phantoms: HashMap::new(),
+            n_trace_hosts: 0,
             trace_active: std::collections::HashSet::new(),
             cmd_traces: HashMap::new(),
             exec_traces: HashMap::new(),

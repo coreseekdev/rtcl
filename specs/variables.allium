@@ -1,7 +1,14 @@
 -- allium: 3
 -- variables.allium
 -- Behaviour spec: variable scoping in Tcl — proc frames, global, upvar,
--- namespaces, arrays. Oracle: tclsh 8.6.17.
+-- namespaces, arrays. Oracle: tclsh 9.1.0 (core-9-1-0).
+-- A/B rules re-anchored 2026-11-27; remaining C-class coverage tracked in
+-- HANDOFF-SPEC-910.md §8.
+--
+-- 9.1 namespace rule: an unqualified variable name inside a namespace eval
+-- body resolves only within the current namespace (plus variable links in
+-- the same body frame). The 8.6 fallback to a same-named global variable was
+-- removed; see the 2026-11-27 oracle probes on the NsBody* rules below.
 
 use "./interp.allium" as interp
 
@@ -210,11 +217,13 @@ rule UpvarToDeletedNsVariable {
 
 rule VariableLinkIsPerEvalBodyFrame {
     -- variable 声明是**体帧瞬态**：内层 ns eval 体无链接；其裸名 set
-    -- 走两级链 → 全局（父 ns 不在链上）。外层声明只影响本帧。
-    when: Evaluates("list $::o::s $s    -- after: set s 1; namespace eval o {variable s 9; namespace eval i {set s 2}}")
+    -- 落内层命名空间自身（::o::i::s），既不回退全局，也不写外层链接
+    -- （::o::s 保持 9，全局 s 保持 1）。
+    when: Evaluates("list $::o::s $s [set ::o::i::s]    -- after: set s 1; namespace eval o {variable s 9; namespace eval i {set s 2}}")
     ensures: completion.code = ok
-    ensures: completion.value = "9 2"
-    -- probe: set s 1; namespace eval o {variable s 9; namespace eval i {set s 2}}; puts [list $::o::s $s]
+    ensures: completion.value = "9 1 2"
+    -- probe 2026-11-27 tclsh9.1: ...; puts [list $::o::s $s [set ::o::i::s]] => 9 1 2
+    -- 8.6 spec pinned "9 2" (inner body set fell back to the global); removed in 9.x.
 }
 
 rule NsBodySetHitsDeclaredLink {
@@ -244,37 +253,52 @@ rule SelfDeleteBodyKeepsRunning {
     -- probe: namespace eval d {namespace delete [namespace current]; set y 3}; puts [info exists d::y]
 }
 
-rule WhichVariableFollowsChain {
-    -- namespace which -variable 沿同一两级链报告**找到的位置**。
+rule WhichVariableDoesNotFallBackToGlobal {
+    -- 9.1: namespace which -variable reports only a variable visible in the
+    -- current namespace (or a variable link in scope). A same-named global
+    -- is NOT visible from a namespace body, so the answer is empty.
     when: Evaluates("namespace eval d {namespace which -variable g}    -- after: set g 1")
     ensures: completion.code = ok
-    ensures: completion.value = "::g"
-    -- probe: set g 1; namespace eval d {puts [namespace which -variable g]}
+    ensures: completion.value = ""
+    -- probe 2026-11-27 tclsh9.1: set g 1; puts [namespace eval d {namespace which -variable g}]
+    --   => (empty); namespace eval d {set g} => can't read "g": no such variable
+    -- contrast: namespace eval d {variable w 5}; namespace which -variable w => ::d::w
+    -- 8.6 spec pinned "::g" (global fallback); removed in 9.x.
 }
 
-rule NsBodyChainIncrGlobalSlot {
-    -- C2' 桥：顶层槽变量经 ns 体 incr（链 → 全局）后，外层槽读见
-    -- 新值（悬挂 invalidate 生效）。
-    when: Evaluates("list $w $d2    -- after: set w 1; namespace eval d {set d2 [incr w]}")
+rule NsBodyIncrCreatesNamespaceVariable {
+    -- 9.1: an unqualified incr in a namespace eval body resolves in the
+    -- current namespace, creating ::d::w (0 -> 1); the global w is left
+    -- untouched. The preceding set d2 also lands in ::d::d2.
+    when: Evaluates("list $w $::d::w $::d::d2    -- after: set w 1; namespace eval d {set d2 [incr w]}")
     ensures: completion.code = ok
-    ensures: completion.value = "3 3"
-    -- probe: set w 1; namespace eval d {set d2 [incr w]}; puts [list $w $d2]
+    ensures: completion.value = "1 1 1"
+    -- probe 2026-11-27 tclsh9.1: set w 1; namespace eval d {set d2 [incr w]}; puts [list $w $::d::w $::d::d2]
+    -- reading bare $d2 afterwards errors: can't read "d2": no such variable
+    -- 8.6 spec pinned "3 3" (ns body incr saw the global slot); removed in 9.x.
 }
 
-rule ProcGlobalWriteThenNsBodyIncr {
-    -- global 写 + ns 体链 incr 叠加于同一全局。
-    when: Evaluates("set k    -- after: set k 1; proc bump {} {global k; incr k}; bump; namespace eval d {incr k}")
+rule NsBodyIncrDoesNotTouchGlobal {
+    -- A global linked write (proc global) and a later namespace-body incr
+    -- are separate variables: the body incr creates ::d::k while the global
+    -- keeps the value written through the link.
+    when: Evaluates("list $k $::d::k    -- after: set k 1; proc bump {} {global k; incr k}; bump; namespace eval d {incr k}")
     ensures: completion.code = ok
-    ensures: completion.value = "3"
-    -- probe: set k 1; proc bump {} {global k; incr k}; bump; namespace eval d {incr k}; puts $k
+    ensures: completion.value = "2 1"
+    -- probe 2026-11-27 tclsh9.1: ...; puts [list $k $::d::k] => 2 1
+    -- 8.6 spec pinned "3" (body incr added to the global); removed in 9.x.
 }
 
-rule NsBodyArrayElementChain {
-    -- 数组元素链（L 形状）：ns 体元素写落**全局基**；顶层槽/名读双见。
-    when: Evaluates("list $a(x) $a(y)    -- after: set a(x) 1; namespace eval d {set a(y) 2}")
+rule NsBodyArrayElementStaysInNamespace {
+    -- An element write in a namespace eval body creates the element in the
+    -- namespace's own array (::d::a(y)); it does not create the element in a
+    -- same-named global array.
+    when: Evaluates("list [array names ::a] [array names ::d::a]    -- after: set a(x) 1; namespace eval d {set a(y) 2}")
     ensures: completion.code = ok
-    ensures: completion.value = "1 2"
-    -- probe: set a(x) 1; namespace eval d {set a(y) 2}; puts [list $a(x) $a(y)]
+    ensures: completion.value = "x y"
+    -- probe 2026-11-27 tclsh9.1: ...; puts [list [array names a] [array names ::d::a]]
+    -- reading $a(y) afterwards errors: no such element in array
+    -- 8.6 spec pinned "1 2" (element write hit the global array base); removed in 9.x.
 }
 
 rule WhichVariableReportsNsVar {

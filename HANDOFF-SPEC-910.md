@@ -242,9 +242,14 @@ doc/*.n 章节）。
 7. `expr` 的 `017` 是十进制 17，而 `scan %i`/`%o` 的 `017` 仍是八进制
    15（C 语义）。两处都已按 oracle 分别钉死，勿当同一套字面量语法。
 8. 规则数口径：§2 写的「447 条规则」与实测不符——交接基线 `442f4ff`
-   上 `grep '^rule ' specs/*.allium` 为 242 条；本轮结束为 329 条
-   （新增 87 条）。§2 的 447 可能是含 probe/其他分支的旧数，后续以
+   上 `grep '^rule ' specs/*.allium` 为 242 条；本轮结束为 335 条
+   （新增 93 条）。§2 的 447 可能是含 probe/其他分支的旧数，后续以
    grep 计数为准。
+9. T7 指令面修正：9.1 的 `assemble` 菜单仍保留 `lshift`，移除的是
+   `land`/`lor`；§3-C 写的「移除 land/lor/lshift」应改为「移除
+   land/lor」。新增 `swap`/`isEmpty`/`strge|strgt|strle|strlt`/
+   `jumpTableNum`/`dictGetDef`/`dictPut`/`dictRemove`/`tclooId` 已由
+   cmp_assemble 实测确认。
 
 ## 8. 交接记录
 
@@ -296,11 +301,10 @@ doc/*.n 章节）。
     64 位不截断、bad index 文案）。
   - T7：matching 补 regexp 编译错误文案（couldn't -> cannot；
     quantifier operand invalid -> invalid quantifier operand），并更新
-    三条既有规则的注释。assemble TIP 720 指令面与 binary Inf/NaN 位
-    保真未做：前者需逐指令矩阵，后者仍挂 §6 裁定项。
-  - T4 余项未做：timer/timerate 的 per-subcommand 细节（本轮已钉
-    in/cancel/单位与 after# id）、tcl::process 的 purge 面（已钉
-    autopurge/list/status/菜单）、unicode、zipfs、socket 新选项、
+    三条既有规则的注释；interp 补 assemble 指令面（swap 可用、land
+    移除、lshift 仍在）与栈平衡错误。binary Inf/NaN 位保真未做：仍挂
+    §6 裁定项。
+  - T4 余项未做：timerate 细节、unicode、zipfs、socket 新选项、
     info loaded、package files、::tcl 命令集 27 vs 23、pkgconfig 键集。
     T6 未做：judge/probes 里没有 properties/abstract/private 的探针，
     且对象计数是 §6 裁定项；待补探针后再 distill。

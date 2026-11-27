@@ -543,10 +543,9 @@ fn incr_int_of(interp: &mut Interp, v: &Value) -> std::result::Result<num_bigint
             } else {
                 set_error_code(interp, "TCL VALUE NUMBER");
             }
-            Err(tcl_err(format!(
-                "expected integer but got \"{}\"",
-                v.as_str()
-            )))
+            // 9.1 报错尾注（tclStrToD.c formaterr）：值是列表样串
+            // （≥2 词）→ but got a list（incr-2.32/2.33、incr-old-2.10）。
+            Err(tcl_err(crate::value::value_report("integer", v.as_str())))
         }
     }
 }

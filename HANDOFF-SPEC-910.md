@@ -250,6 +250,17 @@ doc/*.n 章节）。
    land/lor」。新增 `swap`/`isEmpty`/`strge|strgt|strle|strlt`/
    `jumpTableNum`/`dictGetDef`/`dictPut`/`dictRemove`/`tclooId` 已由
    cmp_assemble 实测确认。
+10. T6 文档超前于 9.1.0 实现：`doc/classvariable.n` 存在，但
+    `oo::define` 里的 `classvariable` 实测是 invalid command；核心
+    `oo::class` 的 `property` 也未注册（只有 `oo::configurable` 提供），
+    且 `info class properties` 实测只认 `-get/-kind/-set`，不认
+    `doc/info.n` 写的 `-readable/-writable/-all`。故 properties/
+    classvariable 不写 ensures，等 9.2 或实现落地后再补；本轮只钉
+    abstract/singleton/private/classmethod/info class variables。
+11. T4 清单里的 `readFile`/`writeFile`/`foreachLine`/`tcl::idna` 在
+    9.1.0 实测不存在；`info commandtype/line` 实际名为 `info cmdtype`，
+    没有 `info line`。`unicode` 只有 tonfc/tonfd/tonfkc/tonfkd 四个
+    归一化子命令，没有 version/names。后续不要再按旧清单硬造规则。
 
 ## 8. 交接记录
 
@@ -304,10 +315,13 @@ doc/*.n 章节）。
     三条既有规则的注释；interp 补 assemble 指令面（swap 可用、land
     移除、lshift 仍在）与栈平衡错误。binary Inf/NaN 位保真未做：仍挂
     §6 裁定项。
-  - T4 余项未做：timerate 细节、unicode、zipfs、socket 新选项、
-    info loaded、package files、::tcl 命令集 27 vs 23、pkgconfig 键集。
-    T6 未做：judge/probes 里没有 properties/abstract/private 的探针，
-    且对象计数是 §6 裁定项；待补探针后再 distill。
+  - T4 余项未做：timerate 细节、unicode（仅归一化）、zipfs、socket
+    新选项、info loaded、package files、::tcl 命令集 27 vs 23、
+    pkgconfig 键集（实测 19 键）。清单中的 readFile/writeFile/
+    foreachLine/tcl::idna 在 9.1.0 不存在（§7-11）。
+  - T6：已钉 abstract/singleton/private method/classmethod/
+    info class variables 五条；properties/classvariable 因文档超前于
+    9.1.0 实现未写（§7-10）；对象计数仍为 §6.1 裁定项。
 - 门禁终态：`allium check specs/` 0 error（4 warning 为 memory-lifecycle
   既有 unused entity/binding；5 info 为既有 unused field）；
   `allium analyse specs/` 0 finding。未改 crates/judge，未跑 judge

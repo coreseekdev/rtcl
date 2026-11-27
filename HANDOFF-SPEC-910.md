@@ -247,21 +247,24 @@ doc/*.n 章节）。
 7. `expr` 的 `017` 是十进制 17，而 `scan %i`/`%o` 的 `017` 仍是八进制
    15（C 语义）。两处都已按 oracle 分别钉死，勿当同一套字面量语法。
 8. 规则数口径：§2 写的「447 条规则」与实测不符——交接基线 `442f4ff`
-   上 `grep '^rule ' specs/*.allium` 为 242 条；本轮结束为 370 条
-   （新增 128 条）。§2 的 447 可能是含 probe/其他分支的旧数，后续以
+   上 `grep '^rule ' specs/*.allium` 为 242 条；本轮结束为 376 条
+   （新增 134 条）。§2 的 447 可能是含 probe/其他分支的旧数，后续以
    grep 计数为准。
 9. T7 指令面修正：9.1 的 `assemble` 菜单仍保留 `lshift`，移除的是
    `land`/`lor`；§3-C 写的「移除 land/lor/lshift」应改为「移除
    land/lor」。新增 `swap`/`isEmpty`/`strge|strgt|strle|strlt`/
    `jumpTableNum`/`dictGetDef`/`dictPut`/`dictRemove`/`tclooId` 已由
    cmp_assemble 实测确认。
-10. T6 文档超前于 9.1.0 实现：`doc/classvariable.n` 存在，但
-    `oo::define` 里的 `classvariable` 实测是 invalid command；核心
-    `oo::class` 的 `property` 也未注册（只有 `oo::configurable` 提供），
-    且 `info class properties` 实测只认 `-get/-kind/-set`，不认
-    `doc/info.n` 写的 `-readable/-writable/-all`。故 properties/
-    classvariable 不写 ensures，等 9.2 或实现落地后再补；本轮只钉
-    abstract/singleton/private/classmethod/info class variables。
+10. T6 properties/classvariable 上下文修正（2026-11-27）：`classvariable`
+    是**方法体内**命令（不是 `oo::define` 子命令），9.1.0 支持，语义是
+    链接到定义类的命名空间、跨实例共享（Counted 例 1/2/3）。`property`
+    由 `oo::configurable` 元类提供，9.1.0 支持 `-kind readable/writable/
+    readwrite`、`-get/-set`、`instance configure` 与
+    `info class properties -all/-readable/-writable`；普通 `oo::class`
+    没有 property。原先“9.1.0 未实现”的结论是测错上下文，已改为实测
+    规则（ClassVariableIsSharedAcrossInstances、ConfigurablePropertyKinds、
+    ConfigureReadsWritesAndListsProperties、ConfigureUnknownPropertyMessage、
+    PropertyCustomAccessors、InstancePropertyDefinition）。
 11. T4 清单里的 `readFile`/`writeFile`/`foreachLine`/`tcl::idna` 在
     9.1.0 实测不存在；`info commandtype/line` 实际名为 `info cmdtype`，
     没有 `info line`。`unicode` 只有 tonfc/tonfd/tonfkc/tonfkd 四个
@@ -326,7 +329,7 @@ doc/*.n 章节）。
     断言。
 24. `regsub` 的替换结果经 `list` 包装时反斜杠元素会被加括号：
     `list ... [regsub {x} x {\\&}]` 得 `ihhi {\x}`，不是 `ihhi \x`。
-25. 自审脚本（2026-11-27）：解析 370 条规则，282 条 `when` 可直接
+25. 自审脚本（2026-11-27）：解析 376 条规则，288 条 `when` 可直接
     执行，对 9.1.0 **0 mismatch**；77 条因 `-- after:` 前态/多行/
     未定义变量跳过。已把 20+ 条依赖前态的规则改成自包含
     （io gets/read、variables 顶部 proc/array、trace、oo、error-deep
@@ -411,23 +414,59 @@ doc/*.n 章节）。
   - T4 余项：已补 clock add weekdays / clock scan -validate、
     exec -encoding、info loaded/cmdtype、tcl::build-info、
     ::tcl::pkgconfig 键集、unicode 归一化、zipfs root、timerate 形状、
-    socket -nodelay/-keepalive、package files、::tcl 命令集 18 条。
+    socket -nodelay/-keepalive、package files、::tcl 命令集 17 条。
     T4 主面到此完成；timerate/zipfs 的文件/数值清单仍不钉（环境相关）。
   - T6：已钉 abstract/singleton/private method/private variable/
     classmethod/info class variables（6 条）+ 匿名对象首基准 Obj20、
     名字/creationid 关系、命名/类共用计数器、info object isa（4 条）+
     destructor 链、method 默认值/args、methodtype/forward、oo::copy/
-    rename、unknown method 文案（5 条）。properties/classvariable 因
-    文档超前于 9.1.0 实现未写（§7-10）；对象计数绝对基准已按用户裁定
-    钉死，不再留 open question。新增探针 `oo_objcount91.tcl`、
-    `oo_features91.tcl`、`pbr6_float_bits.tcl`（§4 授权）。
+    rename、unknown method 文案（5 条）+ classvariable 跨实例共享、
+    property 种类/configure/未知属性/-get/-set/实例属性（6 条）。
+    对象计数绝对基准已按用户裁定钉死，不再留 open question。新增探针
+    `oo_objcount91.tcl`、`oo_features91.tcl`、`pbr6_float_bits.tcl`
+    （§4 授权）。
 - 门禁终态：`allium check specs/` 0 error（3 warning 为 memory-lifecycle
   既有 unused entity/binding；3 info 为既有 unused field）；
   `allium analyse specs/` 0 finding。自审脚本
-  `python3 specs/scripts/audit-91.py`：checked=282 skipped=77
+  `python3 specs/scripts/audit-91.py`：checked=288 skipped=77
   mismatches=0（跳过的是 `-- after:` 前态/多行 trigger）。未改
   crates/judge 代码（仅按授权加 3 个探针 + 审计脚本），未跑 judge
   （规格-only 改动不触发代码门禁）。
 - git diff --stat 范围：`specs/*.allium`（已换锚的 12 份）+ 本文件 +
   `judge/probes/{oo_objcount91,oo_features91,pbr6_float_bits}.tcl` +
   `specs/scripts/audit-91.py`（§4 授权新增探针/审计脚本，只加不改）。
+
+## 9. 全量复核（2026-11-27）
+
+14 份规格：12 份行为规格全部 `Oracle: tclsh 9.1.0 (core-9-1-0)`；
+`memory-lifecycle.allium` 为实现资源契约（Oracle n/a），规则总数 376。
+
+| 规格 | 规则 | 覆盖 | 状态 |
+|---|---:|---|---|
+| control-flow | 19 | T4 switch -integer / case / subst | 9.1 锚定 |
+| dict | 22 | T4 getdef/getwithdefault | 9.1 锚定 |
+| error-deep | 13 | A6 + catch return 语义复核 | 9.1 锚定 |
+| expr | 36 | A1/A2 + T1 | 9.1 锚定 |
+| interp | 17 | T4 timer/process/内省/工具 + T7 assemble | 9.1 锚定 |
+| io | 39 | B1 + T3 + T4 file/exec/socket | 9.1 锚定 |
+| list | 25 | T2 + T4 lpop/lremove/ledit/lseq/lfilter/stride | 9.1 锚定 |
+| matching | 39 | T1 format/scan + T4 regsub + T7 regex/binary | 9.1 锚定 |
+| memory-lifecycle | 8 | 资源契约（值/通道/帧/OO/缓存/JIT） | Oracle n/a |
+| oo | 48 | T6 全量可测面（Obj20 基准） | 9.1 锚定 |
+| regex-spencer | 23 | T7 ARE 语义（23 条全量复跑） | 9.1 锚定 |
+| string | 19 | T1/T2/T3 | 9.1 锚定 |
+| trace | 22 | A5 + 现代 trace 面 | 9.1 锚定 |
+| variables | 46 | A3/A4 + T5 + T4 array/const | 9.1 锚定 |
+
+复核结论：
+
+- 所有 `when` 的 oracle 结果以 tclsh 9.1.0 实测为准；`doc` 与实测
+  冲突时按实测（如 `invokeStk1`、`chan configure -inputmode`）。
+- 自审 `specs/scripts/audit-91.py`：288 条可执行 `when`，0 mismatch；
+  77 条依赖 `-- after:` 前态/多行的规则保持伪代码形态。
+- 已修：io/variables/matching/oo/interp/memory 的头部锚与覆盖范围；
+  expr/error-deep/matching 的 8.6-only 注释；io 的 D-30→D-29 引用。
+- 唯一已知代码缺口：rtcl OO bootstrap 首用户对象 `Obj11` vs 规格
+  `Obj20`（§7-15）。properties/classvariable 已确认在 9.1.0 可用
+  （此前测错上下文，已修正，§7-10）。
+

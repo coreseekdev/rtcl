@@ -3062,3 +3062,39 @@ sweep 12 既有、workspace **cargo exit 0**（rtcl-vm 871/0）、wasm32 ✓、
   fire-w +5.7%/fire-elem +1.1%/notrace-set +4.2%。
 - wasm 体积 **−3001B/−0.09%**（3168702→3165701，release 轨）——三张
   字符串键表退场 > TraceSet 机制成本。
+
+## D1 步骤 4——trace 挂 Var + phantom/链接收口（task/d1-vars4 @ 0f2441e，2026-11-28，子代理施工）
+
+- **TraceSet**：Var.traces: Option<Box<TraceSet>>（Var 24B→32B，仅被追踪
+  的 Var 付堆侧成本）；TraceSet{var 整变量族, var_linger 键在册位,
+  elem 元素族}。挂靠点：整变量族挂名字宿主（无值占位就地确保——
+  bare-:: 与 note_global_entry 同形 UNDEFINED、legacy trace variable
+  plain 占位——oracle「注册即建 Var、ns delete 不发 unset 火」钉形）；
+  **元素族挂数组基宿主**（元素摘除后 trace 仍在、phantom 元素同域——
+  旧 elem_traces 逐字同）。守卫键换 n_trace_hosts（与旧键-linger 语义
+  逐字同）。触发序：在席火（宿主收集）+ 快照火（unset 四臂/ns
+  delete/帧清场先 take 再触发）；帧清场序 = vt 插入序 +「注册后链接
+  过的名字」双形复刻。
+- **收口**：①phantom 重叠态缺口消除——global_remove 实摘时镜像
+  phantom_globals 同步清除（debug 判官全语料 **95/95**，gen_upvar/
+  gen_trace/gen_set-old panic 形全消）；②drop_frame_global_links 改
+  trace 感知（承载 trace 只撤 UNDEFINED 位）；③trace_phantoms 经核实
+  纯 write-only，随三表退役。upvar-8.7 查 var_linger。
+- **语义新发现 4 项**（oracle 对照，如实入账）：①unset 火中 trace
+  info 可见性——随迁移**收敛 oracle**；②append 元素快径 elem trace
+  盲区——**收敛 oracle**；③元素 trace 随元素 unset 存活——基线持平
+  保留；④整数组 unset 的 phantom 元素火序——保留（oracle 异于基线）。
+- 触发序钉形 10/10 oracle-identical（name1 全名形/两 trace 序/数组
+  get 后置矩阵/teardown 行/upvar 簇/t7_arr_elem/c_array_unset_missing/
+  incr_window_p11/global_link_unset_isolation）。
+- 门禁（提交树终验：重建→judge/debug-judge/钉形）：judge **95/95**、
+  crash-gate 128/128、probes 398/76（DIFF 名单与基线逐项相同）、
+  sweep 12 既有、rtcl-vm 889/0（std+nostd）、五特性 ✓、wasm32 ✓、
+  workspace exit 0、**debug judge 全语料 95/95**。
+- 基准（perf cycles 交错中位 + ABBA，负载 2-3）：var_incr -3.5%、
+  dict_ops +2.7%、proc_fib -6%；t7 全案 ±9% 内；帧面 list -10%/
+  after -6.5%/plain -1%；trace 路径（新 bench/scripts/trace_bench.tcl）：
+  reg-rm -8.8%/fire-w +5.7%/fire-elem +1.1%/notrace-set +4.2%。
+- wasm 体积 **-3001B（-0.09%）**。
+- 保留未修：dead_flat/flat_aliases/ns_transient/upvars 本体（步骤 5
+  面）；baseexists 分歧（链接面独立批）。

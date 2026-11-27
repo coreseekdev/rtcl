@@ -172,17 +172,28 @@ pub(crate) fn out_of_memory(interp: &mut Interp, bytes: usize) -> Error {
 /// 之废除（`-4294967295` 不再回绕成 1）。仅真正解析不出（`0x`、
 /// `1.5`、`1+1+1`、`1 + 1`、多元素列表）才 None → bad index。
 pub(crate) fn parse_tcl_index(s: &str, len: usize) -> Option<i64> {
-    use crate::types::bignum::{parse_int, scan_number, NumPayload};
+    use crate::types::bignum::{parse_int, scan_number, IntRep, NumPayload};
     use num_bigint::BigInt;
-    use num_traits::ToPrimitive;
+    use num_traits::{Signed, ToPrimitive};
     let end_value = len as i64 - 1;
     let t = trim_tcl_space(s);
     // 按符号饱和到 wide（Tcl：BIG → ±WIDE_MAX，C 源 mp_isneg 分支）。
+    // 热路径（`12345`/`end-7`）全程 i64/i128，零 BigInt 分配——只有
+    // bignum 项才提升（基准 e1_iostr_bench：BigInt 回退曾致 ix 命中
+    // +20%）。
+    fn sat_i128(v: i128) -> i64 {
+        if v > i64::MAX as i128 {
+            i64::MAX
+        } else if v < i64::MIN as i128 {
+            i64::MIN
+        } else {
+            v as i64
+        }
+    }
     let saturate = |v: &BigInt| -> i64 {
         match v.to_i64() {
             Some(i) => i,
             None => {
-                use num_traits::Signed;
                 if v.is_negative() {
                     i64::MIN
                 } else {
@@ -191,9 +202,38 @@ pub(crate) fn parse_tcl_index(s: &str, len: usize) -> Option<i64> {
             }
         }
     };
+    // 两项求和：双 i64 走 i128 精确（end/int±int 的 wide 数学饱和等价
+    // i128 后饱和）；含 bignum 走 BigInt 精确后截断（oracle：任一项
+    // BIG → 全式 expr 精确求值再 truncate）。
+    fn op_sum(a: IntRep, minus: bool, b: IntRep) -> i64 {
+        use num_traits::{Signed, ToPrimitive};
+        match (a, b) {
+            (IntRep::I64(x), IntRep::I64(y)) => {
+                let (x, y) = (x as i128, y as i128);
+                sat_i128(if minus { x - y } else { x + y })
+            }
+            (a, b) => {
+                let (x, y) = (a.to_big(), b.to_big());
+                let v = if minus { x - y } else { x + y };
+                match v.to_i64() {
+                    Some(i) => i,
+                    None => {
+                        if v.is_negative() {
+                            i64::MIN
+                        } else {
+                            i64::MAX
+                        }
+                    }
+                }
+            }
+        }
+    }
     // 1. 整值数字（Tcl_GetNumberFromObj 先行；end/表达式不是数字）。
     if let Some(rep) = parse_int(t) {
-        return Some(saturate(&rep.to_big()));
+        return Some(match rep {
+            IntRep::I64(i) => i,
+            r => saturate(&r.to_big()),
+        });
     }
     // 2. "end[+-]integer"：操作符后无空白，第二项保留自己的符号。
     if let Some(rest) = t.strip_prefix("end") {
@@ -204,15 +244,11 @@ pub(crate) fn parse_tcl_index(s: &str, len: usize) -> Option<i64> {
         if rb.len() < 2 || (rb[0] != b'+' && rb[0] != b'-') || is_tcl_space(rb[1]) {
             return None;
         }
-        let off = parse_int(&rest[1..])?.to_big();
-        let v = if rb[0] == b'+' {
-            BigInt::from(end_value) + off
-        } else {
-            BigInt::from(end_value) - off
-        };
-        return Some(saturate(&v));
+        let off = parse_int(&rest[1..])?;
+        return Some(op_sum(IntRep::I64(end_value), rb[0] == b'-', off));
     }
     // 3. "integer[+-]integer"：首项是前缀扫描（剩余留给第二项）。
+    //    量级在 i64 内攒 u64（与 parse_int 同法），溢出转 bignum。
     let scan = scan_number(t, true)?;
     let NumPayload::Int { radix, run } = scan.payload else {
         return None;
@@ -221,20 +257,51 @@ pub(crate) fn parse_tcl_index(s: &str, len: usize) -> Option<i64> {
     if digits.is_empty() || digits.bytes().all(|b| b == b'_') {
         return None;
     }
-    let stripped: String = digits.bytes().filter(|&b| b != b'_').map(|b| b as char).collect();
-    let first = BigInt::parse_bytes(stripped.as_bytes(), radix)?;
-    let first = if scan.neg { -first } else { first };
+    let mut mag: u64 = 0;
+    let mut overflow = false;
+    for &b in digits.as_bytes() {
+        if b == b'_' {
+            continue;
+        }
+        mag = match mag
+            .checked_mul(radix as u64)
+            .and_then(|m| m.checked_add(crate::types::bignum::digit_value(b) as u64))
+        {
+            Some(v) => v,
+            None => {
+                overflow = true;
+                break;
+            }
+        };
+    }
+    let first = if overflow {
+        let stripped: String =
+            digits.bytes().filter(|&b| b != b'_').map(|b| b as char).collect();
+        let big = BigInt::parse_bytes(stripped.as_bytes(), radix)?;
+        IntRep::Big(if scan.neg { -big } else { big })
+    } else if scan.neg && mag == (i64::MAX as u64) + 1 {
+        IntRep::I64(i64::MIN)
+    } else if mag > i64::MAX as u64 {
+        // 符号化后超 wide：精确 Big（与 parse_int 同）——不可提前饱和，
+        // `hugeA-hugeB` 型精确差仍可能落在 wide 内（oracle 钉形）。
+        let big = BigInt::from(mag);
+        IntRep::Big(if scan.neg { -big } else { big })
+    } else {
+        IntRep::I64(if scan.neg { -(mag as i64) } else { mag as i64 })
+    };
     let rest = &t[scan.stop..];
     if rest.is_empty() {
-        return Some(saturate(&first));
+        return Some(match first {
+            IntRep::I64(i) => i,
+            IntRep::Big(ref b) => saturate(b),
+        });
     }
     let rb = rest.as_bytes();
     if rb.len() < 2 || (rb[0] != b'+' && rb[0] != b'-') || is_tcl_space(rb[1]) {
         return None;
     }
-    let second = parse_int(&rest[1..])?.to_big();
-    let v = if rb[0] == b'+' { first + second } else { first - second };
-    Some(saturate(&v))
+    let second = parse_int(&rest[1..])?;
+    Some(op_sum(first, rb[0] == b'-', second))
 }
 
 /// Whether a Tcl index is spelled from `end` — the one form whose value

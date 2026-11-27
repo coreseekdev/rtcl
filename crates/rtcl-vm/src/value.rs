@@ -147,6 +147,60 @@ impl SeriesRep {
             Value::from_int(self.start.wrapping_add(i.wrapping_mul(self.step)))
         }
     }
+
+    /// Sub-series `first..=last` (already clamped by the caller).
+    pub fn slice(&self, first: i64, last: i64) -> SeriesRep {
+        let len = (last - first + 1).max(0);
+        if self.is_double {
+            SeriesRep {
+                is_double: true,
+                start: 0,
+                step: 1,
+                dstart: self.dstart + (first as f64) * self.dstep,
+                dstep: self.dstep,
+                len,
+                precision: self.precision,
+            }
+        } else {
+            SeriesRep {
+                is_double: false,
+                start: self.start.wrapping_add(first.wrapping_mul(self.step)),
+                step: self.step,
+                dstart: 0.0,
+                dstep: 1.0,
+                len,
+                precision: 0,
+            }
+        }
+    }
+
+    /// Full reversed series (a negative-step series, no materialization).
+    pub fn reverse(&self) -> SeriesRep {
+        if self.len <= 0 {
+            return *self;
+        }
+        if self.is_double {
+            SeriesRep {
+                is_double: true,
+                start: 0,
+                step: 1,
+                dstart: self.dstart + ((self.len - 1) as f64) * self.dstep,
+                dstep: -self.dstep,
+                len: self.len,
+                precision: self.precision,
+            }
+        } else {
+            SeriesRep {
+                is_double: false,
+                start: self.start.wrapping_add((self.len - 1).wrapping_mul(self.step)),
+                step: self.step.wrapping_neg(),
+                dstart: 0.0,
+                dstep: 1.0,
+                len: self.len,
+                precision: 0,
+            }
+        }
+    }
 }
 
 const SERIES_MATERIALIZE_MAX: i64 = 536_870_909;

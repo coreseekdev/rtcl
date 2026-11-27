@@ -433,11 +433,7 @@ pub fn cmd_lrange(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let first = first_raw.max(0);
         let last = last_raw.min(len as i64 - 1);
         if first <= last && (first as usize) < len {
-            let mut out = Vec::with_capacity((last - first + 1) as usize);
-            for i in first..=last {
-                out.push(s.element(i));
-            }
-            return Ok(Value::from_list(&out));
+            return Ok(Value::from_series(s.slice(first, last)));
         }
         return Ok(Value::empty());
     }
@@ -523,6 +519,22 @@ pub fn cmd_lassign(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         set_error_code(interp, "TCL WRONGARGS");
         return Err(wrong_args("lassign", "list ?varName ...?"));
     }
+    if let Some(s) = args[1].series() {
+        let vars: Vec<&str> = args[2..].iter().map(|v| v.as_str()).collect();
+        let len = s.len.max(0);
+        for (i, var) in vars.iter().enumerate() {
+            let value = if (i as i64) < len {
+                s.element(i as i64)
+            } else {
+                Value::empty()
+            };
+            interp.set_var(var, value)?;
+        }
+        if len > vars.len() as i64 {
+            return Ok(Value::from_series(s.slice(vars.len() as i64, len - 1)));
+        }
+        return Ok(Value::empty());
+    }
     let list = strict_list(interp, &args[1])?;
     let vars: Vec<&str> = args[2..].iter().map(|v| v.as_str()).collect();
     for (i, var) in vars.iter().enumerate() {
@@ -590,6 +602,9 @@ pub fn cmd_lreverse(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
         set_error_code(interp, "TCL WRONGARGS");
         return Err(wrong_args("lreverse", "list"));
+    }
+    if let Some(s) = args[1].series() {
+        return Ok(Value::from_series(s.reverse()));
     }
     let mut list = strict_list(interp, &args[1])?;
     list.reverse();
@@ -1846,6 +1861,14 @@ mod tests {
         assert_eq!(
             interp.eval("lrange [lseq 0x7fffffff] end-1 end").unwrap().as_str(),
             "2147483645 2147483646"
+        );
+        assert_eq!(
+            interp.eval("set r [lreverse [lseq 0x7fffffff]]; list [lindex $r 0] [lindex $r end]").unwrap().as_str(),
+            "2147483646 0"
+        );
+        assert_eq!(
+            interp.eval("set rest [lassign [lseq 0x7fffffff] a b]; list $a $b [lrange $rest 0 2] [llength $rest]").unwrap().as_str(),
+            "0 1 {2 3 4} 2147483645"
         );
         assert_eq!(
             interp.eval("lmap x [lseq 0x7fffffff] {if {$x > 2} break; set x}").unwrap().as_str(),

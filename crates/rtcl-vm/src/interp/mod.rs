@@ -209,6 +209,12 @@ pub(crate) struct CallFrame {
     /// const-free frames pay one branch.  Cleared in
     /// [`CallFrame::reset_var_state`].
     pub consts: Option<Vec<String>>,
+    /// 帧内链接登记表（别名名 → 目标）。D1 步骤 5 决策：**保留**，不
+    /// 收编 Var.link——链接名可无 vt 条目（link-only，T3 直列经
+    /// locals_order 日志 + in_table 过滤列举）；三链接形含 Dead（惰性
+    /// 目标探测即语义）；Frame 链接的跨帧句柄在池化重置下不稳定
+    /// （代数守卫换不来 Dead 判定）。全部热径已有 is_empty 单分支守
+    /// 卫，收编无可得收益、语义风险在字节级红线面。
     pub upvars: UpvarMap,
     /// Namespace the running proc was defined in (tclsh: `namespace current`
     /// inside the proc resolves here).  Variable *reads* do NOT fall back to
@@ -869,9 +875,13 @@ pub struct Interp {
     /// At the global level tclsh's `upvar`/`variable` link two variables;
     /// rtcl's flat global table models that with this redirect.  A Vec so
     /// `namespace eval` can truncate to its entry mark on exit.
+    /// D1 步骤 5 决策：**保留**（解改名/前置重写层，非 per-Var 态——
+    /// 别名名可无表条目；收编需物化别名 Var 并动列举序红线）。
     pub(crate) flat_aliases: Vec<(String, String)>,
     /// Eval-level aliases whose target was deleted (namespace removal):
     /// reads keep the redirect, writes error.
+    /// D1 步骤 5 决策：**保留**（flat_aliases 的亡目标伴随面——同前
+    /// 理由：前置重写层，非 per-Var 态）。
     pub(crate) dead_flat: Vec<String>,
     /// Flat keys of variables a `variable` command declared at eval level
     /// (tclsh: the ns-eval varFrame holds a reference, so a namespace that
@@ -882,6 +892,8 @@ pub struct Interp {
     /// 体帧作用域（var-3.10 与 DIFF-8 的分野——upvar 的 eval 级别名链
     /// 接两个持久 ns 变量、随 flat_aliases 持久；variable 链接随声明
     /// 体帧生灭、不漏入嵌套体）。ns eval 体入口 take 清空、退出恢复。
+    /// D1 步骤 5 决策：**保留**（体作用域瞬态别名——take/恢复的
+    /// 生命周期挂在 ns-eval 体进出，Var.link 无此作用域语义）。
     pub(crate) ns_transient: Vec<(String, String)>,
     /// Namespace variables kept alive past `namespace delete` because a
     /// live variable link still references them; dropped when the

@@ -1301,6 +1301,10 @@ impl Interp {
     /// Var——链接随帧消亡时，仍无值的目标连条目一起离表（d27 p21：proc
     /// 返回后再读 `::gx` 是普通 LOOKUP miss，不是 READ）。帧弹出前对
     /// 本帧的 Global 链接调用；仍被其他存活帧链接的目标留下。
+    /// D1 步骤 5 决策：**保留**为过程（非数据面收编）——keep-alive
+    /// 语义需要「目标被哪些帧链接」的扇入记账，Var.link 是链接*目标*
+    /// 指针而非引用计数；UNDEFINED 位 + upvars 扫描已零平行存储地实现
+    /// 同语义（步骤 4 的 trace 感知臂保留）。
     pub(crate) fn drop_frame_global_links(&mut self, frame_idx: usize) {
         let mut keys: Vec<String> = Vec::new();
         if let Some(f) = self.frames.get(frame_idx) {

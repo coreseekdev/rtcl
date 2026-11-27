@@ -234,17 +234,24 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // variable-set insert, upvar link) stay per-call.
         let (qualified, ns_part) = resolve_var_link(interp, ns.as_ref(), raw_name);
         if &*ns_part != "::" && !interp.namespaces.contains_key(&*ns_part) {
-            crate::interp::commands::list::set_error_code(
-                interp,
-                &format!("TCL LOOKUP VARNAME {}", raw_name),
-            );
-            return Err(Error::runtime(
-                format!(
-                    "can't define \"{}\": parent namespace doesn't exist",
-                    raw_name
-                ),
-                ErrorCode::Generic,
-            ));
+            // 自删体帧窗口（namespace delete [namespace current] 后）：
+            // `variable` 声明落进**垂死**的当前 ns——oracle 静默接受
+            // （n8 tst3 钉形：不报错、随体消亡）；其他缺失 ns 仍报。
+            if ns_part.as_ref() != interp.current_namespace.as_ref() {
+                crate::interp::commands::list::set_error_code(
+                    interp,
+                    &format!("TCL LOOKUP VARNAME {}", raw_name),
+                );
+                return Err(Error::runtime(
+                    format!(
+                        "can't define \"{}\": parent namespace doesn't exist",
+                        raw_name
+                    ),
+                    ErrorCode::Generic,
+                ));
+            }
+            i += if i + 1 < args.len() { 2 } else { 1 };
+            continue;
         }
 
         // If an initial value is provided, set it.  A bare `variable name`
@@ -434,6 +441,29 @@ fn ns_eval(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // post-delete 写入——tclsh sd1-A/E 实证 info globals 无残留）。
         // 体中重建该 ns 则跳过（重建后的变量合法）。
         if interp.namespaces.get(&*qualified).is_none() {
+            // 垂死窗口的命令残留同规则（oracle n8 tst4：名单外新建命令
+            // 只活到体帧退出；复活名单也在此收敛）。
+            interp.ns_resurrect_cmds.remove(qualified.as_str());
+            let cmd_prefix = format!("{}::", qualified);
+            let dead_cmd_keys: Vec<String> = interp
+                .procs
+                .keys()
+                .chain(interp.commands.keys())
+                .chain(interp.ensembles.keys())
+                .filter(|k| k.starts_with(&cmd_prefix))
+                .cloned()
+                .collect();
+            if !dead_cmd_keys.is_empty() {
+                for k in &dead_cmd_keys {
+                    interp.procs.remove(k);
+                    interp.commands.remove(k);
+                    interp.ensembles.remove(k);
+                    interp.command_categories.remove(k);
+                    interp.command_meta.remove(k);
+                    interp.import_aliases.remove(k);
+                }
+                interp.note_cmd_mutation();
+            }
             let dead_keys: Vec<String> = interp
                 .globals
                 .keys()
@@ -621,6 +651,26 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // namespace still resolves during the trace (`namespace which
         // -command` finds the command — 34.4); from inside, the commands
         // are already gone (`namespace which` is empty — 34.5).
+        // 自删语境（inside）：记下**可复活命令名**（basic-15.3 钉形：
+        // 体帧窗口内同名重建任一条即复活 ns——见 Interp.ns_resurrect_cmds；
+        // oracle n8：不同名新建只在体帧内可解析、随体消亡）。
+        if inside {
+            let mut dead_cmd_keys: Vec<String> = interp
+                .procs
+                .keys()
+                .chain(interp.commands.keys())
+                .chain(interp.ensembles.keys())
+                .filter(|k| *k == &qualified || k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            dead_cmd_keys.sort();
+            dead_cmd_keys.dedup();
+            if !dead_cmd_keys.is_empty() {
+                interp
+                    .ns_resurrect_cmds
+                    .insert(qualified.clone(), dead_cmd_keys.into_iter().collect());
+            }
+        }
         let mut dead_procs: Vec<String> = interp
             .procs
             .keys()

@@ -768,6 +768,12 @@ pub struct Interp {
     /// parent's child table without a flag check (TclGetNamespaceForQualName),
     /// so vars/commands of a dying tree stay reachable from trace callbacks.
     pub(crate) ns_dying: std::collections::HashSet<String>,
+    /// 自删语境（`namespace delete [namespace current]` 后、eval 体尚
+    /// 未退出）的**可复活命令名**（ns 全名 → 体帧窗口开始时在该 ns 的
+    /// 命令全名集）：窗口内同名重建任一名单上的命令即复活整个 ns
+    /// （tclsh 基本语义：basic-15.3——同名 `proc p` 重建后 ns 以新空
+    /// 表归位，exists=1；不同名新建命令只在体帧内可解析、随体消亡）。
+    pub(crate) ns_resurrect_cmds: HashMap<String, std::collections::HashSet<String>>,
     /// Var flat keys inside the pending-unset window of a teardown (tclsh
     /// UnsetVarStruct's "in-table but undefined" step): reads and `info vars`
     /// miss them, `namespace which -variable` still resolves them (the Var
@@ -1285,6 +1291,7 @@ impl Interp {
                 ns
             },
             ns_dying: std::collections::HashSet::new(),
+            ns_resurrect_cmds: HashMap::new(),
             var_nuke_pending: std::collections::HashSet::new(),
             import_aliases: HashMap::new(),
             ns_unknown: HashMap::new(),

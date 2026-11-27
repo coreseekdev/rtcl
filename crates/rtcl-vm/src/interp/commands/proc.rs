@@ -151,6 +151,23 @@ pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         compiled,
     };
 
+    // 自删体帧窗口的复活（basic-15.3 钉形；oracle n7/n8 实测）：窗口
+    // 内重建的命令名若在 ns 自删时的命令名单上，整个 ns 以**新空表**
+    // 归位（exists→1，旧命令不复返），本次定义落进复活后的 ns。名单
+    // 外的新名字无此效果（tclsh 只活到体帧退出，ns_eval 出口清扫）。
+    let resurrect_ns = interp
+        .ns_resurrect_cmds
+        .iter()
+        .find(|(ns, names)| {
+            (name.starts_with(&format!("{}::", ns.as_str())) || name.as_str() == ns.as_str())
+                && names.contains(&name)
+        })
+        .map(|(ns, _)| ns.clone());
+    if let Some(dead_ns) = resurrect_ns {
+        interp.ns_resurrect_cmds.remove(&dead_ns);
+        super::namespace::ensure_namespace(interp, &dead_ns);
+    }
+
     // Redefining a command is a silent delete+create (tclsh 8.6.17): no
     // rename/delete trace fires and the old command's stored traces are
     // dropped (trace-19.5, trace-20.3.1).

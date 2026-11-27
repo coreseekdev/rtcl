@@ -298,10 +298,12 @@ doc/*.n 章节）。
     quantifier operand invalid -> invalid quantifier operand），并更新
     三条既有规则的注释。assemble TIP 720 指令面与 binary Inf/NaN 位
     保真未做：前者需逐指令矩阵，后者仍挂 §6 裁定项。
-  - T4 余项未做：timer/timerate、tcl::process、unicode、zipfs、socket
-    新选项、info loaded、package files、::tcl 命令集 27 vs 23、
-    pkgconfig 键集。T6 未做：judge/probes 里没有 properties/abstract/
-    private 的探针，且对象计数是 §6 裁定项；待补探针后再 distill。
+  - T4 余项未做：timer/timerate 的 per-subcommand 细节（本轮已钉
+    in/cancel/单位与 after# id）、tcl::process 的 purge 面（已钉
+    autopurge/list/status/菜单）、unicode、zipfs、socket 新选项、
+    info loaded、package files、::tcl 命令集 27 vs 23、pkgconfig 键集。
+    T6 未做：judge/probes 里没有 properties/abstract/private 的探针，
+    且对象计数是 §6 裁定项；待补探针后再 distill。
 - 门禁终态：`allium check specs/` 0 error（4 warning 为 memory-lifecycle
   既有 unused entity/binding；5 info 为既有 unused field）；
   `allium analyse specs/` 0 finding。未改 crates/judge，未跑 judge

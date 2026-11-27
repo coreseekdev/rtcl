@@ -2080,6 +2080,8 @@ mod tests {
             OpCode::SubEnd,
             OpCode::ExprMark,
             OpCode::Nop,
+            OpCode::EvalExprCond,
+            OpCode::ExprFoldError(1, 2, 3),
         
         ]
     }
@@ -2258,6 +2260,8 @@ mod tests {
             "SUB_END",
             "EXPR_MARK",
             "NOP",
+            "EVAL_EXPR_COND",
+            "EXPR_FOLD_ERROR 1 c2 c3",
         ];
         let census = census();
         assert_eq!(census.len(), golden.len());

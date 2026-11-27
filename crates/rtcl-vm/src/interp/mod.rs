@@ -304,15 +304,19 @@ pub(crate) struct CallFrame {
 
 impl CallFrame {
     /// 帧名键面清空（D1 步骤 2）：`vt` 整表重置（代数逐槽递增——池化
-    /// 复用旧句柄全灭）+ 插入日志清空 + 平表/位集镜像同步（步骤 2 路
-    /// 由落地后镜像转 debug 对拍域）。帧池归还、尾调重绑、trace 清场
-    /// 三处共用。
+    /// 复用旧句柄全灭）+ 插入日志清空（双域）+ 元素计数清空（帧域
+    /// elem_counts 保持既有权威）+ 平表/位集镜像同步（debug 对拍域
+    /// ——release 镜像此后无人读，读全走 vt）。帧池归还、尾调重绑、
+    /// trace 清场三处共用。
     pub(crate) fn reset_var_state(&mut self) {
         self.vt.reset();
         self.locals_order.clear();
-        self.locals.clear();
-        self.array_locals.clear();
         self.elem_counts.clear();
+        #[cfg(debug_assertions)]
+        {
+            self.locals.clear();
+            self.array_locals.clear();
+        }
     }
 
     /// 刷新帧表的表身份（推栈点——池化帧可换帧栈深度复用；协程 resume

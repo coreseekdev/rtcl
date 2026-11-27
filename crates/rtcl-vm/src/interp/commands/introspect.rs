@@ -304,8 +304,10 @@ pub fn cmd_collect(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         work.push(value.value.clone());
     }
     for frame in &interp.frames {
-        for value in frame.locals.values() {
-            work.push(value.clone());
+        // D1 步骤 2：帧名键面根快照走 vt（values 枚举——顺序不承载
+        // 语义；has_value 过滤与旧平表同域——旧 locals 无占位条目）。
+        for value in frame.vt.values().filter(|v| v.has_value()) {
+            work.push(value.value.clone());
         }
         for value in &frame.slots {
             if !value.is_unset() {

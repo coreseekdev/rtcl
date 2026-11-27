@@ -553,7 +553,11 @@ impl Interp {
                         if let Some(frame) = self.frames.last() {
                             let snames: Vec<String> = current_statics.keys().cloned().collect();
                             for sname in &snames {
-                                if let Some(val) = frame.locals.get(sname) {
+                                // D1 步骤 2：回写读走帧 vt（frame_local_get
+                                // ——vt 权威读 + debug 双读对拍）。
+                                if let Some(val) =
+                                    super::vars::frame_local_get(frame, sname)
+                                {
                                     Rc::make_mut(&mut current_statics).insert(sname.clone(), val.clone());
                                 }
                             }
@@ -722,7 +726,8 @@ impl Interp {
             if let Some(frame) = self.frames.last() {
                 let mut updated = Rc::clone(&current_statics);
                 for sname in updated.keys().cloned().collect::<Vec<_>>() {
-                    if let Some(val) = frame.locals.get(&sname) {
+                    // D1 步骤 2：回写读走帧 vt（frame_local_get 同上）。
+                    if let Some(val) = super::vars::frame_local_get(frame, &sname) {
                         Rc::make_mut(&mut updated).insert(sname, val.clone());
                     }
                 }

@@ -387,18 +387,157 @@ impl Interp {
 
 }
 
-/// Insert into a frame's locals, maintaining the frame's Tcl-order log.
+// ── D1 步骤 2：帧名键面——vt 权威 + 平表镜像双写（双读对拍）──────
+//
+// CallFrame.vt（TableId::Frame，形状 = 步骤 1 的 VarTable）是帧名键
+// 面的权威存储：**读走 vt**，debug 下每读同走平表镜像对拍（value 在
+// 席/数组基位逐项一致，release 零成本）；**写双写**（vt 权威，镜像
+// debug 同步——镜像在迁移期保持可独立应答对拍读，步骤 5 删除）。
+//
+// 位语义：有值 ⟺ 镜像 locals 含键（帧域无值条目只有数组基占位——
+// upvar 元素链对缺宿主的占位，proc.rs 的 flag-only mark）；ARRAY ⟺
+// 镜像 array_locals 含键。帧元素计数（elem_counts）与插入日志
+// （locals_order）保持既有权威（release 双域——T3 直列/array size
+// 仍读；日志与 vt 插入序的对拍在 debug 下并跑，顺序语义红线）。
+// upvar/链接面不动：链接键只在日志（frame_log_link），不入 vt。
+
+/// 单键两位对拍（debug）：vt 与平表镜像的 value 在席/数组基位。（帧
+/// 元素计数不在对拍域——elem_counts 保持既有权威，步骤 3 随元素表
+/// 并入 vt 才有对拍位。）release 零成本（cfg! 常量折叠掉镜像读）。
+#[inline]
+fn dcheck_frame_mirror(f: &CallFrame, key: &str) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let m = f.vt.get(key);
+    debug_assert_eq!(
+        m.is_some_and(|v| v.has_value()),
+        f.locals.contains_key(key),
+        "D1 对拍: frame value {key:?}"
+    );
+    debug_assert_eq!(
+        m.is_some_and(|v| v.is_array()),
+        f.array_locals.contains(key),
+        "D1 对拍: frame array flag {key:?}"
+    );
+}
+
+/// Frame-table read: the value of `key` (absent/valueless → None —
+/// phantom semantics, mirroring the old flat-map probe).  D1 步骤 2：
+/// vt 权威 + debug 双读对拍。
+#[inline]
+pub(crate) fn frame_local_get<'a>(f: &'a CallFrame, key: &str) -> Option<&'a Value> {
+    let v = f
+        .vt
+        .get(key)
+        .filter(|v| v.has_value())
+        .map(|v| &v.value);
+    debug_assert_eq!(
+        v.is_some(),
+        f.locals.contains_key(key),
+        "D1 对拍: frame read {key:?}"
+    );
+    v
+}
+
+/// Frame-table write cell: `key`'s value for in-place mutation (the
+/// caller replays the closure onto the debug mirror — same contract as
+/// the global-side `global_cell`).
+#[inline]
+pub(crate) fn frame_local_get_mut<'a>(
+    f: &'a mut CallFrame,
+    key: &str,
+) -> Option<&'a mut Value> {
+    let v = f
+        .vt
+        .get_mut(key)
+        .filter(|v| v.has_value())
+        .map(|v| &mut v.value);
+    debug_assert_eq!(
+        v.is_some(),
+        f.locals.contains_key(key),
+        "D1 对拍: frame cell {key:?}"
+    );
+    v
+}
+
+/// Frame-table presence (⟺ 镜像 locals 含键——「有值条目在表」）。
+#[inline]
+pub(crate) fn frame_local_contains(f: &CallFrame, key: &str) -> bool {
+    let has = f.vt.get(key).is_some_and(|v| v.has_value());
+    debug_assert_eq!(has, f.locals.contains_key(key), "D1 对拍: frame has {key:?}");
+    has
+}
+
+/// Frame-table array-base mark (⟺ 镜像 array_locals 含键).  经 vt 的
+/// 数组基快索引（T7 成本形保持——访问路径非平行存储）。
+#[inline]
+pub(crate) fn frame_local_is_array(f: &CallFrame, key: &str) -> bool {
+    let arr = f.vt.is_array_base(key);
+    debug_assert_eq!(
+        arr,
+        f.array_locals.contains(key),
+        "D1 对拍: frame is-array {key:?}"
+    );
+    arr
+}
+
+/// Insert into a frame's var table (vt 权威 land_value 单探测——有值
+/// 覆盖原位、无值占位上值 = 移位新建序位、新键追加；ARRAY/占位位逐
+/// 字保留), maintaining the frame's Tcl-order log.
 /// 返回是否新建（⟅ 插入序新增——调用方可免先行存在性探测）。
 pub(crate) fn frame_local_insert(f: &mut CallFrame, key: String, v: Value) -> bool {
-    let is_new = f.locals.insert(key.clone(), v).is_none();
-    if is_new {
-        f.locals_order.push(key);
+    #[cfg(debug_assertions)]
+    let was = f.locals.contains_key(&key);
+    let (_, arena_new) = f.vt.land_value(key.clone(), v);
+    #[cfg(debug_assertions)]
+    {
+        // 镜像值词从 vt 回拷（对拍域——结构双写 + 值逐字同；release
+        // 镜像不维护，读全部经 vt）。
+        f.locals
+            .insert(key.clone(), f.vt.get(&key).expect("landed").value.clone());
+        debug_assert_eq!(arena_new, !was, "D1 对拍: frame insert newness {key:?}");
     }
-    if f.locals_order.len() > 2 * f.locals.len() + 64 {
-        let live = |k: &str| f.locals.contains_key(k);
-        compact_order(&mut f.locals_order, &live);
+    if arena_new {
+        f.locals_order.push(key.clone());
     }
-    is_new
+    if f.locals_order.len() > 2 * f.vt.len() + 64 {
+        // 活性集先行收集（vt 有值键——镜像在席的权威域），日志压缩
+        // 期间不再借用 vt（compact_order 的 &str 谓词形保持）。
+        let live: std::collections::HashSet<String> = f
+            .vt
+            .order_entries()
+            .filter(|(_, v)| v.has_value())
+            .map(|(k, _)| k.as_ref().to_string())
+            .collect();
+        let livef = |k: &str| live.contains(k);
+        compact_order(&mut f.locals_order, &livef);
+    }
+    dcheck_frame_mirror(f, &key);
+    arena_new
+}
+
+/// Remove from a frame's var table (log entry goes stale, as above).
+/// 旧平表 map-remove 的逐字对应：返回值 = 被摘的**值**（有值条目才
+/// Some——旧 locals 无占位条目，flag-only 数组基占位摘除返回 None）；
+/// 终态 = 无条目（vt 的占位条目一并摘除，与镜像「无条目」同）。
+pub(crate) fn frame_local_remove(f: &mut CallFrame, key: &str) -> Option<Value> {
+    let had_value = f.vt.get(key).is_some_and(|v| v.has_value());
+    let v = if had_value {
+        Some(f.vt.remove(key).expect("valued entry").value)
+    } else {
+        // 占位条目（数组基 flag-only）一并摘——终态与镜像同（无条
+        // 目）；返回 None 与旧 map-remove 对无条目同形。
+        f.vt.remove(key);
+        None
+    };
+    #[cfg(debug_assertions)]
+    {
+        let from_map = f.locals.remove(key);
+        debug_assert_eq!(v.is_some(), from_map.is_some(), "D1 对拍: frame remove {key:?}");
+    }
+    dcheck_frame_mirror(f, key);
+    v
 }
 
 // ── T4 命名空间体快路径的键拼装 ─────────────────────────────────
@@ -451,21 +590,41 @@ fn stack_ns_elem_keys<'b>(
     Some((host, elem))
 }
 
-/// Remove from a frame's locals (log entry goes stale, as above).
-pub(crate) fn frame_local_remove(f: &mut CallFrame, key: &str) -> Option<Value> {
-    f.locals.remove(key)
-}
-
 /// Log a frame-table entry whose creation did not go through
 /// [`frame_local_insert`] — a `global`/`upvar`/`variable` link with
 /// nothing to mirror: tclsh's frame table holds the entry all the same
 /// (`global nosuch; info vars` lists nosuch), and the hash-order replay
 /// needs it in the creation sequence.  A name already logged keeps its
 /// entry (tclsh: a re-link keeps the table position).
+/// （D1 步骤 2：链接条目仍只入日志不入 vt——链接面步骤 3/4 迁移；
+/// 列举重放的 in_table 过滤含 upvars 键，行为不变。）
 pub(crate) fn frame_log_link(f: &mut CallFrame, key: &str) {
     if !f.locals_order.iter().any(|o| o == key) {
         f.locals_order.push(key.to_string());
     }
+}
+
+/// 数组基标记（帧域）：vt 位 + 快索引（权威）+ 镜像位（debug）；帧
+/// 元素计数不在此落（保持 elem_counts 既有权威——步骤 3 随元素表并
+/// 入）。无条目时 vt 建无值占位 Var（ARRAY 位先行——基键随后由
+/// loc_insert 落表，vt 的移位插入语义与日志 map-insert-new 逐字同）。
+pub(crate) fn frame_local_mark_array(f: &mut CallFrame, key: &str) {
+    f.vt.mark_array(key, None);
+    #[cfg(debug_assertions)]
+    {
+        f.array_locals.insert(key.to_string());
+    }
+    dcheck_frame_mirror(f, key);
+}
+
+/// 数组基摘标（位随标清——快索引/计数对账在 vt 内）。
+pub(crate) fn frame_local_unmark_array(f: &mut CallFrame, key: &str) {
+    f.vt.unmark_array(key);
+    #[cfg(debug_assertions)]
+    {
+        f.array_locals.remove(key);
+    }
+    dcheck_frame_mirror(f, key);
 }
 
 /// Bring an insertion log back to what the replay reads of it: the keys
@@ -938,10 +1097,10 @@ impl Interp {
                 if let Some(cv) = f.slots.get_mut(i) {
                     if !cv.is_unset() {
                         let taken = std::mem::replace(cv, Value::unset());
-                        f.locals.insert(name.clone(), taken);
-                        if !f.locals_order.iter().any(|o| o == name.as_str()) {
-                            f.locals_order.push(name.as_str().to_string());
-                        }
+                        // D1 步骤 2：名键面落 vt（权威）+ 镜像双写；序
+                        // 位语义与旧「map-insert-new + 日志查重」逐字
+                        // 同（vt land_value 单探测）。
+                        frame_local_insert(f, name.clone(), taken);
                     }
                 }
             }
@@ -1000,10 +1159,8 @@ impl Interp {
         };
         if !f.slots[i].is_unset() {
             let taken = std::mem::replace(&mut f.slots[i], Value::unset());
-            f.locals.insert(base.to_string(), taken);
-            if !f.locals_order.iter().any(|o| o == base) {
-                f.locals_order.push(base.to_string());
-            }
+            // D1 步骤 2：名键面落 vt（degrade_frame_local 同款单探测）。
+            frame_local_insert(f, base.to_string(), taken);
         }
         if f.slot_aliased.len() != f.slots.len() {
             f.slot_aliased.clear();
@@ -1075,7 +1232,7 @@ impl Interp {
                 // store (`degrade_frame_link_at`); the link itself is
                 // the existence (tclsh lists `global nosuch` with no
                 // value at all).
-                frame.locals.contains_key(name.as_str())
+                frame_local_contains(frame, name.as_str())
                     || frame.upvars.contains_key(name.as_str())
             } else {
                 match frame.slots.get(i) {
@@ -1083,8 +1240,8 @@ impl Interp {
                     // Name-keyed frame (tree walk / degraded unit): the
                     // map holds what exists, and a link exists by itself.
                     None => {
-                        frame.locals.contains_key(name.as_str())
-                            || frame.array_locals.contains(name.as_str())
+                        frame_local_contains(frame, name.as_str())
+                            || frame_local_is_array(frame, name.as_str())
                             || frame.upvars.contains_key(name.as_str())
                     }
                 }
@@ -1103,10 +1260,13 @@ impl Interp {
         //    nothing to mirror is a table entry all the same (logged at
         //    link time), and the link filter applies to the replayed
         //    output, not to the replayed population.
+        //    D1 步骤 2：在席判定走 vt（frame_local_contains——镜像在
+        //    席的权威读）；日志重放本身保持（release 直列源），vt 插
+        //    入序的对拍在下方 debug 块并跑（顺序语义红线迁移期并存）。
         let is_compiled: std::collections::HashSet<&str> =
             compiled.iter().map(|s| s.as_str()).collect();
         let in_table = |k: &str| {
-            frame.locals.contains_key(k) || frame.upvars.contains_key(k)
+            frame_local_contains(frame, k) || frame.upvars.contains_key(k)
         };
         let dyn_keys: Vec<&str> = frame
             .locals_order
@@ -1120,6 +1280,29 @@ impl Interp {
             if include_links || !linked(k) {
                 names.push(k.to_string());
             }
+        }
+        #[cfg(debug_assertions)]
+        {
+            // D1 步骤 2 顺序对拍：vt 插入序（有值条目）与日志重放
+            // （vt 在席过滤 + 保留末次出现）逐列同序——vt 的创建序语
+            // 义与日志重放等价的迁移期证明。链接条目只入日志（不在
+            // vt），两侧按「vt 有值成员」同域过滤。
+            let vt_seq: Vec<&str> = frame
+                .vt
+                .order_entries()
+                .filter(|(_, v)| v.has_value())
+                .map(|(k, _)| k.as_ref())
+                .collect();
+            let mut seen: std::collections::HashSet<&str> =
+                std::collections::HashSet::with_capacity(frame.locals_order.len());
+            let mut log_seq: Vec<&str> = Vec::with_capacity(vt_seq.len());
+            for k in frame.locals_order.iter().rev() {
+                if frame_local_contains(frame, k) && seen.insert(k.as_str()) {
+                    log_seq.push(k.as_str());
+                }
+            }
+            log_seq.reverse();
+            debug_assert_eq!(vt_seq, log_seq, "D1 对拍: frame 插入序");
         }
         names
     }
@@ -1321,10 +1504,12 @@ impl Interp {
     fn loc_is_array(&self, loc: &VarLoc) -> bool {
         match loc {
             VarLoc::Global(n) => self.global_is_array(n),
+            // D1 步骤 2：数组基位走 vt（frame_local_is_array——T7 成本
+            // 形保持）。
             VarLoc::Frame(i, n) => self
                 .frames
                 .get(*i)
-                .map(|f| f.array_locals.contains(n))
+                .map(|f| frame_local_is_array(f, n))
                 .unwrap_or(false),
         }
     }
@@ -1337,7 +1522,10 @@ impl Interp {
             VarLoc::Frame(i, n) => self
                 .frames
                 .get(*i)
-                .map(|f| f.locals.contains_key(n) || f.slot_value(n).is_some())
+                .map(|f| {
+                    // D1 步骤 2：在席判定走 vt（frame_local_contains）。
+                    frame_local_contains(f, n) || f.slot_value(n).is_some()
+                })
                 .unwrap_or(false),
         }
     }
@@ -1346,7 +1534,10 @@ impl Interp {
     fn loc_get(&self, loc: &VarLoc, key: &str) -> Option<&Value> {
         match loc {
             VarLoc::Global(_) => self.global_get(key),
-            VarLoc::Frame(i, _) => self.frames.get(*i).and_then(|f| f.locals.get(key)),
+            // D1 步骤 2：帧域读走 vt（frame_local_get——debug 双读对拍）。
+            VarLoc::Frame(i, _) => {
+                self.frames.get(*i).and_then(|f| frame_local_get(f, key))
+            }
         }
     }
 
@@ -1389,7 +1580,10 @@ impl Interp {
             }
             VarLoc::Frame(i, n) => {
                 if let Some(f) = self.frames.get_mut(*i) {
-                    f.array_locals.insert(n.clone());
+                    // D1 步骤 2：数组基位走 vt（frame_local_mark_array
+                    // ——权威位 + debug 镜像）；元素计数保持 elem_counts
+                    // 既有权威（步骤 3 随元素表并入）。
+                    frame_local_mark_array(f, n);
                     f.elem_counts.insert(n.clone(), 0);
                 }
             }
@@ -1471,19 +1665,22 @@ impl Interp {
             }
             VarLoc::Frame(i, _) => {
                 if let Some(f) = self.frames.get_mut(*i) {
-                    let keys: Vec<String> = f
-                        .locals
-                        .keys()
-                        .filter(|k| k.starts_with(&prefix) && k.ends_with(')'))
-                        .cloned()
+                    // D1 步骤 2：元素键枚举/摘除走 vt（keys_with_prefix
+                    // 插入序；摘除全量——旧平表 map-remove 的逐字对
+                    // 应，枚举序不承载语义——无 trace 触发在此）。
+                    let keys: Vec<Rc<str>> = f
+                        .vt
+                        .keys_with_prefix(&prefix)
+                        .into_iter()
+                        .filter(|k| k.ends_with(')'))
                         .collect();
                     for k in keys {
-                        f.locals.remove(&k);
+                        frame_local_remove(f, &k);
                     }
                     let base = loc.base_name().to_string();
-                    f.array_locals.remove(&base);
+                    frame_local_unmark_array(f, &base);
                     f.elem_counts.remove(&base);
-                    f.locals.remove(&base);
+                    frame_local_remove(f, &base);
                 }
                 if !self.array_defaults.is_empty() {
                     self.array_defaults.remove(&stamp_key(loc));
@@ -1582,7 +1779,7 @@ impl Interp {
                     // `namespace delete [namespace current]`).
                     UpvarLink::Global(gname) => self
                         .global_get(self.redirect_flat(gname.to_string()).as_str())
-                        .or_else(|| frame.locals.get(name)),
+                        .or_else(|| frame_local_get(frame, name)),
                     UpvarLink::Frame { frame_index, var_name } => {
                         // Link installation degrades the target frame, so
                         // the map probe is the live path; the slot consult
@@ -1593,7 +1790,7 @@ impl Interp {
                         // lives in get_var's tail, not here.
                         self.frames.get(*frame_index)
                             .and_then(|f| f.slot_value(var_name.as_str())
-                                .or_else(|| f.locals.get(var_name.as_str())))
+                                .or_else(|| frame_local_get(f, var_name.as_str())))
                     }
                     UpvarLink::Dead { target, was_global, .. } => {
                         // 全局死链回退 globals（目标已 unset 的 `variable`
@@ -1602,9 +1799,9 @@ impl Interp {
                         // ③④：帧占位 arr(1) vs 全局 arr(1)=2）。
                         if *was_global {
                             self.global_get(target.as_str())
-                                .or_else(|| frame.locals.get(name))
+                                .or_else(|| frame_local_get(frame, name))
                         } else {
-                            frame.locals.get(name)
+                            frame_local_get(frame, name)
                         }
                     }
                 };
@@ -1620,7 +1817,7 @@ impl Interp {
             }
             frame
                 .slot_value(name)
-                .or_else(|| frame.locals.get(name))
+                .or_else(|| frame_local_get(frame, name))
         } else {
             // Outside procs an unqualified name resolves ONLY in the
             // current namespace's own table (Tcl 9: TclLookupSimpleVar
@@ -1755,8 +1952,10 @@ impl Interp {
                 })
                 .collect();
             for n in dead {
-                f.locals.remove(&n);
-                f.array_locals.remove(&n);
+                // D1 步骤 2：种子摘除走 vt（全量——有值/占位皆去）+
+                // 数组基位摘标（镜像同步在咽喉内）。
+                frame_local_remove(f, &n);
+                frame_local_unmark_array(f, &n);
             }
         }
     }
@@ -1788,13 +1987,13 @@ impl Interp {
                 }
                 UpvarLink::Frame { frame_index, var_name } => {
                     if let Some(f) = self.frames.get_mut(frame_index) {
-                        f.locals.remove(&var_name);
+                        frame_local_remove(f, &var_name);
                     }
                 }
                 // Unset through a dead alias keeps its pre-deletion
                 // behavior (removes the seeded local copy).
                 UpvarLink::Dead { .. } => {
-                    self.frames[frame_idx].locals.remove(name);
+                    frame_local_remove(&mut self.frames[frame_idx], name);
                 }
             }
         } else {
@@ -1804,7 +2003,7 @@ impl Interp {
                 // compiledLocal's Var is cleared, the table entry stays).
                 Some(i) => f.slots[i] = Value::unset(),
                 None => {
-                    f.locals.remove(name);
+                    frame_local_remove(f, name);
                 }
             }
         }
@@ -1908,7 +2107,7 @@ impl Interp {
                 && self.ns_transient.iter().all(|(k, _)| k != array_name)
             {
                 if let Some(frame) = self.var_frame() {
-                    if frame.array_locals.contains(array_name)
+                    if frame_local_is_array(frame, array_name)
                         && (frame.upvars.is_empty()
                             || !frame.upvars.contains_key(array_name))
                     {
@@ -1916,7 +2115,7 @@ impl Interp {
                         // 组带默认值 -> 返回默认（不物化：info exists/
                         // array size 不动；append/incr/lappend 的读同获
                         // 默认）。已有元素永远优先。
-                        if let Some(v) = frame.locals.get(name) {
+                        if let Some(v) = frame_local_get(frame, name) {
                             return Ok(v);
                         }
                         if let Some(dv) = self.array_default_ref(array_name) {
@@ -2028,10 +2227,8 @@ impl Interp {
                             }
                             return Ok(sv);
                         }
-                        if let Some(v) = frame.locals.get(name) {
-                            if !frame.array_locals.is_empty()
-                                && frame.array_locals.contains(name)
-                            {
+                        if let Some(v) = frame_local_get(frame, name) {
+                            if frame_local_is_array(frame, name) {
                                 return Err(Error::runtime(
                                     format!("can't read \"{}\": variable is array", name),
                                     ErrorCode::Generic,
@@ -2294,14 +2491,26 @@ impl Interp {
             {
                 let mut wrote = false;
                 if let Some(frame) = self.var_frame_mut() {
-                    if frame.array_locals.contains(array_name)
+                    if frame_local_is_array(frame, array_name)
                         && (frame.upvars.is_empty()
                             || !frame.upvars.contains_key(array_name))
                     {
-                        if let Some(slot) = frame.locals.get_mut(name) {
-                            *slot = value.clone();
-                            wrote = true;
+                        // D1 步骤 2：vt 权威格写 + 镜像重放（值词赋值可
+                        // 重放——对拍域）。
+                        let landed = match frame_local_get_mut(frame, name) {
+                            Some(cell) => {
+                                *cell = value.clone();
+                                true
+                            }
+                            None => false,
+                        };
+                        #[cfg(debug_assertions)]
+                        if landed {
+                            if let Some(cell) = frame.locals.get_mut(name) {
+                                *cell = value.clone();
+                            }
                         }
+                        wrote = landed;
                     }
                 } else if self.current_namespace.as_ref() == "::"
                     && self.global_is_array(array_name)
@@ -2395,7 +2604,7 @@ impl Interp {
                 let mut wrote = false;
                 if let Some(frame) = self.var_frame_mut() {
                     if (frame.upvars.is_empty() || !frame.upvars.contains_key(name))
-                        && (frame.array_locals.is_empty() || !frame.array_locals.contains(name))
+                        && !frame_local_is_array(frame, name)
                     {
                         match frame.slot_index_of(name) {
                             // Slotted name: write the cell (creation of an
@@ -2406,10 +2615,21 @@ impl Interp {
                                 wrote = true;
                             }
                             None => {
-                                if let Some(slot) = frame.locals.get_mut(name) {
-                                    *slot = value.clone();
-                                    wrote = true;
+                                // D1 步骤 2：vt 权威格写 + 镜像重放。
+                                let landed = match frame_local_get_mut(frame, name) {
+                                    Some(cell) => {
+                                        *cell = value.clone();
+                                        true
+                                    }
+                                    None => false,
+                                };
+                                #[cfg(debug_assertions)]
+                                if landed {
+                                    if let Some(cell) = frame.locals.get_mut(name) {
+                                        *cell = value.clone();
+                                    }
                                 }
+                                wrote = landed;
                             }
                         }
                     }
@@ -2542,7 +2762,9 @@ impl Interp {
             if !frame.upvars.is_empty() && frame.upvars.contains_key(name) {
                 return None;
             }
-            if !frame.array_locals.is_empty() && frame.array_locals.contains(name) {
+            // D1 步骤 2：数组基位读走 vt（frame_local_is_array——权威
+            // 位；成本形 = 旧 array_locals 空集守卫的快索引探测）。
+            if frame_local_is_array(frame, name) {
                 return None;
             }
             match frame.slot_index_of(name) {
@@ -2555,7 +2777,20 @@ impl Interp {
                     }
                     Some(f(cell))
                 }
-                None => frame.locals.get_mut(name).map(|cell| f(cell)),
+                // D1 步骤 2：vt 权威格 + 镜像重放（`f` 对格可重放且
+                // 「改格 ⟺ Some」——incr 的 as_int/checked_add 前置、
+                // append 的 rep 前置拒绝都在改格之前；global_cell 的
+                // 无条件重放同语义）。重放按 r 在席门（release 无警）。
+                None => {
+                    let r = frame_local_get_mut(frame, name).map(|cell| f(cell));
+                    #[cfg(debug_assertions)]
+                    if r.is_some() {
+                        if let Some(cell) = frame.locals.get_mut(name) {
+                            let _ = f(cell);
+                        }
+                    }
+                    r
+                }
             }
         } else {
             if !self.flat_aliases.is_empty() || !self.ns_transient.is_empty() {
@@ -2646,7 +2881,8 @@ impl Interp {
             // global (resolve_var consults the global first); the seed
             // only keeps a mid-proc-deleted namespace variable readable.
             if let Some(frame) = self.var_frame_mut() {
-                frame.locals.remove(name);
+                // D1 步骤 2：种子持有摘除走 vt（全量摘除）。
+                frame_local_remove(frame, name);
             }
             return self.global_cell(&key, f);
         }
@@ -2881,16 +3117,22 @@ impl Interp {
             }
             let next;
             if let Some(frame) = self.var_frame_mut() {
-                if !(frame.array_locals.contains(array_name)
+                if !(frame_local_is_array(frame, array_name)
                     && (frame.upvars.is_empty()
                         || !frame.upvars.contains_key(array_name)))
                 {
                     return None;
                 }
-                let cell = frame.locals.get_mut(name)?;
+                // D1 步骤 2：vt 权威格 + 镜像重放（from_int 确定性；
+                // 前置 ? 早退不触重放——与格未改同形）。
+                let cell = frame_local_get_mut(frame, name)?;
                 let current = cell.as_int()?;
                 next = current.checked_add(amount)?;
                 *cell = Value::from_int(next);
+                #[cfg(debug_assertions)]
+                if let Some(cell) = frame.locals.get_mut(name) {
+                    *cell = Value::from_int(next);
+                }
             } else {
                 if self.current_namespace.as_ref() != "::"
                     || !self.global_is_array(array_name)
@@ -3131,11 +3373,12 @@ impl Interp {
                 && self.ns_transient.iter().all(|(k, _)| k != array_name)
             {
                 if let Some(frame) = self.var_frame() {
-                    if frame.array_locals.contains(array_name)
+                    if frame_local_is_array(frame, array_name)
                         && (frame.upvars.is_empty()
                             || !frame.upvars.contains_key(array_name))
                     {
-                        return frame.locals.contains_key(name);
+                        // D1 步骤 2：元素在席判定走 vt（frame_local_contains）。
+                        return frame_local_contains(frame, name);
                     }
                 } else if self.current_namespace.as_ref() == "::"
                     && self.global_is_array(array_name)
@@ -3527,7 +3770,8 @@ impl Interp {
         let key = self.array_stamp_key(base);
         let gen0 = self.array_generation;
         let alive = |t: &Self| match owner_fi {
-            Some(i) => t.frames.get(i).map(|f| f.locals.contains_key(base)),
+            // D1 步骤 2：宿主在席判定走 vt（frame_local_contains）。
+            Some(i) => t.frames.get(i).map(|f| frame_local_contains(f, base)),
             None => Some(t.global_has(base)),
         };
         let (whole, elems) = self.collect_trace_scripts(&key, Some(elem), "read");
@@ -3559,7 +3803,8 @@ impl Interp {
         }
         let ekey = format!("{}({})", base, elem);
         Ok(match owner_fi {
-            Some(i) => self.frames.get(i).and_then(|f| f.locals.get(&ekey)).cloned(),
+            // D1 步骤 2：元素读走 vt（frame_local_get）。
+            Some(i) => self.frames.get(i).and_then(|f| frame_local_get(f, &ekey)).cloned(),
             None => self.global_get(&ekey).cloned(),
         })
     }
@@ -3633,7 +3878,7 @@ impl Interp {
             for (name, link) in f.upvars.iter() {
                 if let UpvarLink::Global(g) = link {
                     if g.trim_start_matches(':').starts_with(norm_prefix)
-                        && !f.locals.contains_key(&**name)
+                        && !frame_local_contains(f, name)
                     {
                         to_seed.push((fi, Rc::clone(name), g.to_string()));
                     }
@@ -3710,8 +3955,9 @@ impl Interp {
             // `can't read/unset "fv": no such variable`、exists 0).
             if !inside_tree {
                 for n in dead {
-                    f.locals.remove(&n);
-                    f.array_locals.remove(&n);
+                    // D1 步骤 2：死链种子摘除走 vt（全量）+ 数组基位摘标。
+                    frame_local_remove(f, &n);
+                    frame_local_unmark_array(f, &n);
                 }
             }
         }
@@ -3946,6 +4192,8 @@ impl Interp {
     pub(crate) fn array_element_count(&self, name: &str) -> Option<usize> {
         let (owner_fi, base) = self.array_owner(name);
         match owner_fi {
+            // 帧域计数保持 elem_counts 既有权威（步骤 3 随元素表并入
+            // vt 的 elem_count 字段）。
             Some(i) => self
                 .frames
                 .get(i)
@@ -4063,8 +4311,11 @@ impl Interp {
                 .frames
                 .get(*i)
                 .map(|f| {
-                    let n = f.locals.len();
-                    collect(&f.locals_order, &|k| f.locals.contains_key(k), n)
+                    // D1 步骤 2：活性计数/过滤走 vt（frame_local_contains
+                    // ——镜像在席的权威读；日志重放保持，vt 插入序的对
+                    // 拍在 debug 块并跑）。
+                    let n = f.vt.len();
+                    collect(&f.locals_order, &|k| frame_local_contains(f, k), n)
                 })
                 .unwrap_or_default(),
         }

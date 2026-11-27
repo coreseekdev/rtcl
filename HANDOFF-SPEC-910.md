@@ -291,11 +291,11 @@ doc/*.n 章节）。
       类对象（Obj15-19：oo::singleton、oo::SingletonInstance、
       oo::abstract、::oo::configuresupport::configurable、
       oo::configurable），首个用户对象才是 Obj20。
-    - rtcl 目前也没有 abstract/singleton/configurable/property 这套
-      bootstrap。规格已按用户裁定钉 Obj20；代码面要么补齐这 9 个
-      可观察对象（推荐，因为 `info class instances oo::Slot`、
-      `oo::singleton` 等都可观察），要么至少把计数器推到 19。本任务
-      不改码，登记为 T6 实现缺口。
+    - 2026-11-27 已**真实创建** Obj15-19（见 §10）；首用户对象现为
+      `::oo::Obj20`。abstract 的 create/new 报 unknown method，singleton
+      的 new 返回唯一实例。property/classvariable 的**行为**仍未实现
+      （类对象已在，但 property 定义方言/classvariable 命令未接），属
+      T6 代码面后续。
     - 9 个对象的规格已落地（oo.allium）：
       `BootstrapPropertySlotObjects`（Obj11-14）、
       `BootstrapAdditionalClassObjects`（Obj15-19）、
@@ -471,7 +471,26 @@ doc/*.n 章节）。
   77 条依赖 `-- after:` 前态/多行的规则保持伪代码形态。
 - 已修：io/variables/matching/oo/interp/memory 的头部锚与覆盖范围；
   expr/error-deep/matching 的 8.6-only 注释；io 的 D-30→D-29 引用。
-- 唯一已知代码缺口：rtcl OO bootstrap 首用户对象 `Obj11` vs 规格
-  `Obj20`（§7-15）。properties/classvariable 已确认在 9.1.0 可用
-  （此前测错上下文，已修正，§7-10）。
+- 代码缺口：OO bootstrap 已对齐（§10）；仍缺 property/classvariable
+  的**运行时行为**（规格已按 9.1 钉，代码未接）。
 
+
+## 10. 代码对齐（2026-11-27）
+
+按要求“真实创建”9 个 bootstrap 对象：
+
+- `crates/rtcl-vm/src/interp/commands/oo.rs`：
+  - Obj15 `oo::singleton`、Obj16 `oo::SingletonInstance`、Obj17
+    `oo::abstract`、Obj18 `::oo::configuresupport::configurable`、
+    Obj19 `oo::configurable` 进入 classes 表并注册对象命令；
+  - `OoClass` 增 `abstract_class`/`singleton_class`/`singleton_instance`：
+    `oo::abstract create` 出的类禁 create/new，`oo::singleton create`
+    出的类 new 返回唯一实例、create 报错；
+  - `next_obj_id = 19`，首个用户对象为 `::oo::Obj20`；
+  - 新增单测 `test_oo_9_1_bootstrap_objects`，原 Obj15 断言改 Obj20。
+- 验证：`cargo test -p rtcl-vm --lib` 871 passed；新单测覆盖
+  Obj11-19、类层次、Slot 11 实例、abstract/singleton 行为。
+- judge：`94 pass / 1 fail`，失败项 `gen/gen_lseq`（lseq-4.11，
+  `lindex [lseq 0x7fffffff] 0x80000000`）与本次 OO 改动无关，单独记录。
+- 仍未接：`property` 定义方言与 `classvariable` 方法内命令的运行时
+  行为（`oo::configurable`/属性 slot 对象已就位，规格已钉 9.1 语义）。

@@ -1136,13 +1136,15 @@ fn exec_bytecode_with(
         let n = code.locals().len();
         // aliased 初值 = 已是全局数组的名字（与 top_invalidate 同一规则
         // ——槽 op 对数组名一律回落名路径，is-array 错误归属全链）。
-        let aliased: Vec<bool> = if interp.array_globals.is_empty() {
-            vec![false; n]
-        } else {
+        // D1 步骤 1：数组位读经 arena（global_any_array/global_is_array
+        // ——守卫语义与旧 is_empty 全等）。
+        let aliased: Vec<bool> = if interp.global_any_array() {
             code.locals()
                 .iter()
-                .map(|nm| interp.array_globals.contains(nm.as_str()))
+                .map(|nm| interp.global_is_array(nm.as_str()))
                 .collect()
+        } else {
+            vec![false; n]
         };
         interp.top_slots = Some(crate::interp::TopSlots {
             names: code.locals().to_vec(),
@@ -2702,11 +2704,14 @@ fn lappend_var_impl(
     value: Value,
 ) -> Result<Value> {
     let name = code.get_const(name_idx).unwrap_or("");
-    if let Some(v) = interp.var_slot_fast(name) {
-        if let Some(items) = v.as_list_mut() {
-            items.push(value);
-            return Ok(v.clone());
-        }
+    // D1 步骤 1：with_var_slot（全局臂双写 arena + 镜像重放——闭包对
+    // 被捕获的 value 取 clone，重放确定性成立）。
+    if let Some(v) = interp.with_var_slot(name, |cell| {
+        let items = cell.as_list_mut()?;
+        items.push(value.clone());
+        Some(cell.clone())
+    }) {
+        return Ok(v);
     }
     let args = [
         Value::from_str("lappend"),

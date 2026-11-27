@@ -1473,9 +1473,12 @@ impl Interp {
                     // `fw g`（forward 目标缺命令走标准 not-found 链）靠
                     // 它补齐 r4 行。默认臂此前不落表（has_unknown 只认
                     // 用户 proc/ensemble）——移到两臂共用的前位。
-                    if !self.globals.contains_key("auto_index") {
+                    // D1 步骤 1：读经 arena（global_has），数组位经
+                    // global_mark_array（flag-only——与旧「只插
+                    // array_globals 不落计数」逐字同）。
+                    if !self.global_has("auto_index") {
                         self.global_insert("auto_index".to_string(), Value::empty());
-                        self.array_globals.insert("auto_index".to_string());
+                        self.global_mark_array("auto_index", None);
                     }
                     let has_unknown = self.procs.contains_key("unknown")
                         || self.procs.contains_key("::unknown")
@@ -1779,8 +1782,7 @@ impl Interp {
         // 裸消息）；-errorcode = 解析错误的 TCL PARSE EXPR <CLASS>
         // 抬升码（err_code_raised 已装全局），其余按变体派生。
         let tec = if self.err_code_raised {
-            self.globals
-                .get("errorCode")
+            self.global_get("errorCode")
                 .map(|v| v.as_str().to_string())
                 .unwrap_or_else(|| e.tcl_error_code())
         } else {

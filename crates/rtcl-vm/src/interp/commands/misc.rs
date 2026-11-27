@@ -640,7 +640,8 @@ pub fn cmd_unset(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // A swallowed "no such variable" must not leave the lookup
             // errorCode behind (tclsh: `unset -nocomplain missing` does not
             // touch ::errorCode).
-            let saved_code = interp.globals.get("errorCode").cloned();
+            // D1 步骤 1：读经 arena、删经 global_remove（双删）。
+            let saved_code = interp.global_get("errorCode").cloned();
             let saved_raised = interp.err_code_raised;
             if interp.unset_var(name).is_err() {
                 match saved_code {
@@ -648,7 +649,7 @@ pub fn cmd_unset(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         interp.global_insert("errorCode".to_string(), v);
                     }
                     None => {
-                        interp.globals.remove("errorCode");
+                        interp.global_remove("errorCode");
                     }
                 }
                 interp.err_code_raised = saved_raised;
@@ -2222,7 +2223,9 @@ pub fn cmd_append(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // variable's creation and its errors, other representations (an
     // integer, a list), links, arrays, and traced variables, whose write
     // traces `set_var` fires.
-    if let Some(slot) = interp.var_slot_fast(var_name) {
+    // D1 步骤 1：with_var_slot（全局臂双写 arena + 镜像重放——闭包
+    // 逐 arg 追加、对 args 纯读，重放确定性成立）。
+    if let Some(v) = interp.with_var_slot(var_name, |slot| {
         let mut in_place = true;
         for arg in &args[2..] {
             if !slot.append_str_in_place(arg.as_str()) {
@@ -2230,13 +2233,13 @@ pub fn cmd_append(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 break;
             }
         }
-        if in_place {
-            return Ok(slot.clone());
-        }
-        // A value that is not a plain string: what was appended so far
-        // is nothing (the first non-string value stopped the loop before
-        // any change), and the rebuild below reads it as it is.
+        in_place.then(|| slot.clone())
+    }) {
+        return Ok(v);
     }
+    // A value that is not a plain string: what was appended so far
+    // is nothing (the first non-string value stopped the loop before
+    // any change), and the rebuild below reads it as it is.
     // T7 vars: element fast path — an existing element whose flat key is
     // the name as spelled (frame array-local, or a global array at "::"),
     // no traces, holding a plain string: append to the cell's own buffer
@@ -2256,28 +2259,40 @@ pub fn cmd_append(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     && (frame.upvars.is_empty()
                         || !frame.upvars.contains_key(array_name))
                 {
-                    frame.locals.get_mut(var_name)
+                    frame.locals.get_mut(var_name).map(|c| {
+                        // 帧局部格：闭包单次施加。
+                        let mut in_place = true;
+                        for arg in &args[2..] {
+                            if !c.append_str_in_place(arg.as_str()) {
+                                in_place = false;
+                                break;
+                            }
+                        }
+                        in_place.then(|| c.clone())
+                    })
                 } else {
                     None
                 }
             } else if interp.current_namespace.as_ref() == "::"
-                && interp.array_globals.contains(array_name)
+                && interp.global_is_array(array_name)
             {
-                interp.globals.get_mut(var_name)
+                // D1 步骤 1：arena 权威格 + 镜像重放（global_cell）。
+                interp.global_cell(var_name, |c| {
+                    let mut in_place = true;
+                    for arg in &args[2..] {
+                        if !c.append_str_in_place(arg.as_str()) {
+                            in_place = false;
+                            break;
+                        }
+                    }
+                    in_place.then(|| c.clone())
+                })
             } else {
                 None
             };
-            if let Some(slot) = slot {
-                let mut in_place = true;
-                for arg in &args[2..] {
-                    if !slot.append_str_in_place(arg.as_str()) {
-                        in_place = false;
-                        break;
-                    }
-                }
-                if in_place {
-                    return Ok(slot.clone());
-                }
+            let slot = slot.flatten();
+            if let Some(v) = slot {
+                return Ok(v);
             }
         }
     }
@@ -4049,8 +4064,8 @@ pub fn cmd_tcl_bgerror(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // of the lookup itself.
     // Read off the tables: a `get_var` of an unset variable raises, and
     // that would install its own errorCode.
-    let saved_code = interp.globals.get("errorCode").cloned();
-    let saved_info = interp.globals.get("errorInfo").cloned();
+    let saved_code = interp.global_get("errorCode").cloned();
+    let saved_info = interp.global_get("errorInfo").cloned();
     let handler_args = [Value::from_str("bgerror"), msg.clone()];
     let r = interp.dispatch_values(&handler_args);
     if let Err(e) = &r {
@@ -4072,7 +4087,7 @@ pub fn cmd_tcl_bgerror(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         // a variable that never existed is itself an error,
                         // and raises that errorCode.
                         None => {
-                            if interp.globals.contains_key(key) {
+                            if interp.global_has(key) {
                                 let _ = interp.unset_var(name);
                             }
                         }

@@ -299,8 +299,9 @@ pub fn cmd_collect(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // Snapshot the roots first: the mark phase only needs clones, and
     // finalizers below must run without any borrow of the tables held.
     let mut work: Vec<Value> = Vec::new();
-    for value in interp.globals.values() {
-        work.push(value.clone());
+    // D1 步骤 1：根快照读经 arena（values 枚举——顺序不承载语义）。
+    for value in interp.var_arena.root().values() {
+        work.push(value.value.clone());
     }
     for frame in &interp.frames {
         for value in frame.locals.values() {

@@ -22,6 +22,10 @@ mod vm_bridge;
 mod vm_exec;
 pub(crate) mod util;
 mod varmap;
+// D1 变量表重写步骤 1（specs/ARCH-DESIGN-20261126.md D1）：基础设施先
+// 落（本模块自带测试）；读写面接线在步骤 1 迁移提交接入——接线后该
+// 模块顶部的 dead_code 暂免收窄到未接线句柄 API。
+pub(crate) mod vararena;
 pub(crate) mod tclhash;
 pub(crate) mod dbgtrace;
 
@@ -502,6 +506,13 @@ fn default_max_call_depth() -> usize {
 }
 
 pub struct Interp {
+    /// D1 步骤 1（specs/ARCH-DESIGN-20261126.md D1）：全局变量表
+    /// arena——`globals` 平表 + `phantom_globals` + `array_globals`
+    /// （连带全局域 `elem_counts`）三合一的权威存储。读写经 vars.rs
+    /// 的 global_* 咽喉（读 arena + debug 双读对拍；写双写）；本批只
+    /// 装配 0 号根表（::，平键域与 `globals` 同域——链接/死链面的键
+    /// 天然兼容），每命名空间一张的拆分随步骤 2/3。
+    pub(crate) var_arena: vararena::VarArena,
     /// Variables (global scope).
     pub(crate) globals: VarMap<Value>,
     /// 顶层 slot 单元执行中（Some = 激活；exec_bytecode 进出管理）。
@@ -1181,6 +1192,7 @@ impl Interp {
     /// Create a new interpreter.
     pub fn new() -> Self {
         let mut interp = Interp {
+            var_arena: vararena::VarArena::new(),
             globals: VarMap::default(),
             array_globals: VarSet::default(),
             arrays_env_only: true,
@@ -1819,24 +1831,28 @@ impl Interp {
             "tcl_platform(user)".to_string(),
             Value::from_str(&std::env::var("USER").unwrap_or_default()),
         );
-        self.array_globals.insert("tcl_platform".to_string());
-        self.array_globals.insert("env".to_string());
-        self.arrays_env_only = true;
-        // P5: seed the live element counts for the two startup arrays
-        // (their element keys were inserted above without the vars.rs
-        // element-write path).
+        // D1 步骤 1：两个启动数组的位/计数入 arena（global_mark_array
+        // ——只落位与计数，不进插入日志；基键落表仍在下方 global_insert，
+        // 启动插入序红线不动）。env 无 env 特性时无计数（与旧平表同形）。
+        {
+            // D1 步骤 1：元素计数经 arena 前缀扫描（release 镜像退场
+            // ——globals 平表 debug 域才有维护）。
+            let n = self
+                .var_arena
+                .root()
+                .keys_with_prefix("tcl_platform(")
+                .len();
+            self.global_mark_array("tcl_platform", Some(n as u32));
+        }
         #[cfg(feature = "env")]
         {
-            self.elem_counts.insert("env".to_string(), env_elems);
+            self.global_mark_array("env", Some(env_elems as u32));
         }
+        #[cfg(not(feature = "env"))]
         {
-            let n = self
-                .globals
-                .keys()
-                .filter(|k| k.starts_with("tcl_platform(") && k.ends_with(')'))
-                .count();
-            self.elem_counts.insert("tcl_platform".to_string(), n);
+            self.global_mark_array("env", None);
         }
+        self.arrays_env_only = true;
 
         // --- :: var table in tclsh's iteration order ---
         // ::auto_index 惰性首建（2026-11-16 var-order 轮）：tclsh 文件

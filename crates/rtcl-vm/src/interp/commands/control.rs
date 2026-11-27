@@ -1093,9 +1093,9 @@ pub fn cmd_catch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // 标志却在 code==1 无条件重派生，把抬升点码打回 NONE
             // （join-2.3 回归根因）。无抬升码才走变体派生。
             let raised_code = if interp.err_code_raised {
+                // D1 步骤 1：读经 arena。
                 let rc = interp
-                    .globals
-                    .get("errorCode")
+                    .global_get("errorCode")
                     .map(|v| v.as_str().to_string());
                 // return -errorcode 载荷不落 ::errorCode（tclsh ec1/ec2
                 // 实证）——其经 return_with_options 的 error_code 槽

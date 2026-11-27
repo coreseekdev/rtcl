@@ -294,15 +294,12 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // Resolve through upvar links to the owning table (`upvar a
             // x; array get x` lists the target's elements).
             let (owner_fi, base) = interp.array_owner(array_name);
-            let prefix = format!("{}(", base);
-            let table = match owner_fi {
-                Some(i) => &interp.frames[i].locals,
-                None => &interp.globals,
-            };
             // Element-name snapshot: callbacks that add elements during
             // the get don't join this enumeration (trace-1.11: the read
             // trace's `set x(foo) 1` never shows up in the same get).
             // Tcl hash order via the scope's insertion-log replay.
+            // D1 步骤 1：元素名快照走 array_element_names（日志重放序
+            // 保持）；原 table/prefix 绑定在本臂已无读者，删除。
             let vars: Vec<String> = interp
                 .array_element_names(array_name)
                 .into_iter()
@@ -370,12 +367,24 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let listed = {
                 let (owner_fi, base) = interp.array_owner(array_name);
                 let prefix = format!("{}(", base);
-                let table = match owner_fi {
-                    Some(i) => &interp.frames[i].locals,
-                    None => &interp.globals,
-                };
+                // D1 步骤 1：元素在席扫描经 arena（帧域不变；全局域
+                // order_entries 前缀过滤——序不承载语义）。
                 interp.is_array_semantic(array_name)
-                    || table.keys().any(|k| k.starts_with(&prefix) && k.ends_with(')'))
+                    || match owner_fi {
+                        Some(i) => interp.frames[i]
+                            .locals
+                            .keys()
+                            .any(|k| k.starts_with(&prefix) && k.ends_with(')')),
+                        None => interp
+                            .var_arena
+                            .root()
+                            .order_entries()
+                            .any(|(k, v)| {
+                                v.has_value()
+                                    && k.as_ref().starts_with(&prefix)
+                                    && k.as_ref().ends_with(')')
+                            }),
+                    }
             };
             #[cfg(feature = "regexp")]
             let regex_engine: Option<std::rc::Rc<super::regexp_cmds::CachedEngine>> =
@@ -649,26 +658,41 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let (owner_fi, base) = interp.array_owner(array_name);
             let prefix = format!("{}(", base);
             let pattern = if args.len() > 3 { Some(args[3].as_str()) } else { None };
-            let table = match owner_fi {
-                Some(i) => &interp.frames[i].locals,
-                None => &interp.globals,
-            };
-            let elements_to_remove: Vec<String> = table
-                .keys()
-                .filter(|k| {
-                    if k.starts_with(&prefix) && k.ends_with(')') {
-                        if let Some(pat) = pattern {
-                            let elem = &k[prefix.len()..k.len() - 1];
-                            glob_match(pat, elem)
+            // D1 步骤 1：枚举经 arena（插入序；release 镜像退场后唯一
+            // 真源）。逐元素 unset trace 的触发序随之 = 插入序（与旧映
+            // 射迭代序不同源——judge 语料钉形验证）。
+            let elements_to_remove: Vec<String> = match owner_fi {
+                Some(i) => interp.frames[i]
+                    .locals
+                    .keys()
+                    .filter(|k| {
+                        if k.starts_with(&prefix) && k.ends_with(')') {
+                            match pattern {
+                                Some(pat) => glob_match(pat, &k[prefix.len()..k.len() - 1]),
+                                None => true,
+                            }
                         } else {
-                            true
+                            false
                         }
-                    } else {
-                        false
-                    }
-                })
-                .map(|k| k[prefix.len()..k.len() - 1].to_string())
-                .collect();
+                    })
+                    .map(|k| k[prefix.len()..k.len() - 1].to_string())
+                    .collect(),
+                None => interp
+                    .var_arena
+                    .root()
+                    .order_entries()
+                    .filter(|(k, v)| {
+                        v.has_value()
+                            && k.as_ref().starts_with(&prefix)
+                            && k.as_ref().ends_with(')')
+                    })
+                    .filter(|(k, _)| match pattern {
+                        Some(pat) => glob_match(pat, &k.as_ref()[prefix.len()..k.as_ref().len() - 1]),
+                        None => true,
+                    })
+                    .map(|(k, _)| k.as_ref()[prefix.len()..k.as_ref().len() - 1].to_string())
+                    .collect(),
+            };
             if pattern.is_none() {
                 // tclsh：无 pattern 的 array unset = 整数组 unset——变量
                 // 本身移除（D-35）、一次 {a {} unset}（n2= 空，9.1 实测）

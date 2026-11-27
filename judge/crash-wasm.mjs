@@ -164,8 +164,12 @@ await check('silent: + overflows exactly',        '+ 9223372036854775807 1', /ok
 // 9 语法迁移是另一批），故错误仍在、词面随 C16 换新）。
 await check('silent: octal 018 is invalid',       'catch {set v 018; expr {$v + 0}} e; set e', /non-numeric string/);
 // A `#` in an expression: the checker scanned it as a comment and looped.
-await check('hang: # in an expression',           'catch {expr {3 #}} e; set e', new RegExp(String.raw`invalid character \\"#\\"`));
-await check('hang: # after an operand',           'catch {expr {1 + #}} e; set e', new RegExp(String.raw`invalid character \\"#\\"`));
+// E3 重钉（TIP582 落地后）：9.1 起 `#` 是合法行注释——`expr {3 #}` 求值
+// 为 3，`expr {1 + #}` 注释吃到串尾报 missing operand（oracle 实测同
+// 词面）；旧钉的 invalid character "#" 是 8.6 词法，随 TIP582 退役。
+await check('tip582: # trailing comment',         'catch {expr {3 #}} e; set e', /ok:"3"/);
+await check('tip582: # eats to eol then missing operand',
+    'catch {expr {1 + #}} e; set e', /missing operand at _@_/);
 // A `tailcall` naming a non-proc: logged by the dispatcher, the words as
 // written, the command looked up where the tailcall ran.
 await check('silent: tailcall error is logged',   'proc p1 {} { tailcall error x3 }; catch {p1} e o; dict get $o -errorinfo', new RegExp(String.raw`while executing\\n\\"error x3\\"\\n {4}invoked from within\\n\\"p1\\"`));

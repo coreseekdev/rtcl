@@ -2950,3 +2950,33 @@ sweep 12 既有、workspace **cargo exit 0**（rtcl-vm 871/0）、wasm32 ✓、
   回收）。行为序变化面（登记）：`array unset <pattern>` 逐元素 trace
   触发序、oo copy 复制序从 HashMap 迭代序换 arena 插入序——judge 语料
   证实两处旧序未被钉。
+
+## D1 步骤 2——帧变量表迁入 VarArena（task/d1-vars2 @ e808a36，2026-11-28，子代理施工）
+
+- **帧表形状**：VarTable 驻 CallFrame.vt（不驻 arena vec——协程排水把
+  整帧 Box<CallFrame> 移入 record、恢复重推，表必须随帧走）；池化
+  归还/尾调重绑/trace 清场三处清空收敛为 reset_var_state（整表清空+
+  逐槽代数+1——旧句柄全灭，容量保留 O(槽数)）；表实例携带
+  TableId::Frame(帧栈下标)（推栈点+coro resume 刷新，池化帧可换深度
+  复用），句柄读写归属校验。
+- **迁移面**：咽喉层 frame_local_insert/remove（单探测+有值域返回）、
+  get/get_mut/contains/is_array/mark、resolve/store/remove/loc_* 五件、
+  get/set 快径、incr 元素快径、upvar/global/append/array 元素扫描/
+  GC 根快照。编译局部槽、upvars/drop_frame_global_links/dead 链不动
+  （步骤 3/4 面）。帧域无 UNDEFINED phantom（链接条目只入日志——
+  步骤 3/4 面）。
+- **对拍抓 2 个真漏点**：①frame_local_remove 对 flag-only 占位返回
+  Some（改有值域）；②占位不入日志时 array_elements 快径守卫可误列
+  （占位入日志恢复「日志 ⊇ vt 条目」不变式）。T3 直列输出与步骤 1
+  基线逐字相同（一处 arr 位置分歧为预存，两版 rtcl 一致）。
+- 门禁（合并树）：judge **95/95**、crash-gate 128/128、probes 398/76、
+  sweep 12 既有、rtcl-vm **886/0**（debug 对拍常开 +2 帧表测试）、
+  workspace exit 0、wasm32 ✓、四特性 check ✓。
+- 基准：var_incr/dict/proc_fib/list/string_build 持平；帧面放大基准
+  199→198ms（池化重置成本可控）；T3 info locals 持平、after/plain 反
+  超方向保持；t7 数组 ±4% 内；ns 体反超方向保持；RSS 持平。
+- wasm 体积 **−395B**（帧表机制+镜像维护退场相抵）。
+- **遗留登记**：debug 判官的预存对拍缺口——全局域 arena UNDEFINED 位
+  与 phantom_globals 镜像在 unset 走 global_remove 的重叠态分歧（步骤
+  1 遗留，基线 36269a7 逐字复现，常设门禁不覆盖）——随步骤 3/4
+  （链接/phantom 面迁移）收口。

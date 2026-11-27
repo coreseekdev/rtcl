@@ -376,13 +376,15 @@ pub fn cmd_lappend(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // variables keep the rebuilding path below; so does a value that is
     // not a list rep — the strict parse there owns its errors.
     if args.len() >= 3 {
-        if let Some(v) = interp.var_slot_fast(var_name) {
-            if let Some(items) = v.as_list_mut() {
-                for arg in &args[2..] {
-                    items.push(arg.clone());
-                }
-                return Ok(v.clone());
+        // D1 步骤 1：with_var_slot（全局臂双写 arena + 镜像重放）。
+        if let Some(v) = interp.with_var_slot(var_name, |cell| {
+            let items = cell.as_list_mut()?;
+            for arg in &args[2..] {
+                items.push(arg.clone());
             }
+            Some(cell.clone())
+        }) {
+            return Ok(v);
         }
     }
     let mut list = match interp.get_var(var_name) {

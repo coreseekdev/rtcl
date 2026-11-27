@@ -2176,25 +2176,10 @@ fn detach_object(interp: &mut Interp, key: &str, ns: &str, keep_ns: bool) {
     // frame's reads).
     let var_prefix = format!("{}::", ns.trim_start_matches(':'));
     interp.materialize_frame_links(&var_prefix);
-    let globals: Vec<String> = interp
-        .globals
-        .keys()
-        .filter(|k| k.starts_with(&var_prefix))
-        .cloned()
-        .collect();
-    for g in globals {
-        interp.globals.remove(&g);
-        interp.array_globals.remove(&g);
-        interp.arrays_env_only = interp
-            .array_globals
-            .iter()
-            .all(|k| k == "env" || k == "tcl_platform");
-    }
-    // P5: the destroyed namespace's arrays take their element counts with
-    // them (the element keys above were removed without the vars.rs path).
-    interp
-        .elem_counts
-        .retain(|k, _| !k.starts_with(&var_prefix));
+    // D1 步骤 1：purge 经 global_purge_prefix（arena 枚举 + 逐键双删，
+    // 数组位/元素计数随键清理；arrays_env_only 随 unmark 重算——与旧
+    // 逐键重算同终值）。
+    interp.global_purge_prefix(&var_prefix);
     if !keep_ns {
         interp.namespaces.remove(ns);
     }
@@ -3761,21 +3746,18 @@ extern "Rust" fn cmd_oo_copy(interp: &mut Interp, args: &[Value]) -> Result<Valu
     // Copy namespace variables.
     let src_prefix = format!("{}::", ns.trim_start_matches(':'));
     let dst_prefix = format!("{}::", new_ns.trim_start_matches(':'));
-    let moving: Vec<(String, Value)> = interp
-        .globals
-        .iter()
-        .filter(|(k, _)| k.starts_with(&src_prefix))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    // D1 步骤 1：复制枚举经 arena（global_entries_with_prefix——镜像
+    // 值词在 release 下可滞后于原地覆写，值读必须走 arena）；枚举序 =
+    // arena 插入序（与旧映射迭代序不同源——judge 语料钉形验证）。数
+    // 组位经 global_mark_array（flag-only——与旧「只插 array_globals
+    // 不落计数」逐字同）。
+    let moving: Vec<(String, Value)> = interp.global_entries_with_prefix(&src_prefix);
     for (k, v) in moving {
         let new_key = format!("{}{}", dst_prefix, &k[src_prefix.len()..]);
-        let is_array = interp.array_globals.contains(&k);
+        let is_array = interp.global_is_array(&k);
         interp.global_insert(new_key.clone(), v);
         if is_array {
-            if new_key != "env" && new_key != "tcl_platform" {
-                interp.arrays_env_only = false;
-            }
-            interp.array_globals.insert(new_key);
+            interp.global_mark_array(&new_key, None);
         }
     }
 
@@ -4323,11 +4305,17 @@ fn info_object(interp: &mut Interp, args: &[Value], prefix: &str) -> Result<Valu
                     // vars / variables: names in the object namespace.
                     let ns = object_ns_of(interp, &key);
                     let prefix = format!("{}::", ns.trim_start_matches(':'));
+                    // D1 步骤 1：枚举经 arena 前缀扫描（值条目域同旧
+                    // globals.keys()；序不承载语义——names 随后与 ns 表
+                    // 并集去重）。
                     let mut names: Vec<String> = interp
-                        .globals
-                        .keys()
-                        .filter(|k| k.starts_with(&prefix))
-                        .map(|k| k[prefix.len()..].split('(').next().unwrap_or("").to_string())
+                        .var_arena
+                        .root()
+                        .keys_with_prefix(&prefix)
+                        .into_iter()
+                        .map(|k| {
+                            k[prefix.len()..].split('(').next().unwrap_or("").to_string()
+                        })
                         .filter(|n| !n.is_empty())
                         .collect();
                     if let Some(nsi) = interp.namespaces.get(ns.as_ref()) {

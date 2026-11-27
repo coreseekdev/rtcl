@@ -323,9 +323,10 @@ pub fn cmd_variable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // variable seeds no value (`info exists` → 0), but the link
             // is a frame-table entry all the same — log it so the
             // hash-order replay lists it.
+            // D1 步骤 1：读经 arena。
             let seeded = match &init_value {
                 Some(val) => Some(val.clone()),
-                None => interp.globals.get(&*qualified).cloned(),
+                None => interp.global_get(&*qualified).cloned(),
             };
             match seeded {
                 Some(val) => {
@@ -431,7 +432,8 @@ fn ns_eval(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         while i < interp.ns_eval_keep.len() {
             if interp.ns_eval_keep[i].starts_with(&flat_prefix) {
                 let key = interp.ns_eval_keep.swap_remove(i);
-                interp.globals.remove(&key);
+                // D1 步骤 1：删经 global_remove（双删）。
+                interp.global_remove(&key);
             } else {
                 i += 1;
             }
@@ -464,29 +466,10 @@ fn ns_eval(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 interp.note_cmd_mutation();
             }
-            let dead_keys: Vec<String> = interp
-                .globals
-                .keys()
-                .filter(|k| k.starts_with(flat_prefix.as_str()))
-                .cloned()
-                .collect();
-            for k in dead_keys {
-                interp.globals.remove(&k);
-            }
-            let dead_arrays: Vec<String> = interp
-                .array_globals
-                .iter()
-                .filter(|k| k.starts_with(flat_prefix.as_str()))
-                .cloned()
-                .collect();
-            for k in dead_arrays {
-                interp.array_globals.remove(k.as_str());
-            }
-            // P5: the dead namespace's arrays take their element counts
-            // with them (a recreated namespace re-counts from 0).
-            interp
-                .elem_counts
-                .retain(|k, _| !k.starts_with(flat_prefix.as_str()));
+            // D1 步骤 1：purge 经 global_purge_prefix（arena 枚举 + 逐
+            // 键双删，数组位/元素计数随键清理——与旧 globals.keys() 扫
+            // 描 + array_globals/elem_counts 清理同构）。
+            interp.global_purge_prefix(flat_prefix.as_str());
         }
     }
     if let Err(e) = &result {
@@ -588,13 +571,12 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // during the callback (18.4's count).  Element keys collapse into
         // their base (tclsh unsets the whole Var once).
         let mut bases: Vec<String> = Vec::new();
-        for k in interp.globals.keys() {
-            if !k.starts_with(&var_prefix) {
-                continue;
-            }
+        // D1 步骤 1：枚举经 arena 前缀扫描（值条目域同旧 globals.keys()
+        // ——序不承载语义：bases 随后排序）。
+        for k in interp.var_arena.root().keys_with_prefix(&var_prefix) {
             let base = match k.find('(') {
                 Some(i) => k[..i].to_string(),
-                None => k.clone(),
+                None => k.as_ref().to_string(),
             };
             if !bases.contains(&base) {
                 bases.push(base);
@@ -611,23 +593,16 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 kept.push(base);
                 continue;
             }
+            // D1 步骤 1：基键 + 元素键经 global_remove 双删；数组位/
+            // 计数经 global_unmark_array（arrays_env_only 按镜像集重算
+            // ——与旧全等式逐字同）。
             let elem_prefix = format!("{}(", base);
-            let keys: Vec<String> = interp
-                .globals
-                .keys()
-                .filter(|k| *k == &base || k.starts_with(&elem_prefix))
-                .cloned()
-                .collect();
+            let keys: Vec<Rc<str>> = interp.var_arena.root().keys_with_prefix(&elem_prefix);
             for k in keys {
-                interp.globals.remove(&k);
+                interp.global_remove(&k);
             }
-            interp.array_globals.remove(&base);
-            // P5: the array's element count dies with its elements.
-            interp.elem_counts.remove(&base);
-            interp.arrays_env_only = interp
-                .array_globals
-                .iter()
-                .all(|k| k == "env" || k == "tcl_platform");
+            interp.global_remove(&base);
+            interp.global_unmark_array(&base);
             // Unset traces fire after the removal; a callback's read of the
             // var itself fails (undefined, 18.4's catch=1) and cannot
             // resurrect it, but the key stays resolvable for
@@ -710,9 +685,19 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
         // Remove namespace-scoped global variables (flat keys, no leading
         // ::), except the ones a live variable link keeps alive.
-        interp
-            .globals
-            .retain(|k, _| !k.starts_with(&var_prefix) || kept.iter().any(|b| b == k));
+        // D1 步骤 1：retain 的 arena 等价（枚举 + 保留名单过滤 + 双删）。
+        {
+            let doomed: Vec<Rc<str>> = interp
+                .var_arena
+                .root()
+                .keys_with_prefix(&var_prefix)
+                .into_iter()
+                .filter(|k| !kept.iter().any(|b| b == k.as_ref()))
+                .collect();
+            for k in doomed {
+                interp.global_remove(&k);
+            }
+        }
 
         // Remove import aliases defined in, or pointing into, the tree.
         interp.import_aliases.retain(|alias, origin| {
@@ -1009,12 +994,13 @@ fn ns_which(interp: &Interp, args: &[Value]) -> Result<Value> {
                 .get(interp.current_namespace.as_ref())
                 .map(|info| info.variables.contains(&key))
                 .unwrap_or(false);
-            if interp.globals.contains_key(&key)
+            // D1 步骤 1：读经 arena。
+            if interp.global_has(&key)
                 || interp.var_nuke_pending.contains(&key)
                 || declared
             {
                 Ok(Value::from_str(&format!("::{}", key)))
-            } else if interp.globals.contains_key(name) {
+            } else if interp.global_has(name) {
                 Ok(Value::from_str(&format!("::{}", name)))
             } else {
                 Ok(Value::empty())

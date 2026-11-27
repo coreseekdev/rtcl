@@ -5,44 +5,400 @@
 //! locals (or follow upvar links to globals / other frames).
 
 use super::util::{has_ns_sep, is_array_element_name, split_array_ref};
+use super::vararena::{Var, VarFlags};
 use super::{tclhash, CallFrame, Interp, Rc, UpvarLink};
 use crate::error::{Error, ErrorCode, Result};
 use crate::value::Value;
 
 impl Interp {
+    // ── D1 步骤 1：全局表 arena 权威 + 平表镜像双写（双读对拍）──────
+    //
+    // 三合一（globals 平表 + phantom_globals + array_globals，连带
+    // 全局域 elem_counts）迁移到 var_arena 的 :: 表：**读走 arena**，
+    // debug 下每读同走旧路径对拍（presence/phantom/array 位逐项一致，
+    // release 零成本）；**写双写**（arena 权威，平表/两个位集/计数
+    // 镜像同步维护——镜像在迁移期保持可独立应答对拍读）。
+    //
+    // 位语义：有值 ⟺ 镜像 globals 含键（值词经重放双写逐字同）；
+    // UNDEFINED ⟺ 镜像 phantom_globals 含键（与有值独立——链接目标先
+    // phantom 后 set 的重叠态两位同置）；ARRAY ⟺ 镜像 array_globals
+    // 含键。arena 键 = 平键字符串，与现 globals 键同域（链接/死链面
+    // ——flat_aliases/dead_flat/ns_transient/drop_frame_global_links
+    // ——本批不动，键域天然兼容）。
+
+    /// 单键三位对拍（debug）：arena 与镜像的 value/phantom/array 位。
+    /// release 零成本（对拍域整体退场——cfg! 常量折叠掉镜像读）。
+    #[inline]
+    fn dcheck_global_mirror(&self, key: &str) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let m = self.var_arena.root().get(key);
+        debug_assert_eq!(
+            m.is_some_and(|v| v.has_value()),
+            self.globals.contains_key(key),
+            "D1 对拍: value presence {key:?}"
+        );
+        debug_assert_eq!(
+            m.is_some_and(|v| v.is_undefined()),
+            self.phantom_globals.contains(key),
+            "D1 对拍: phantom {key:?}"
+        );
+        debug_assert_eq!(
+            m.is_some_and(|v| v.is_array()),
+            self.array_globals.contains(key),
+            "D1 对拍: array flag {key:?}"
+        );
+    }
+
+    // ── 读（arena 权威）───────────────────────────────────────────
+
+    /// 全局标量读值（无值条目/缺席 → None——phantom 语义：读 miss）。
+    #[inline]
+    pub(crate) fn global_get(&self, key: &str) -> Option<&Value> {
+        let v = self
+            .var_arena
+            .root()
+            .get(key)
+            .filter(|v| v.has_value())
+            .map(|v| &v.value);
+        debug_assert_eq!(
+            v.is_some(),
+            self.globals.contains_key(key),
+            "D1 对拍: read {key:?}"
+        );
+        v
+    }
+
+    /// 全局有值条目判定（⟺ 镜像 globals 含键）。
+    #[inline]
+    pub(crate) fn global_has(&self, key: &str) -> bool {
+        let has = self
+            .var_arena
+            .root()
+            .get(key)
+            .is_some_and(|v| v.has_value());
+        debug_assert_eq!(has, self.globals.contains_key(key), "D1 对拍: has {key:?}");
+        has
+    }
+
+    /// 无值占位条目判定（⟺ 镜像 phantom_globals 含键）。
+    #[inline]
+    pub(crate) fn global_is_undefined(&self, key: &str) -> bool {
+        let un = self
+            .var_arena
+            .root()
+            .get(key)
+            .is_some_and(|v| v.is_undefined());
+        debug_assert_eq!(
+            un,
+            self.phantom_globals.contains(key),
+            "D1 对拍: undefined {key:?}"
+        );
+        un
+    }
+
+    /// 数组基标记判定（⟺ 镜像 array_globals 含键）。经 VarTable 的
+    /// 数组基快索引（访问路径非平行存储——位真值在 Var 上，索引同步
+    /// 维护；成本形 = 旧 array_globals 微小集合探测——T7 钉形）。
+    #[inline]
+    pub(crate) fn global_is_array(&self, key: &str) -> bool {
+        let arr = self.var_arena.root().is_array_base(key);
+        debug_assert_eq!(
+            arr,
+            self.array_globals.contains(key),
+            "D1 对拍: is-array {key:?}"
+        );
+        arr
+    }
+
+    /// 「存在任一数组基」守卫（旧 `!array_globals.is_empty()` 的
+    /// O(1) 等价——arena 记账的 ARRAY 条目数）。
+    #[inline]
+    pub(crate) fn global_any_array(&self) -> bool {
+        self.var_arena.root().array_count() != 0
+    }
+
+    /// 全局数组存活元素数（T7 语义保持：计数随元素写/删位点维护；
+    /// 旧 `elem_counts` 平表的 arena 内化——`None` 与旧「计数未跟踪」
+    /// 同形，调用方回落扫描）。计数值对拍：镜像缺失按 0 计（oo clone
+    /// 的 flag-only 复制面两态同观值）。
+    #[inline]
+    pub(crate) fn global_elem_count(&self, key: &str) -> Option<usize> {
+        let n = self
+            .var_arena
+            .root()
+            .array_var(key)
+            .filter(|v| v.is_array())
+            .map(|v| v.elem_count as usize);
+        debug_assert_eq!(
+            n.unwrap_or(0),
+            self.elem_counts.get(key).copied().unwrap_or(0),
+            "D1 对拍: elem count {key:?}"
+        );
+        n
+    }
+
+    // ── 写（双写）────────────────────────────────────────────────
+
     /// Insert into the global var table, appending the key to the
     /// Tcl-order log when the insert was NEW (a re-set keeps its
     /// position; a recreate after delete appends anew — Tcl hash-entry
-    /// semantics).
-    pub(crate) fn global_insert(&mut self, key: String, v: Value) {
-        if self.globals.insert(key.clone(), v).is_none() {
-            self.var_order.push(key);
+    /// semantics).  D1 步骤 1：arena 权威插入/覆盖（已有 Var 的
+    /// ARRAY/UNDEFINED 位保留——数组基覆盖、phantom 重叠态），平表
+    /// 镜像 + 插入日志同步双写。
+    /// 返回是否新建序位（⟅ 平表 map-insert-new——对拍位；元素创建径
+    /// 据此免掉先行存在性探测）。
+    ///
+    /// 双写分域：镜像平表/位集维护 = debug（对拍域；release 零成本
+    /// ——镜像值/结构此后无人读，漏点由 judge 逐字节兜底）；插入日志
+    /// = 双域（array statistics 的历史面是 release 特性，活性过滤走
+    /// arena——语义与「globals 含键」逐字同：日志键恒有值条目）。
+    pub(crate) fn global_insert(&mut self, key: String, v: Value) -> bool {
+        // 序位语义（land_value 单探测）：有值条目覆盖 = 原位（镜像
+        // re-set 不进日志）；无值占位（phantom/启动标记）上值 = 新建
+        // 序位（镜像 map-insert-new 必进日志——与平表重放逐字同）。
+        let (_, arena_new) = self.var_arena.root_mut().land_value(key.clone(), v.clone());
+        #[cfg(debug_assertions)]
+        {
+            let is_new = self.globals.insert(key.clone(), v).is_none();
+            debug_assert_eq!(arena_new, is_new, "D1 对拍: insert newness {key:?}");
+            self.dcheck_global_mirror(&key);
+        }
+        if arena_new {
+            self.var_order.push(key.clone());
         }
         // A log grown far past the table (variables made and unset in a
         // loop) is brought back to the live entries.
-        if self.var_order.len() > 2 * self.globals.len() + 64 {
-            let live = |k: &str| self.globals.contains_key(k);
+        if self.var_order.len() > 2 * self.var_arena.root().len() + 64 {
+            let live = |k: &str| {
+                self.var_arena
+                    .root()
+                    .get(k)
+                    .is_some_and(|v| v.has_value())
+            };
             compact_order(&mut self.var_order, &live);
         }
+        self.dcheck_global_mirror(&key);
+        arena_new
     }
 
     /// Remove from the global var table (log entry becomes stale; the
     /// iteration walk filters by table liveness and dedups to the last
-    /// occurrence).
+    /// occurrence).  D1 步骤 1：双删（arena 只摘有值条目——占位条目归
+    /// [`Self::global_forget_phantom`]）。
     pub(crate) fn global_remove(&mut self, key: &str) -> Option<Value> {
-        self.globals.remove(key)
+        // 单探测：arena 有值才摘（remove_value）。镜像双删 = debug
+        // （对拍域；release 零成本）。
+        let from_arena = self.var_arena.root_mut().remove_value(key);
+        #[cfg(debug_assertions)]
+        {
+            let from_map = self.globals.remove(key);
+            debug_assert_eq!(
+                from_arena.is_some(),
+                from_map.is_some(),
+                "D1 对拍: remove {key:?}"
+            );
+            self.dcheck_global_mirror(key);
+        }
+        from_arena
     }
+
+    /// 原地覆盖（存在有值条目才写；`set_var`/`store_var` 的链接写与
+    /// 覆写快径共用）。arena 权威 + 镜像重放。
+    /// Returns whether the write landed.
+    pub(crate) fn global_overwrite(&mut self, key: &str, value: &Value) -> bool {
+        let landed = match self.var_arena.root_mut().get_mut(key) {
+            Some(var) if var.has_value() => {
+                var.value = value.clone();
+                true
+            }
+            _ => false,
+        };
+        debug_assert_eq!(
+            landed,
+            self.globals.contains_key(key),
+            "D1 对拍: overwrite {key:?}"
+        );
+        // 镜像值词：debug 保持逐字同（对拍域）；release 可滞后——同
+        // [`Self::global_cell`]（结构双写不变，值读全走 arena）。
+        #[cfg(debug_assertions)]
+        if landed {
+            if let Some(cell) = self.globals.get_mut(key) {
+                *cell = value.clone();
+            }
+        }
+        landed
+    }
+
+    /// 全局标量格的原地值变更（`incr`/`lappend`/`append`/`dict set` 的
+    /// arena 权威格路径）。`f` 先施加于 arena 格，再**重放**于平表镜像
+    /// 格（迁移期双写的实现方式——`f` 必须可重放：对被捕获状态纯函数、
+    /// 对格内容确定性）。
+    pub(crate) fn global_cell<R>(
+        &mut self,
+        key: &str,
+        mut f: impl FnMut(&mut Value) -> R,
+    ) -> Option<R> {
+        let has = self
+            .var_arena
+            .root()
+            .get(key)
+            .is_some_and(|v| v.has_value());
+        debug_assert_eq!(has, self.globals.contains_key(key), "D1 对拍: cell {key:?}");
+        if !has {
+            return None;
+        }
+        let r = {
+            let var = self.var_arena.root_mut().get_mut(key).expect("checked");
+            f(&mut var.value)
+        };
+        // 镜像重放：debug 保持镜像值词与 arena 逐字同（对拍域）；release
+        // 镜像值可滞后（镜像结构仍双写新鲜；release 值读全部经 arena
+        // ——漏点由 judge 逐字节兜底），省一次大表探测（元素覆写热径）。
+        #[cfg(debug_assertions)]
+        if let Some(cell) = self.globals.get_mut(key) {
+            let _ = f(cell);
+        }
+        Some(r)
+    }
+
+    /// 无值占位条目入表（trace/`global`/`upvar #0` 链接的 keep-alive
+    /// ——旧 `phantom_globals.insert` 的双写）。已有 Var（有值/占位）
+    /// 时只补 UNDEFINED 位。
+    pub(crate) fn global_note_phantom(&mut self, key: &str) {
+        match self.var_arena.root_mut().get_mut(key) {
+            Some(var) => var.flags.insert(VarFlags::UNDEFINED),
+            None => {
+                let mut var = Var::with_value(Value::unset());
+                var.flags.insert(VarFlags::UNDEFINED);
+                self.var_arena.root_mut().insert(Rc::from(key), var);
+            }
+        }
+        #[cfg(debug_assertions)]
+        {
+            self.phantom_globals.insert(key.to_string());
+            self.dcheck_global_mirror(key);
+        }
+    }
+
+    /// 无值占位条目出表（变量 unset / 末条 trace 摘除——旧
+    /// `phantom_globals.remove` 的双写）。重叠态（有值 + phantom）下
+    /// 只撤 UNDEFINED 位，值条目保留。
+    pub(crate) fn global_forget_phantom(&mut self, key: &str) {
+        match self.var_arena.root_mut().get_mut(key) {
+            Some(var) if var.has_value() => var.flags.remove(VarFlags::UNDEFINED),
+            Some(_) => {
+                self.var_arena.root_mut().remove(key);
+            }
+            None => {}
+        }
+        #[cfg(debug_assertions)]
+        {
+            self.phantom_globals.remove(key);
+            self.dcheck_global_mirror(key);
+        }
+    }
+
+    /// 数组基标记（`count: Some(n)` 同时落存活元素计数——`loc_mark_array`
+    /// 与启动种子；`None` 只落位——oo clone / auto_index 的 flag-only
+    /// 面，与旧「只插 array_globals 不落计数」逐字同）。无条目时先建
+    /// 无值 Var（启动窗口：标记先于基键落表——`init_special_vars` 的
+    /// 插入序红线不得重排）。
+    pub(crate) fn global_mark_array(&mut self, key: &str, count: Option<u32>) {
+        self.var_arena.root_mut().mark_array(key, count);
+        if key != "env" && key != "tcl_platform" {
+            self.arrays_env_only = false;
+        }
+        #[cfg(debug_assertions)]
+        {
+            self.array_globals.insert(key.to_string());
+            if let Some(n) = count {
+                self.elem_counts.insert(key.to_string(), n as usize);
+            }
+            self.dcheck_global_mirror(key);
+        }
+    }
+
+    /// 数组基摘标（整数组 unset / purge 面；元素计数随标同清；
+    /// `arrays_env_only` 按镜像集重算——与旧全等式逐字同）。
+    pub(crate) fn global_unmark_array(&mut self, key: &str) {
+        self.var_arena.root_mut().unmark_array(key);
+        // arrays_env_only 重算：经 arena 的数组基快索引（release 镜像
+        // 退场后它就是唯一真源；debug 下对拍位同步验证）。与旧全等式
+        // 「镜像集全为启动数组」逐字同域——快索引 ⟺ ARRAY 位 ⟺ 旧镜像
+        // 集（对拍位）。
+        self.arrays_env_only = self.var_arena.root().arrays_all_startup();
+        #[cfg(debug_assertions)]
+        {
+            self.array_globals.remove(key);
+            self.elem_counts.remove(key);
+            debug_assert_eq!(
+                self.arrays_env_only,
+                self.array_globals
+                    .iter()
+                    .all(|k| k == "env" || k == "tcl_platform"),
+                "D1 对拍: arrays_env_only"
+            );
+            self.dcheck_global_mirror(key);
+        }
+    }
+
+    /// 全局数组存活元素计数增减（元素写/删位点；镜像同步）。
+    pub(crate) fn global_elem_bump(&mut self, key: &str, delta: i64) {
+        if let Some(var) = self.var_arena.root_mut().array_var_mut(key) {
+            var.elem_count = ((var.elem_count as i64) + delta).max(0) as u32;
+        }
+        #[cfg(debug_assertions)]
+        if let Some(c) = self.elem_counts.get_mut(key) {
+            *c = ((*c as i64) + delta).max(0) as usize;
+        }
+    }
+
+    /// 前缀下的（键, 值）快照（oo clone 的复制面——调用方按旧枚举序
+    /// 消费时改走镜像 `globals.iter()`，见调用点注记）。
+    pub(crate) fn global_entries_with_prefix(&self, prefix: &str) -> Vec<(String, Value)> {
+        self.var_arena
+            .root()
+            .order_entries()
+            .filter(|(_, v)| v.has_value())
+            .filter(|(k, _)| k.as_ref().starts_with(prefix))
+            .map(|(k, v)| (k.as_ref().to_string(), v.value.clone()))
+            .collect()
+    }
+
+    /// 前缀清除（namespace delete / oo destroy 的 purge 面）：arena
+    /// 枚举 + 逐键双删，数组位/元素计数随键清理（与旧
+    /// `globals.keys()` 扫描 + `array_globals`/`elem_counts` 清理同构
+    /// ——位集与计数只在基键上非空，元素键上的清理是幂等 no-op）。
+    /// 返回被清的键（枚举序 = 插入序；调用方自行排序或无序消费）。
+    pub(crate) fn global_purge_prefix(&mut self, prefix: &str) -> Vec<String> {
+        let keys = self.var_arena.root().keys_with_prefix(prefix);
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            if self.global_is_array(&k) {
+                self.global_unmark_array(&k);
+            }
+            self.global_remove(&k);
+            out.push(k.as_ref().to_string());
+        }
+        out
+    }
+
 }
 
 /// Insert into a frame's locals, maintaining the frame's Tcl-order log.
-pub(crate) fn frame_local_insert(f: &mut CallFrame, key: String, v: Value) {
-    if f.locals.insert(key.clone(), v).is_none() {
+/// 返回是否新建（⟅ 插入序新增——调用方可免先行存在性探测）。
+pub(crate) fn frame_local_insert(f: &mut CallFrame, key: String, v: Value) -> bool {
+    let is_new = f.locals.insert(key.clone(), v).is_none();
+    if is_new {
         f.locals_order.push(key);
     }
     if f.locals_order.len() > 2 * f.locals.len() + 64 {
         let live = |k: &str| f.locals.contains_key(k);
         compact_order(&mut f.locals_order, &live);
     }
+    is_new
 }
 
 // ── T4 命名空间体快路径的键拼装 ─────────────────────────────────
@@ -225,10 +581,18 @@ impl Interp {
     /// 错误归属全链）。
     pub(crate) fn top_invalidate(&mut self) {
         crate::interp::dbgtrace::event("invalidate", "");
+        // D1 步骤 1：数组位读经 arena（global_any_array/global_is_array
+        // ——守卫语义与旧 `!array_globals.is_empty()` 全等）。
+        let aliased: Vec<bool> = match self.top_slots.as_ref() {
+            Some(ts) if self.global_any_array() => {
+                ts.names.iter().map(|n| self.global_is_array(n)).collect()
+            }
+            Some(ts) => vec![false; ts.names.len()],
+            None => return,
+        };
         let Some(ts) = self.top_slots.as_mut() else { return };
         for i in 0..ts.names.len() {
-            ts.aliased[i] = !self.array_globals.is_empty()
-                && self.array_globals.contains(&ts.names[i]);
+            ts.aliased[i] = aliased[i];
             ts.values[i] = Value::unset();
         }
     }
@@ -298,7 +662,7 @@ impl Interp {
             // Global link: ONE probe with the canonical key (the name
             // path would pay upvars + globals = two hashes).
             let key = f.link_keys.get(slot)?.as_ref()?;
-            return self.globals.get(key.as_ref()).cloned();
+            return self.global_get(key.as_ref()).cloned();
         }
         let v = f.slots.get(slot)?;
         if v.is_unset() {
@@ -365,8 +729,7 @@ impl Interp {
                 .and_then(|f| f.link_keys.get(slot))
                 .and_then(|k| k.clone());
             if let Some(key) = key {
-                if let Some(cell) = self.globals.get_mut(key.as_ref()) {
-                    *cell = value.clone();
+                if self.global_overwrite(key.as_ref(), &value) {
                     return true;
                 }
                 let name = self.frames.last().and_then(|f| {
@@ -432,8 +795,7 @@ impl Interp {
                 .and_then(|f| f.link_keys.get(slot))
                 .and_then(|k| k.clone());
             if let Some(key) = key {
-                if let Some(cell) = self.globals.get_mut(key.as_ref()) {
-                    *cell = value;
+                if self.global_overwrite(key.as_ref(), &value) {
                     return Ok(());
                 }
                 let name = self.frames.last().and_then(|f| {
@@ -521,16 +883,28 @@ impl Interp {
             return Some(cell.clone());
         }
         {
-            let f = self.frames.last()?;
-            if f.has_aliased && f.slot_aliased.get(slot).copied().unwrap_or(false) {
-                // Global link: one probe, in-place int rewrite when the
-                // stored value is unshared/immediate.
-                let key = f.link_keys.get(slot)?.as_ref()?;
-                let cell = self.globals.get_mut(key.as_ref())?;
-                let current = cell.as_int()?;
-                let next = current.checked_add(amount)?;
-                cell.set_int_rep(next);
-                return Some(cell.clone());
+            // D1 步骤 1：全局链接臂——f 的借用先收口（键拷出），arena
+            // 权威格 + 镜像重放（global_cell 的重放确定性对整型 retag
+            // 成立）。
+            let aliased = self
+                .frames
+                .last()
+                .map(|f| f.has_aliased && f.slot_aliased.get(slot).copied().unwrap_or(false))
+                .unwrap_or(false);
+            if aliased {
+                let key = self
+                    .frames
+                    .last()
+                    .and_then(|f| f.link_keys.get(slot))
+                    .and_then(|k| k.clone())?;
+                return self
+                    .global_cell(key.as_ref(), |cell| {
+                        let current = cell.as_int()?;
+                        let next = current.checked_add(amount)?;
+                        cell.set_int_rep(next);
+                        Some(cell.clone())
+                    })
+                    .flatten();
             }
         }
         let cell = self.frames.last_mut()?.slots.get_mut(slot)?;
@@ -819,13 +1193,13 @@ impl Interp {
     /// probe for bare names at the :: level: reads and `info exists` of
     /// a valueless entry still miss.
     fn global_entry_exists(&self, key: &str) -> bool {
-        if self.globals.contains_key(key) {
+        if self.global_has(key) {
             return true;
         }
         if key.contains('(') || key.contains("::") {
             return false;
         }
-        self.phantom_globals.contains(key)
+        self.global_is_undefined(key)
             || self
                 .namespaces
                 .get("::")
@@ -865,8 +1239,8 @@ impl Interp {
     /// The same for a key known to be a scalar of the :: table — the
     /// target of a proc's `global` or `upvar #0` link.
     pub(crate) fn note_global_key(&mut self, key: &str) {
-        if !key.contains('(') && !key.contains("::") && !self.globals.contains_key(key) {
-            self.phantom_globals.insert(key.to_string());
+        if !key.contains('(') && !key.contains("::") && !self.global_has(key) {
+            self.global_note_phantom(key);
         }
     }
 
@@ -874,7 +1248,7 @@ impl Interp {
     /// while it still had no value.
     pub(crate) fn forget_global_entry(&mut self, name: &str) {
         if let Some(key) = self.global_scalar_key(name) {
-            self.phantom_globals.remove(key);
+            self.global_forget_phantom(key);
         }
     }
 
@@ -889,8 +1263,8 @@ impl Interp {
                 if let UpvarLink::Global(g) = link {
                     // 无值才谈得上瞬态条目；不在 phantom 表的键没有要
                     // 清的东西（有值的变量本来就该留下）。
-                    if !self.globals.contains_key(g.as_ref())
-                        && self.phantom_globals.contains(g.as_ref())
+                    if !self.global_has(g.as_ref())
+                        && self.global_is_undefined(g.as_ref())
                         && !keys.iter().any(|k| k == g.as_ref())
                     {
                         keys.push(g.to_string());
@@ -907,7 +1281,7 @@ impl Interp {
                         .any(|l| matches!(l, UpvarLink::Global(g) if g.as_ref() == k.as_str()))
             });
             if !still_linked {
-                self.phantom_globals.remove(&k);
+                self.global_forget_phantom(&k);
             }
         }
     }
@@ -946,7 +1320,7 @@ impl Interp {
     /// empty base-key value is only an enumeration marker.)
     fn loc_is_array(&self, loc: &VarLoc) -> bool {
         match loc {
-            VarLoc::Global(n) => self.array_globals.contains(n),
+            VarLoc::Global(n) => self.global_is_array(n),
             VarLoc::Frame(i, n) => self
                 .frames
                 .get(*i)
@@ -959,7 +1333,7 @@ impl Interp {
     /// marker, or otherwise)?
     fn loc_base_exists(&self, loc: &VarLoc) -> bool {
         match loc {
-            VarLoc::Global(n) => self.globals.contains_key(n),
+            VarLoc::Global(n) => self.global_has(n),
             VarLoc::Frame(i, n) => self
                 .frames
                 .get(*i)
@@ -971,22 +1345,22 @@ impl Interp {
     /// Get a flat key in the scope owning `loc`.
     fn loc_get(&self, loc: &VarLoc, key: &str) -> Option<&Value> {
         match loc {
-            VarLoc::Global(_) => self.globals.get(key),
+            VarLoc::Global(_) => self.global_get(key),
             VarLoc::Frame(i, _) => self.frames.get(*i).and_then(|f| f.locals.get(key)),
         }
     }
 
     /// Insert a flat key in the scope owning `loc`.
-    fn loc_insert(&mut self, loc: &VarLoc, key: String, value: Value) {
+    /// Insert a flat key in the scope owning `loc`; returns whether the
+    /// key was NEW (insertion-log growth — callers drop a prior existence
+    /// probe with it).
+    fn loc_insert(&mut self, loc: &VarLoc, key: String, value: Value) -> bool {
         match loc {
-            VarLoc::Global(_) => {
-                self.global_insert(key, value);
-            }
-            VarLoc::Frame(i, _) => {
-                if let Some(f) = self.frames.get_mut(*i) {
-                    frame_local_insert(f, key, value);
-                }
-            }
+            VarLoc::Global(_) => self.global_insert(key, value),
+            VarLoc::Frame(i, _) => match self.frames.get_mut(*i) {
+                Some(f) => frame_local_insert(f, key, value),
+                None => false,
+            },
         }
     }
 
@@ -1009,12 +1383,9 @@ impl Interp {
         self.array_generation = self.array_generation.wrapping_add(1);
         match loc {
             VarLoc::Global(n) => {
-                if n != "env" && n != "tcl_platform" {
-                    self.arrays_env_only = false;
-                }
-                self.array_globals.insert(n.clone());
-                // (Re)creation starts the live element count at 0 (P5).
-                self.elem_counts.insert(n.clone(), 0);
+                // D1 步骤 1：arena 位 + 计数（(Re)creation 从 0 起数
+                // ——P5），镜像同步在 global_mark_array 内。
+                self.global_mark_array(n, Some(0));
             }
             VarLoc::Frame(i, n) => {
                 if let Some(f) = self.frames.get_mut(*i) {
@@ -1033,9 +1404,7 @@ impl Interp {
     fn loc_elem_count_bump(&mut self, loc: &VarLoc, delta: i64) {
         match loc {
             VarLoc::Global(n) => {
-                if let Some(c) = self.elem_counts.get_mut(n) {
-                    *c = ((*c as i64) + delta).max(0) as usize;
-                }
+                self.global_elem_bump(n, delta);
             }
             VarLoc::Frame(i, n) => {
                 if let Some(f) = self.frames.get_mut(*i) {
@@ -1080,28 +1449,25 @@ impl Interp {
         let prefix = format!("{}(", loc.base_name());
         match loc {
             VarLoc::Global(_) => {
-                let keys: Vec<String> = self
-                    .globals
-                    .keys()
-                    .filter(|k| k.starts_with(&prefix) && k.ends_with(')'))
-                    .cloned()
+                // D1 步骤 1：arena 前缀枚举（插入序）+ 逐键双删。
+                let keys: Vec<Rc<str>> = self
+                    .var_arena
+                    .root()
+                    .keys_with_prefix(&prefix)
+                    .into_iter()
+                    .filter(|k| k.ends_with(')'))
                     .collect();
                 for k in keys {
-                    self.globals.remove(&k);
+                    self.global_remove(&k);
                 }
                 let base = loc.base_name().to_string();
-                self.array_globals.remove(&base);
-                self.elem_counts.remove(&base);
                 // A deleted array's default dies with it (probe: unset
                 // then recreate -> no default).
                 if !self.array_defaults.is_empty() {
                     self.array_defaults.remove(&stamp_key(loc));
                 }
-                self.arrays_env_only = self
-                    .array_globals
-                    .iter()
-                    .all(|k| k == "env" || k == "tcl_platform");
-                self.globals.remove(&base);
+                self.global_unmark_array(&base);
+                self.global_remove(&base);
             }
             VarLoc::Frame(i, _) => {
                 if let Some(f) = self.frames.get_mut(*i) {
@@ -1204,7 +1570,7 @@ impl Interp {
 
     fn resolve_var(&self, name: &str) -> Option<&Value> {
         if let Some(gname) = Self::split_global(name) {
-            return self.globals.get(gname.as_str());
+            return self.global_get(gname.as_str());
         }
         if let Some(frame) = self.var_frame() {
             if let Some(link) = frame.upvars.get(name) {
@@ -1215,8 +1581,7 @@ impl Interp {
                     // refcounted; 46.8 `info exist x` → 1 after
                     // `namespace delete [namespace current]`).
                     UpvarLink::Global(gname) => self
-                        .globals
-                        .get(self.redirect_flat(gname.to_string()).as_str())
+                        .global_get(self.redirect_flat(gname.to_string()).as_str())
                         .or_else(|| frame.locals.get(name)),
                     UpvarLink::Frame { frame_index, var_name } => {
                         // Link installation degrades the target frame, so
@@ -1236,8 +1601,7 @@ impl Interp {
                         // 宿主已亡，同名全局元素不属于这条链（trv_p11
                         // ③④：帧占位 arr(1) vs 全局 arr(1)=2）。
                         if *was_global {
-                            self.globals
-                                .get(target.as_str())
+                            self.global_get(target.as_str())
                                 .or_else(|| frame.locals.get(name))
                         } else {
                             frame.locals.get(name)
@@ -1252,7 +1616,7 @@ impl Interp {
             // 字面 frame 查找不适用,variable 链接已由 upvars 臂处理。
             if name.contains("::") {
                 let key = self.redirect_flat(name.to_string());
-                return self.globals.get(key.as_str());
+                return self.global_get(key.as_str());
             }
             frame
                 .slot_value(name)
@@ -1266,7 +1630,7 @@ impl Interp {
             // same-named global is invisible from here (S7: reading a
             // global-only name inside a namespace body errors).
             let key = self.redirect_flat(self.canonical_global(name));
-            self.globals.get(key.as_str())
+            self.global_get(key.as_str())
         }
     }
 
@@ -1305,9 +1669,7 @@ impl Interp {
                     // unconditional insert dropped and re-stored the key
                     // String per write.
                     let key = self.redirect_flat(gname.to_string());
-                    if let Some(slot) = self.globals.get_mut(&key) {
-                        *slot = value;
-                    } else {
+                    if !self.global_overwrite(&key, &value) {
                         self.global_insert(key, value);
                     }
                 }
@@ -1402,12 +1764,12 @@ impl Interp {
     /// Remove a variable from the current scope, following upvar links.
     fn remove_var(&mut self, name: &str) {
         if let Some(gname) = Self::split_global(name) {
-            self.globals.remove(gname.as_str());
+            self.global_remove(gname.as_str());
             return;
         }
         if self.var_frame_idx().is_none() {
             let key = self.redirect_flat(self.canonical_global(name));
-            self.globals.remove(key.as_str());
+            self.global_remove(key.as_str());
             // Unsetting also forgets the `variable` declaration (tclsh:
             // `namespace which -variable` afterwards is empty).  Tcl 9:
             // a later read does NOT fall through to a same-named global
@@ -1422,7 +1784,7 @@ impl Interp {
             match link {
                 UpvarLink::Global(gname) => {
                     let gname = self.redirect_flat(gname.to_string());
-                    self.globals.remove(gname.as_str());
+                    self.global_remove(gname.as_str());
                 }
                 UpvarLink::Frame { frame_index, var_name } => {
                     if let Some(f) = self.frames.get_mut(frame_index) {
@@ -1505,9 +1867,9 @@ impl Interp {
             .strip_prefix("::")
             .filter(|rest| !rest.contains("::") && !rest.contains('('))
         {
-            if !self.array_globals.is_empty() && self.array_globals.contains(leaf) {
+            if self.global_any_array() && self.global_is_array(leaf) {
                 // 数组语义（is-array 错误文本归属全链）。
-            } else if let Some(v) = self.globals.get(leaf) {
+            } else if let Some(v) = self.global_get(leaf) {
                 return Ok(v);
             }
         }
@@ -1569,9 +1931,9 @@ impl Interp {
                         ));
                     }
                 } else if self.current_namespace.as_ref() == "::"
-                    && self.array_globals.contains(array_name)
+                    && self.global_is_array(array_name)
                 {
-                    if let Some(v) = self.globals.get(name) {
+                    if let Some(v) = self.global_get(name) {
                         return Ok(v);
                     }
                     if let Some(dv) = self.array_default_ref(array_name) {
@@ -1598,9 +1960,9 @@ impl Interp {
                         // 宿主不是死链别名（deaden 后的裸名读不得穿到旧
                         // 目标——T7 守卫同款，对 canonical 键再查一遍）。
                         if self.dead_flat.iter().all(|k| k != host)
-                            && self.array_globals.contains(host)
+                            && self.global_is_array(host)
                         {
-                            if let Some(v) = self.globals.get(elem) {
+                            if let Some(v) = self.global_get(elem) {
                                 return Ok(v);
                             }
                             if let Some(dv) = self.array_default_ref(host) {
@@ -1679,8 +2041,8 @@ impl Interp {
                         }
                     }
                 } else if self.current_namespace.as_ref() == "::" && self.flat_aliases.is_empty() {
-                    if let Some(v) = self.globals.get(name) {
-                        if !self.array_globals.is_empty() && self.array_globals.contains(name) {
+                    if let Some(v) = self.global_get(name) {
+                        if self.global_any_array() && self.global_is_array(name) {
                             return Err(Error::runtime(
                                 format!("can't read \"{}\": variable is array", name),
                                 ErrorCode::Generic,
@@ -1700,9 +2062,8 @@ impl Interp {
                     if let Some(key) =
                         stack_ns_key(self.current_namespace.as_ref(), name, &mut buf)
                     {
-                        if let Some(v) = self.globals.get(key) {
-                            if !self.array_globals.is_empty() && self.array_globals.contains(key)
-                            {
+                        if let Some(v) = self.global_get(key) {
+                            if self.global_any_array() && self.global_is_array(key) {
                                 return Err(Error::runtime(
                                     format!("can't read \"{}\": variable is array", name),
                                     ErrorCode::Generic,
@@ -1777,7 +2138,7 @@ impl Interp {
             // That namespace's own table.
             Self::split_global(name).is_some_and(|key| {
                 key.contains("::")
-                    || self.phantom_globals.contains(&key)
+                    || self.global_is_undefined(&key)
                     || self
                         .namespaces
                         .get("::")
@@ -1943,10 +2304,9 @@ impl Interp {
                         }
                     }
                 } else if self.current_namespace.as_ref() == "::"
-                    && self.array_globals.contains(array_name)
+                    && self.global_is_array(array_name)
                 {
-                    if let Some(slot) = self.globals.get_mut(name) {
-                        *slot = value.clone();
+                    if self.global_overwrite(name, &value) {
                         wrote = true;
                     }
                 }
@@ -1986,8 +2346,9 @@ impl Interp {
             let loc = self.resolve_loc(array_name);
             if self.loc_is_array(&loc) {
                 let key = loc.element_key(index);
-                let existed = self.loc_get(&loc, &key).is_some();
-                self.loc_insert(&loc, key, value.clone());
+                // D1 步骤 1：存在性 = 插入的新建位（单探测免先行
+                // loc_get 大表探测）。
+                let existed = !self.loc_insert(&loc, key, value.clone());
                 if !existed {
                     // New element: element-set mutation invalidates searches.
                     self.bump_stamp(&loc);
@@ -2054,10 +2415,9 @@ impl Interp {
                     }
                 } else if self.current_namespace.as_ref() == "::"
                     && self.flat_aliases.is_empty()
-                    && (self.arrays_env_only || !self.array_globals.contains(name))
+                    && (self.arrays_env_only || !self.global_is_array(name))
                 {
-                    if let Some(slot) = self.globals.get_mut(name) {
-                        *slot = value.clone();
+                    if self.global_overwrite(name, &value) {
                         wrote = true;
                     }
                 } else if self.current_namespace.as_ref() != "::"
@@ -2071,10 +2431,9 @@ impl Interp {
                     if let Some(key) =
                         stack_ns_key(self.current_namespace.as_ref(), name, &mut buf)
                     {
-                        if !self.array_globals.is_empty() && self.array_globals.contains(key) {
+                        if self.global_any_array() && self.global_is_array(key) {
                             // 数组语义（is-array 错误文本归属全链）。
-                        } else if let Some(slot) = self.globals.get_mut(key) {
-                            *slot = value.clone();
+                        } else if self.global_overwrite(key, &value) {
                             wrote = true;
                         }
                     }
@@ -2129,19 +2488,30 @@ impl Interp {
 
     /// The slot a change to the scalar `name` writes, for making the
     /// change in place (tclsh: mutate the refcnt==1 object in the
-    /// variable's own table entry).  Returns `None` unless every guard
-    /// for the mutation fast path holds: unqualified scalar name, no
-    /// upvar/dead link, not an array, no variable traces registered
-    /// anywhere, and the variable currently exists.  Nothing is taken out
-    /// of a table — a value lifted out and put back used to leave a
-    /// second entry in the scope's insertion log, and a listing replays
-    /// a second entry as a variable made anew: it jumped to the head of
+    /// variable's own table entry).  `f` runs on the resolved cell when
+    /// every guard for the mutation fast path holds: unqualified scalar
+    /// name, no upvar/dead link, not an array, no variable traces
+    /// registered anywhere, and the variable currently exists; `None`
+    /// (f never runs) otherwise — callers fall back to the commands' own
+    /// paths, which go through `set_var`.  Nothing is taken out of a
+    /// table — a value lifted out and put back used to leave a second
+    /// entry in the scope's insertion log, and a listing replays a
+    /// second entry as a variable made anew: it jumped to the head of
     /// its bucket.
     ///
-    /// The guards matter for more than speed: with a trace registered the
-    /// write has to fire it, and the callers fall back to the commands'
-    /// own paths, which go through `set_var`.
-    pub(crate) fn var_slot_fast(&mut self, name: &str) -> Option<&mut Value> {
+    /// D1 步骤 1：全局臂的 `f` 先施加于 arena 权威格、再重放于平表
+    /// 镜像格（[`Self::global_cell`] 的双写）——`f` 必须可重放；ts/帧
+    /// 臂单次施加（无镜像）。返回值取 arena 施加的产出。
+    ///
+    /// 返回形的分层：外层 `None` = 无格可施（守卫拦截/变量缺席——
+    /// 调用方回落全链）；内层 `None` = 格在席但 `f` 婉拒（[`Self::
+    /// with_dict_slot`] 据此**不**再试 link 臂——旧 with_dict_slot 的
+    /// 语义）。[`Self::with_var_slot`] 是拍平的便利形。
+    pub(crate) fn with_var_slot_res<R>(
+        &mut self,
+        name: &str,
+        mut f: impl FnMut(&mut Value) -> Option<R>,
+    ) -> Option<Option<R>> {
         if has_ns_sep(name)
             || name.contains('(')
             || !self.var_traces.is_empty()
@@ -2157,7 +2527,7 @@ impl Interp {
                         return None;
                     }
                     let cell = &mut ts.values[i];
-                    return if cell.is_unset() { None } else { Some(cell) };
+                    return if cell.is_unset() { None } else { Some(f(cell)) };
                 }
                 // 非槽名 → 落下方全局路径
             }
@@ -2183,43 +2553,59 @@ impl Interp {
                     if cell.is_unset() {
                         return None;
                     }
-                    Some(cell)
+                    Some(f(cell))
                 }
-                None => frame.locals.get_mut(name),
+                None => frame.locals.get_mut(name).map(|cell| f(cell)),
             }
         } else {
             if !self.flat_aliases.is_empty() || !self.ns_transient.is_empty() {
                 return None;
             }
             if self.current_namespace.as_ref() == "::" {
-                if !self.arrays_env_only && self.array_globals.contains(name) {
+                if !self.arrays_env_only && self.global_is_array(name) {
                     return None;
                 }
-                return self.globals.get_mut(name);
+                return self.global_cell(name, f);
             }
             // T4 vars：ns 体裸名（incr 热径）——键栈上拼，与 scalar
             // 直写守卫同一构造；数组语义与超长回落真 incr（其建名、
             // 非整数与溢出错误文本归它）。
             let mut buf = [0u8; 64];
             let key = stack_ns_key(self.current_namespace.as_ref(), name, &mut buf)?;
-            if !self.arrays_env_only && self.array_globals.contains(key) {
+            if !self.arrays_env_only && self.global_is_array(key) {
                 return None;
             }
-            self.globals.get_mut(key)
+            self.global_cell(key, f)
         }
     }
 
-    /// [`Self::var_slot_fast`] where plain frame-local travel won't do:
+    /// [`Self::with_var_slot_res`] 拍平形（无格与婉拒同形 `None`——
+    /// `incr`/`lappend`/`append` 的回落不区分二者）。
+    pub(crate) fn with_var_slot<R>(
+        &mut self,
+        name: &str,
+        f: impl FnMut(&mut Value) -> Option<R>,
+    ) -> Option<R> {
+        self.with_var_slot_res(name, f).flatten()
+    }
+
+    /// [`Self::with_var_slot`] where plain frame-local travel won't do:
     /// the proc-level `variable` link (`UpvarLink::Global` — the alias a
     /// `variable` declaration installs to the owning namespace's
     /// variable), qualified names (`::m …`), and bare/relative-qualified
     /// names at eval level under the namespace's canonical write key.
     /// Same guards; nothing is taken out of a table (see
-    /// [`Self::var_slot_fast`]).
+    /// [`Self::with_var_slot`]).
     ///
     /// The store keys here mirror `store_var`/`resolve_loc` exactly
-    /// (`redirect_flat` over the split/canonical forms).
-    pub(crate) fn var_slot_fast_link(&mut self, name: &str) -> Option<&mut Value> {
+    /// (`redirect_flat` over the split/canonical forms).  全局臂双写同
+    /// 上（arena 权威 + 镜像重放）。返回形分层同
+    /// [`Self::with_var_slot_res`]。
+    pub(crate) fn with_var_slot_link_res<R>(
+        &mut self,
+        name: &str,
+        f: impl FnMut(&mut Value) -> Option<R>,
+    ) -> Option<Option<R>> {
         if name.contains('(')
             || !self.var_traces.is_empty()
             || !self.dead_flat.is_empty()
@@ -2232,14 +2618,14 @@ impl Interp {
         //     split_global arm short-circuits the frame walk).
         if let Some(gname) = Self::split_global(name) {
             let key = gname;
-            if (!self.arrays_env_only && self.array_globals.contains(key.as_str())) {
+            if !self.arrays_env_only && self.global_is_array(&key) {
                 return None;
             }
-            return self.globals.get_mut(key.as_str());
+            return self.global_cell(&key, f);
         }
 
         // (1) Proc level: only the `variable` command's namespace link.
-        //     Unlinked proc locals are handled by var_slot_fast.
+        //     Unlinked proc locals are handled by with_var_slot.
         if let Some(frame) = self.var_frame() {
             let target = match frame.upvars.get(name) {
                 Some(UpvarLink::Global(g)) => g.to_string(),
@@ -2249,7 +2635,7 @@ impl Interp {
             // keep the eval-level flat-alias redirect in step with
             // resolve_var's read path.
             let key = self.redirect_flat(target);
-            if (!self.arrays_env_only && self.array_globals.contains(key.as_str())) {
+            if !self.arrays_env_only && self.global_is_array(&key) {
                 return None; // element/array target: scalar writes take the generic path
             }
             // Release the `variable` command's seeded local hold as well:
@@ -2262,7 +2648,7 @@ impl Interp {
             if let Some(frame) = self.var_frame_mut() {
                 frame.locals.remove(name);
             }
-            return self.globals.get_mut(key.as_str());
+            return self.global_cell(&key, f);
         }
 
         // (2) Eval level: qualified (`::m`), relative-qualified (`sub::m`)
@@ -2270,63 +2656,94 @@ impl Interp {
         //     canonical WRITE key (store_var's eval arm), through the
         //     flat-alias redirect exactly as resolve_loc computes it.
         let key = self.redirect_flat(self.canonical_global(name));
-        if (!self.arrays_env_only && self.array_globals.contains(key.as_str())) {
+        if !self.arrays_env_only && self.global_is_array(&key) {
             return None;
         }
-        self.globals.get_mut(key.as_str())
+        self.global_cell(&key, f)
+    }
+
+    /// [`Self::with_var_slot_link_res`] 拍平形。
+    pub(crate) fn with_var_slot_link<R>(
+        &mut self,
+        name: &str,
+        f: impl FnMut(&mut Value) -> Option<R>,
+    ) -> Option<R> {
+        self.with_var_slot_link_res(name, f).flatten()
     }
 
     /// Run `f` on the slot `dict set` changes in place — an ordinary
     /// local or global, else through a `variable` link or a qualified
-    /// name (see [`Self::var_slot_fast`] and [`Self::var_slot_fast_link`])
-    /// — and return what it returned; `None` when no guard let the change
-    /// in place, or when `f` declined (it returns `None`).
+    /// name (see [`Self::with_var_slot_res`] and
+    /// [`Self::with_var_slot_link_res`]) — and return what it returned;
+    /// `None` when no guard let the change in place, or when `f`
+    /// declined (it returns `None` — the link arm is then NOT tried,
+    /// exactly as the old raw-&mut resolver behaved).
     pub(crate) fn with_dict_slot<R>(
         &mut self,
         name: &str,
-        f: impl FnOnce(&mut Value) -> Option<R>,
+        mut f: impl FnMut(&mut Value) -> Option<R>,
     ) -> Option<R> {
-        let slot = self.var_slot_fast(name);
-        let slot = match slot {
-            Some(v) => v,
-            None => self.var_slot_fast_link(name)?,
-        };
-        f(slot)
+        // `f` 经重放包装传入（全局臂的双写会调它两次——arena 权威 +
+        // 镜像重放）；ts/帧臂单次。首臂**有格**即止（含婉拒）——无格
+        // 才走 link 臂。
+        match self.with_var_slot_res(name, |cell| f(cell)) {
+            Some(r) => r,
+            None => match self.with_var_slot_link_res(name, |cell| f(cell)) {
+                Some(r) => r,
+                None => None,
+            },
+        }
     }
 
     /// The live keys of the :: table in Tcl hash-table order — bare
     /// globals and namespace variables (`n::x`), array elements left out:
     /// what `info globals` and `info vars` list from, and what the
-    /// element keys of an array ride along with.  The insertion log is
-    /// replayed keeping a key's LAST occurrence: in a Tcl hash table a
-    /// variable made again after a delete takes a new place (the head of
-    /// its bucket), unlike a plain re-set, which never touches the log.
+    /// element keys of an array ride along with.
+    ///
+    /// D1 步骤 1：arena 插入序向量跳洞枚举（有值条目——无值 phantom
+    /// 不列，与旧「globals 含键」过滤一致），经调用方的 tcl_order 重放
+    /// 产出 tclsh 表序。debug 下同时走旧路径（`var_order` 插入日志的
+    /// liveness 过滤 + 保留末次出现）对拍**同一序列**——顺序语义红线
+    /// 的迁移期对拍；重放的对拍在最终验证通过后才许退役（步骤 5）。
     pub(crate) fn global_var_order(&self) -> Vec<&str> {
-        let log = &self.var_order;
         // An element key `n::a(k)` or `a(k)`: the array's name has a
         // parenthesised tail.
         let not_element = |k: &str| {
             !k.rsplit("::").next().is_some_and(|last| last.contains('('))
         };
-        if log.len() == self.globals.len() {
-            // No stale entry, so no duplicate either: the log is the table
-            // in insertion order, and no key needs a lookup.
-            return log
-                .iter()
-                .map(String::as_str)
-                .filter(|k| not_element(k))
-                .collect();
+        let order: Vec<&str> = self
+            .var_arena
+            .root()
+            .order_entries()
+            .filter(|(_, v)| v.has_value())
+            .map(|(k, _)| k.as_ref())
+            .filter(|k| not_element(k))
+            .collect();
+        #[cfg(debug_assertions)]
+        {
+            let log = &self.var_order;
+            let old: Vec<&str> = if log.len() == self.globals.len() {
+                // No stale entry, so no duplicate either: the log is the
+                // table in insertion order, and no key needs a lookup.
+                log.iter()
+                    .map(String::as_str)
+                    .filter(|k| not_element(k))
+                    .collect()
+            } else {
+                let mut seen: std::collections::HashSet<&str> =
+                    std::collections::HashSet::with_capacity(self.globals.len());
+                let mut o: Vec<&str> = Vec::with_capacity(self.globals.len());
+                for k in log.iter().rev() {
+                    let k = k.as_str();
+                    if not_element(k) && self.globals.contains_key(k) && seen.insert(k) {
+                        o.push(k);
+                    }
+                }
+                o.reverse();
+                o
+            };
+            debug_assert_eq!(order, old, "D1 对拍: info 列举序");
         }
-        let mut seen: std::collections::HashSet<&str> =
-            std::collections::HashSet::with_capacity(self.globals.len());
-        let mut order: Vec<&str> = Vec::with_capacity(self.globals.len());
-        for k in log.iter().rev() {
-            let k = k.as_str();
-            if not_element(k) && self.globals.contains_key(k) && seen.insert(k) {
-                order.push(k);
-            }
-        }
-        order.reverse();
         order
     }
 
@@ -2476,27 +2893,35 @@ impl Interp {
                 *cell = Value::from_int(next);
             } else {
                 if self.current_namespace.as_ref() != "::"
-                    || !self.array_globals.contains(array_name)
+                    || !self.global_is_array(array_name)
                 {
                     return None;
                 }
-                let cell = self.globals.get_mut(name)?;
-                let current = cell.as_int()?;
-                next = current.checked_add(amount)?;
-                *cell = Value::from_int(next);
+                // D1 步骤 1：arena 权威格 + 镜像重放（global_cell——
+                // set_int_rep 的整型 retag 可重放）。
+                next = self
+                    .global_cell(name, |cell| {
+                        let current = cell.as_int()?;
+                        let nxt = current.checked_add(amount)?;
+                        cell.set_int_rep(nxt);
+                        Some(nxt)
+                    })
+                    .flatten()?;
             }
             if !self.trace_phantoms.is_empty() {
                 self.clear_phantom(array_name, index);
             }
             return Some(Value::from_int(next));
         }
-        let slot = self.var_slot_fast(name)?;
-        let current = slot.as_int()?;
-        // Overflow（含 bignum 现值）属于真 `incr`——cmd_incr 的
-        // BigInt 精确和（D5：9.1 任意精度默认，不回绕）。
-        let next = current.checked_add(amount)?;
-        slot.set_int_rep(next);
-        Some(slot.clone())
+        // D1 步骤 1：with_var_slot（全局臂双写 arena + 镜像重放）。
+        self.with_var_slot(name, |slot| {
+            let current = slot.as_int()?;
+            // Overflow（含 bignum 现值）属于真 `incr`——cmd_incr 的
+            // BigInt 精确和（D5：9.1 任意精度默认，不回绕）。
+            let next = current.checked_add(amount)?;
+            slot.set_int_rep(next);
+            Some(slot.clone())
+        })
     }
 
     pub fn unset_var(&mut self, name: &str) -> Result<()> {
@@ -2623,7 +3048,7 @@ impl Interp {
                     self.drop_global_seeds(&k);
                     // The entry goes with its traces (a traced variable
                     // that was never set leaves the table).
-                    self.phantom_globals.remove(&k);
+                    self.global_forget_phantom(&k);
                 }
                 // The key from where the variable WAS: by name it would
                 // no longer resolve there (the chain needs the variable).
@@ -2661,7 +3086,7 @@ impl Interp {
                 // global reached from inside a namespace body.
                 if let VarLoc::Global(k) = &loc {
                     let k = k.clone();
-                    self.phantom_globals.remove(&k);
+                    self.global_forget_phantom(&k);
                     if let Some(info) = self.namespaces.get_mut("::") {
                         info.variables.remove(&k);
                     }
@@ -2713,9 +3138,9 @@ impl Interp {
                         return frame.locals.contains_key(name);
                     }
                 } else if self.current_namespace.as_ref() == "::"
-                    && self.array_globals.contains(array_name)
+                    && self.global_is_array(array_name)
                 {
-                    return self.globals.contains_key(name);
+                    return self.global_has(name);
                 }
             }
             // Tcl 9: a bare array base is the current namespace's own
@@ -3103,7 +3528,7 @@ impl Interp {
         let gen0 = self.array_generation;
         let alive = |t: &Self| match owner_fi {
             Some(i) => t.frames.get(i).map(|f| f.locals.contains_key(base)),
-            None => Some(t.globals.contains_key(base)),
+            None => Some(t.global_has(base)),
         };
         let (whole, elems) = self.collect_trace_scripts(&key, Some(elem), "read");
         let q = |v: &str| Value::from_list(&[Value::from_str(v)]).as_str().to_string();
@@ -3135,7 +3560,7 @@ impl Interp {
         let ekey = format!("{}({})", base, elem);
         Ok(match owner_fi {
             Some(i) => self.frames.get(i).and_then(|f| f.locals.get(&ekey)).cloned(),
-            None => self.globals.get(&ekey).cloned(),
+            None => self.global_get(&ekey).cloned(),
         })
     }
 
@@ -3219,12 +3644,14 @@ impl Interp {
             // The same lookup a read through the link performs — the
             // seeded copy is exactly what the later fallback returns.
             let key = self.redirect_flat(target.clone());
+            // D1 步骤 1：读经 arena（global_get 是全 self 借用——值先
+            // 拷出再进帧插入，借用收口）。
             let v = self
-                .globals
-                .get(key.as_str())
-                .or_else(|| self.globals.get(target.trim_start_matches(':')));
+                .global_get(key.as_str())
+                .or_else(|| self.global_get(target.trim_start_matches(':')))
+                .cloned();
             if let Some(v) = v {
-                frame_local_insert(&mut self.frames[fi], name.to_string(), v.clone());
+                frame_local_insert(&mut self.frames[fi], name.to_string(), v);
             }
         }
     }
@@ -3357,10 +3784,10 @@ impl Interp {
             if leaf.contains("::") || self.top_slots.is_some() {
                 return None;
             }
-            if !self.array_globals.is_empty() && self.array_globals.contains(leaf) {
+            if self.global_any_array() && self.global_is_array(leaf) {
                 return None; // 数组语义（is-array 错误文本归属全链）
             }
-            return self.globals.get(leaf);
+            return self.global_get(leaf);
         }
         if has_ns_sep(name) {
             return None;
@@ -3370,10 +3797,10 @@ impl Interp {
             if !self.flat_aliases.is_empty() {
                 return None;
             }
-            if !self.array_globals.is_empty() && self.array_globals.contains(name) {
+            if self.global_any_array() && self.global_is_array(name) {
                 return None; // 数组语义（is-array 错误文本归属全链）
             }
-            return self.globals.get(name);
+            return self.global_get(name);
         }
         // T4 命名空间体裸名臂：键栈上拼（超长回落），平键重定向缺席
         // 时 `<ns>::<名字>` 与 canonical_global+redirect_flat 的产出逐
@@ -3385,10 +3812,10 @@ impl Interp {
         }
         let mut buf = [0u8; 64];
         let key = stack_ns_key(self.current_namespace.as_ref(), name, &mut buf)?;
-        if !self.array_globals.is_empty() && self.array_globals.contains(key) {
+        if self.global_any_array() && self.global_is_array(key) {
             return None; // 数组语义（is-array 错误文本归属全链）
         }
-        self.globals.get(key)
+        self.global_get(key)
     }
 
     /// 顶层标量直写实守卫（set_var_scalar_top 前置；分离以避免 value
@@ -3412,8 +3839,10 @@ impl Interp {
             return false;
         }
         if self.current_namespace.as_ref() == "::" {
+            // 旧形 `array_globals.is_empty() || !contains(name)` 的等价
+            // （启动数组在场时 is_empty 恒假——守卫即 `!contains`）。
             return self.flat_aliases.is_empty()
-                && (self.array_globals.is_empty() || !self.array_globals.contains(name));
+                && !(self.global_any_array() && self.global_is_array(name));
         }
         // T4 命名空间体裸名覆写臂。
         if !self.flat_aliases.is_empty() || !self.ns_transient.is_empty() {
@@ -3423,8 +3852,7 @@ impl Interp {
         let Some(key) = stack_ns_key(self.current_namespace.as_ref(), name, &mut buf) else {
             return false;
         };
-        (self.array_globals.is_empty() || !self.array_globals.contains(key))
-            && self.globals.contains_key(key)
+        !(self.global_any_array() && self.global_is_array(key)) && self.global_has(key)
     }
 
     /// 顶层标量直写（守卫由 scalar_top_write_ok 前置；写 trace 已被
@@ -3436,8 +3864,7 @@ impl Interp {
         if self.current_namespace.as_ref() != "::" {
             let mut buf = [0u8; 64];
             if let Some(key) = stack_ns_key(self.current_namespace.as_ref(), name, &mut buf) {
-                if let Some(slot) = self.globals.get_mut(key) {
-                    *slot = value;
+                if self.global_overwrite(key, &value) {
                     return;
                 }
             }
@@ -3524,7 +3951,9 @@ impl Interp {
                 .get(i)
                 .and_then(|f| f.elem_counts.get(&base))
                 .copied(),
-            None => self.elem_counts.get(&base).copied(),
+            // D1 步骤 1：全局域计数 = 数组 Var 的 elem_count 字段
+            // （T7 语义保持——None 形与旧「计数未跟踪」同观）。
+            None => self.global_elem_count(&base),
         }
     }
 
@@ -3589,8 +4018,46 @@ impl Interp {
         };
         match &loc {
             VarLoc::Global(_) => {
-                let n = self.globals.len();
-                collect(&self.var_order, &|k| self.globals.contains_key(k), n)
+                // D1 步骤 1：array names（live_only）走 arena 插入序向量
+                // 跳洞枚举（有值条目）+ 同一 tcl_order 重放；debug 下对
+                // 拍旧日志重放路径同序（顺序语义红线）。history 形
+                // （array statistics——需已删键）保留旧日志路径（日志镜
+                // 像迁移期保留）。
+                if live_only {
+                    let keys: Vec<&str> = self
+                        .var_arena
+                        .root()
+                        .order_entries()
+                        .filter(|(_, v)| v.has_value())
+                        .map(|(k, _)| k.as_ref())
+                        .filter(|k| is_element(k))
+                        .map(|k| &k[prefix.len()..k.len() - 1])
+                        .collect();
+                    let out: Vec<String> = tclhash::tcl_order(keys.iter().copied())
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect();
+                    #[cfg(debug_assertions)]
+                    {
+                        let n = self.globals.len();
+                        let old =
+                            collect(&self.var_order, &|k| self.globals.contains_key(k), n);
+                        debug_assert_eq!(out, old, "D1 对拍: array names 序");
+                    }
+                    out
+                } else {
+                    // D1 步骤 1：历史面（array statistics）的活性过滤走
+                    // arena（release 镜像退场）；live_count 参数在该分支
+                    // 不被读取（快径条件只挂 live_only）。
+                    let n = self.var_arena.root().len();
+                    let live = |k: &str| {
+                        self.var_arena
+                            .root()
+                            .get(k)
+                            .is_some_and(|v| v.has_value())
+                    };
+                    collect(&self.var_order, &live, n)
+                }
             }
             VarLoc::Frame(i, _) => self
                 .frames

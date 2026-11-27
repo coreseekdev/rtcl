@@ -83,7 +83,8 @@ fn pkg_require(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // Try to auto-load from $auto_path
     #[cfg(feature = "file")]
     {
-        let auto_path = interp.globals.get("auto_path")
+        // D1 步骤 1：读经 arena。
+        let auto_path = interp.global_get("auto_path")
             .map(|v| v.as_str().to_string())
             .unwrap_or_default();
         if !auto_path.is_empty() {

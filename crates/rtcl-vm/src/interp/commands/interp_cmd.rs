@@ -868,7 +868,8 @@ impl Interp {
     /// interpreter that asked for this one to be evaluated.
     fn error_state(&self) -> (Option<Value>, bool, Option<String>, bool) {
         (
-            self.globals.get("errorCode").cloned(),
+            // D1 步骤 1：读经 arena。
+            self.global_get("errorCode").cloned(),
             self.err_code_raised,
             self.err_info.clone(),
             self.err_fresh,

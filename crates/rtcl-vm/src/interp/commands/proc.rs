@@ -1011,7 +1011,8 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // target when one exists; reads/writes still go through the
         // link.
         let mirror: Option<Value> = match &link {
-            UpvarLink::Global(gname) => interp.globals.get(&**gname).cloned(),
+            // D1 步骤 1：读经 arena。
+            UpvarLink::Global(gname) => interp.global_get(&**gname).cloned(),
             UpvarLink::Frame { frame_index, var_name } => interp
                 .frames
                 .get(*frame_index)
@@ -1143,7 +1144,8 @@ pub fn cmd_global(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // value to mirror the link is still a table entry: log its
         // creation so the hash-order replay lists it (tclsh:
         // `global nosuch; info vars` lists nosuch).
-        match interp.globals.get(&target) {
+        // D1 步骤 1：读经 arena。
+        match interp.global_get(&target) {
             Some(v) => {
                 let v = v.clone();
                 super::super::vars::frame_local_insert(

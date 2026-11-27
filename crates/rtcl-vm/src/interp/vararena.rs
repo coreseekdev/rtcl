@@ -1,6 +1,5 @@
 //! VarArena — D1 变量表重写（specs/ARCH-DESIGN-20261126.md D1）的基础
 //! 设施：generation-guarded 句柄 arena + 有序 Var 表。
-#![allow(dead_code)] // 步骤 1 迁移提交接线读写面后收窄到未接线句柄 API
 //!
 //! 目标形状（D1 节）：三类表——全局表（每命名空间一张）、帧变量表、
 //! 数组元素表——都是真实哈希容器（桶链 + 插入序向量，顺序天然，删除
@@ -37,7 +36,11 @@ use alloc::rc::Rc;
 #[cfg(feature = "embedded")]
 use alloc::vec;
 #[cfg(feature = "embedded")]
+use alloc::string::String;
+#[cfg(feature = "embedded")]
 use alloc::vec::Vec;
+#[cfg(not(feature = "embedded"))]
+use std::string::String;
 #[cfg(not(feature = "embedded"))]
 use std::vec::Vec;
 
@@ -52,6 +55,7 @@ const NO_SLOT: u32 = u32::MAX;
 
 /// 表身份（D1：三类表）。步骤 1 只用 `Global(0)`；`Frame`/`Array` 为
 /// 步骤 2/3 的占位臂。
+#[allow(dead_code)] // 步骤 2/3 接线后移除（Frame/Array 臂占位）
 #[derive(Debug, Clone)]
 pub(crate) enum TableId {
     /// 全局（命名空间）表：[`VarArena::tables`] 的下标。
@@ -64,6 +68,8 @@ pub(crate) enum TableId {
 
 /// 「解析一次」返回的句柄：表 + 槽 + 代数。槽删除后代数递增，持旧
 /// 句柄的读取一律 miss（返回 None）——指针稳定与 ABA 防护并存。
+/// （句柄 API 的消费面在步骤 2/3 接线——「解析一次」替代平键快径。）
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct VarRef {
     pub table: TableId,
@@ -88,6 +94,7 @@ impl VarFlags {
     /// `set` 的重叠态下两位同置（对拍逐位镜像，vars.rs 双写层维护）。
     pub(crate) const UNDEFINED: Self = Self(1 << 1);
     /// 被链接（步骤 3/4 链接面迁入时启用；本批恒 0）。
+    #[allow(dead_code)]
     pub(crate) const LINKED: Self = Self(1 << 2);
 
     #[inline]
@@ -108,10 +115,12 @@ impl VarFlags {
 
 /// trace 集占位（步骤 4：`var_traces`/`elem_traces`/`trace_phantoms`
 /// 三表收进 `Var.traces`；本批恒 `None`——不可构造类型使占位零成本）。
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) enum TraceSet {}
 
 /// 链接目标占位（步骤 3/4：链接/死链面迁入；本批恒 `None`）。
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) enum LinkTarget {}
 
@@ -127,8 +136,10 @@ pub(crate) struct Var {
     /// 域；帧域随步骤 2/3）。
     pub elem_count: u32,
     /// 变量/元素 trace 集（步骤 4 挂载；本批恒 `None`）。
+    #[allow(dead_code)]
     pub traces: Option<TraceSet>,
     /// 链接目标（步骤 3/4 迁入；本批恒 `None`）。
+    #[allow(dead_code)]
     pub link: Option<LinkTarget>,
 }
 
@@ -213,6 +224,16 @@ pub(crate) struct VarTable {
     free: Vec<u32>,
     /// ARRAY 标记条目数（`!array_globals.is_empty()` 守卫的 O(1) 等价）。
     arrays: u32,
+    /// 数组基快索引：基键 → 槽下标。**访问路径，非平行存储**——ARRAY
+    /// 位与元素计数只存在 Var 上，本索引只把它们做成 O(1) 小表探测
+    /// （旧 `array_globals`/`elem_counts` 是 1-2 条目的微小集合，探测
+    /// 近乎免费；元素平键与基键同表期间（步骤 3 拆元素表前），对 8 万
+    /// 元素大表探测基键是 T7 快径的成本回退——本索引保持旧成本形）。
+    /// 维护点：mark/unmark/remove（位变化即同步）。
+    #[cfg(not(feature = "embedded"))]
+    arr_index: super::varmap::VarMap<u32>,
+    #[cfg(feature = "embedded")]
+    arr_index: alloc::collections::BTreeMap<Rc<str>, u32>,
 }
 
 impl Default for VarTable {
@@ -233,6 +254,10 @@ impl VarTable {
             live: 0,
             free: Vec::new(),
             arrays: 0,
+            #[cfg(not(feature = "embedded"))]
+            arr_index: super::varmap::VarMap::default(),
+            #[cfg(feature = "embedded")]
+            arr_index: alloc::collections::BTreeMap::new(),
         }
     }
 
@@ -243,6 +268,7 @@ impl VarTable {
     }
 
     /// 空（无活条目）。
+    #[allow(dead_code)] // 表 API 面（测试用；步骤 2/3 接线）
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.live == 0
@@ -254,7 +280,90 @@ impl VarTable {
         self.arrays
     }
 
+    /// 数组基是否全为启动数组（env/tcl_platform）——`arrays_env_only`
+    /// 重算的 arena 侧真源（旧形：镜像集 `iter().all(...)` 逐字同域）。
+    pub(crate) fn arrays_all_startup(&self) -> bool {
+        self.arr_index
+            .keys()
+            .all(|k| k == "env" || k == "tcl_platform")
+    }
+
+    /// 数组基标记探测（小表快索引——T7 成本形保持；位真值在 Var 上，
+    /// 索引与位同步维护）。
+    #[inline]
+    pub(crate) fn is_array_base(&self, key: &str) -> bool {
+        self.arr_index.contains_key(key)
+    }
+
+    /// 数组基的 Var 访问（经快索引 → 槽）。计数读写走这条单探测路径。
+    #[inline]
+    pub(crate) fn array_var(&self, key: &str) -> Option<&Var> {
+        let &sidx = self.arr_index.get(key)?;
+        Some(self.slots[sidx as usize].var.as_ref().expect("indexed slot"))
+    }
+
+    #[inline]
+    pub(crate) fn array_var_mut(&mut self, key: &str) -> Option<&mut Var> {
+        let sidx = *self.arr_index.get(key)?;
+        Some(self.slots[sidx as usize].var.as_mut().expect("indexed slot"))
+    }
+
+    /// 数组基标记（位 + 计数；快索引对账）。无条目时建无值 Var
+    /// （启动窗口：标记先于基键落表——插入序红线不动）。已标记时只
+    /// 更新计数。
+    pub(crate) fn mark_array(&mut self, key: &str, count: Option<u32>) {
+        if let Some(&sidx) = self.arr_index.get(key) {
+            if let Some(n) = count {
+                self.slots[sidx as usize]
+                    .var
+                    .as_mut()
+                    .expect("indexed slot")
+                    .elem_count = n;
+            }
+            return;
+        }
+        match self.slot_of(key) {
+            Some(sidx) => {
+                let was = {
+                    let var = self.slots[sidx as usize].var.as_mut().expect("live slot");
+                    let was = var.is_array();
+                    var.flags.insert(VarFlags::ARRAY);
+                    if let Some(n) = count {
+                        var.elem_count = n;
+                    }
+                    was
+                };
+                if !was {
+                    self.arrays += 1;
+                    self.arr_index.insert(key.to_string(), sidx);
+                }
+            }
+            None => {
+                let mut var = Var::with_value(Value::unset());
+                var.flags.insert(VarFlags::ARRAY);
+                if let Some(n) = count {
+                    var.elem_count = n;
+                }
+                // 走 insert（ARRAY 条目入表时快索引自动对账）。
+                self.insert(Rc::from(key), var);
+            }
+        }
+    }
+
+    /// 数组基摘标（计数随位同清；快索引对账）。
+    pub(crate) fn unmark_array(&mut self, key: &str) {
+        if let Some(&sidx) = self.arr_index.get(key) {
+            let slot = &mut self.slots[sidx as usize];
+            let var = slot.var.as_mut().expect("indexed slot");
+            var.flags.remove(VarFlags::ARRAY);
+            var.elem_count = 0;
+            self.arrays -= 1;
+            self.arr_index.remove(key);
+        }
+    }
+
     /// 是否持有该键的条目（有值或占位皆算——「表里有这条 Var」）。
+    #[allow(dead_code)] // 表 API 面（测试用；步骤 2/3 接线）
     pub(crate) fn contains(&self, key: &str) -> bool {
         self.slot_of(key).is_some()
     }
@@ -312,12 +421,13 @@ impl VarTable {
                     if was_array != new_is_array {
                         self.arrays += u32::from(new_is_array);
                         self.arrays -= u32::from(was_array);
+                        self.reconcile_arr_index(&key, idx, was_array);
                     }
                     return self.ref_of(idx);
                 }
                 idx = self.slots[idx as usize].next;
             }
-            let sidx = self.alloc_slot(key, bidx);
+            let sidx = self.alloc_slot(key.clone(), bidx);
             let is_array = {
                 let slot = &mut self.slots[sidx as usize];
                 slot.var = Some(var);
@@ -325,6 +435,7 @@ impl VarTable {
             };
             if is_array {
                 self.arrays += 1;
+                self.arr_index.insert(key.as_ref().to_string(), sidx);
             }
             self.order.push(sidx);
             self.slots[sidx as usize].order_pos = (self.order.len() - 1) as u32;
@@ -347,11 +458,12 @@ impl VarTable {
                     if was_array != new_is_array {
                         self.arrays += u32::from(new_is_array);
                         self.arrays -= u32::from(was_array);
+                        self.reconcile_arr_index(&key, sidx, was_array);
                     }
                     VarRef { table: TableId::Global(0), slot: sidx, gen: self.slots[sidx as usize].gen }
                 }
                 None => {
-                    let sidx = self.alloc_slot(key);
+                    let sidx = self.alloc_slot(key.clone());
                     let is_array = {
                         let slot = &mut self.slots[sidx as usize];
                         slot.var = Some(var);
@@ -359,6 +471,7 @@ impl VarTable {
                     };
                     if is_array {
                         self.arrays += 1;
+                        self.arr_index.insert(key, sidx);
                     }
                     self.order.push(sidx);
                     self.slots[sidx as usize].order_pos = (self.order.len() - 1) as u32;
@@ -368,6 +481,143 @@ impl VarTable {
                 }
             }
         }
+    }
+
+    /// 上值到既有**无值**条目（phantom 占位/启动数组标记）：序位按新
+    /// 建处理——移到插入序末尾、旧位留洞。与平表镜像的日志语义逐字
+    /// 同（map-insert-new 必进插入日志；无值条目不列——它此前从未在
+    /// 列举域出现过）。槽与代数不动（指针稳定不变式）。
+    #[allow(dead_code)] // not(embedded) 下 land_value 单探测接管；本形为 embedded 臂
+    pub(crate) fn insert_moving(&mut self, key: Rc<str>, var: Var) -> VarRef {
+        if let Some(sidx) = self.slot_of(&key) {
+            let old_pos = self.slots[sidx as usize].order_pos as usize;
+            self.order[old_pos] = NO_SLOT;
+            let was_array = self.slots[sidx as usize]
+                .var
+                .as_ref()
+                .is_some_and(|v| v.is_array());
+            self.slots[sidx as usize].var = Some(var);
+            self.reconcile_arr_index(&key, sidx, was_array);
+            self.order.push(sidx);
+            self.slots[sidx as usize].order_pos = (self.order.len() - 1) as u32;
+            self.maybe_compact_order();
+            return self.ref_of(sidx);
+        }
+        self.insert(key, var)
+    }
+
+    /// 快索引与 ARRAY 位对账（位变化点共用）：`was` = 换入前该槽的
+    /// ARRAY 位，`now` 取自刚换入的 Var。
+    #[inline]
+    fn reconcile_arr_index(&mut self, key: &str, sidx: u32, was: bool) {
+        let now = self.slots[sidx as usize]
+            .var
+            .as_ref()
+            .is_some_and(|v| v.is_array());
+        if now && !was {
+            self.arr_index.insert(key.to_string(), sidx);
+        } else if !now && was {
+            self.arr_index.remove(key);
+        }
+    }
+
+    /// 值落地的**单探测**形（`global_insert` 咽喉专用）：一次桶链走
+    /// 同时产出 was_valued/flags 并按序位语义分派（有值 = 原位覆盖；
+    /// 无值 = 移位新建——`insert_moving` 语义；新键 = 追加）。ARRAY
+    /// 位逐字保留（计数/索引不随值落地变化）。返回
+    /// `(句柄, 是否新建序位)`——后者 ⟺ 平表 map-insert-new（对拍位，
+    /// 调用方据此免掉一次先行存在性探测）。键 String 在新键臂被
+    /// `Rc::from` 挪用（零拷贝）。
+    pub(crate) fn land_value(&mut self, key: String, v: Value) -> (VarRef, bool) {
+        #[cfg(not(feature = "embedded"))]
+        {
+            let bidx = bucket_of(&key, self.buckets.len());
+            let mut idx = self.buckets[bidx];
+            while idx != NO_SLOT {
+                if self.slots[idx as usize].key.as_deref() == Some(key.as_str()) {
+                    let sidx = idx;
+                    let (was_valued, flags) = {
+                        let var = self.slots[sidx as usize].var.as_ref().expect("live slot");
+                        (var.has_value(), var.flags)
+                    };
+                    let mut var = Var::with_value(v);
+                    var.flags = flags;
+                    if was_valued {
+                        self.slots[sidx as usize].var = Some(var);
+                        return (self.ref_of(sidx), false);
+                    }
+                    let old_pos = self.slots[sidx as usize].order_pos as usize;
+                    self.order[old_pos] = NO_SLOT;
+                    self.slots[sidx as usize].var = Some(var);
+                    self.order.push(sidx);
+                    self.slots[sidx as usize].order_pos = (self.order.len() - 1) as u32;
+                    self.maybe_compact_order();
+                    return (self.ref_of(sidx), true);
+                }
+                idx = self.slots[idx as usize].next;
+            }
+            let sidx = self.alloc_slot(Rc::from(key), bidx);
+            self.slots[sidx as usize].var = Some(Var::with_value(v));
+            self.order.push(sidx);
+            self.slots[sidx as usize].order_pos = (self.order.len() - 1) as u32;
+            self.live += 1;
+            self.maybe_grow_buckets();
+            self.maybe_compact_order();
+            (self.ref_of(sidx), true)
+        }
+        #[cfg(feature = "embedded")]
+        {
+            let existing = self.get(&key);
+            let (was_valued, flags) = existing
+                .map(|x| (x.has_value(), x.flags))
+                .unwrap_or((false, VarFlags::default()));
+            let mut var = Var::with_value(v);
+            var.flags = flags;
+            if was_valued {
+                let r = self.insert(Rc::from(key.as_str()), var);
+                (r, false)
+            } else {
+                let r = self.insert_moving(Rc::from(key.as_str()), var);
+                (r, true)
+            }
+        }
+    }
+
+    /// 有值条目的**单探测**摘除（`global_remove` 咽喉专用）：占位
+    /// 条目不动（归 forget_phantom 面）。返回被摘的值。
+    pub(crate) fn remove_value(&mut self, key: &str) -> Option<Value> {
+        let sidx = self.slot_of(key)?;
+        if !self.slots[sidx as usize]
+            .var
+            .as_ref()
+            .expect("live slot")
+            .has_value()
+        {
+            return None;
+        }
+        #[cfg(not(feature = "embedded"))]
+        self.unlink_from_bucket(sidx);
+        #[cfg(feature = "embedded")]
+        {
+            self.index.remove(key);
+        }
+        let (var, was_array) = {
+            let slot = &mut self.slots[sidx as usize];
+            let var = slot.var.take().expect("live slot");
+            let was = var.is_array();
+            slot.key = None;
+            slot.gen += 1;
+            (var, was)
+        };
+        if was_array {
+            self.arrays -= 1;
+            self.arr_index.remove(key);
+        }
+        self.order[self.slots[sidx as usize].order_pos as usize] = NO_SLOT;
+        self.live -= 1;
+        self.free.push(sidx);
+        self.maybe_compact_order();
+        Some(var.value)
     }
 
     /// 读表项（仅活条目）。
@@ -401,6 +651,7 @@ impl VarTable {
         };
         if was_array {
             self.arrays -= 1;
+            self.arr_index.remove(key);
         }
         self.order[self.slots[sidx as usize].order_pos as usize] = NO_SLOT;
         self.live -= 1;
@@ -410,11 +661,13 @@ impl VarTable {
     }
 
     /// 「解析一次」：键 → 句柄（无条目 → None）。
+    #[allow(dead_code)] // 句柄 API——步骤 2/3 的「解析一次」消费面
     pub(crate) fn resolve(&self, key: &str) -> Option<VarRef> {
         self.slot_of(key).map(|i| self.ref_of(i))
     }
 
     /// 句柄读（代数守卫：不符/空洞 → None）。
+    #[allow(dead_code)] // 句柄 API——步骤 2/3 接线
     pub(crate) fn get_ref(&self, r: &VarRef) -> Option<&Var> {
         let slot = self.slots.get(r.slot as usize)?;
         if slot.gen != r.gen {
@@ -424,6 +677,7 @@ impl VarTable {
     }
 
     /// 句柄写（代数守卫同上）。
+    #[allow(dead_code)] // 句柄 API——步骤 2/3 接线
     pub(crate) fn get_ref_mut(&mut self, r: &VarRef) -> Option<&mut Var> {
         let slot = self.slots.get_mut(r.slot as usize)?;
         if slot.gen != r.gen {
@@ -433,6 +687,7 @@ impl VarTable {
     }
 
     /// 句柄的键（代数守卫同上）。
+    #[allow(dead_code)] // 句柄 API——步骤 2/3 接线
     pub(crate) fn key_of(&self, r: &VarRef) -> Option<&str> {
         let slot = self.slots.get(r.slot as usize)?;
         if slot.gen != r.gen {
@@ -634,6 +889,7 @@ impl VarArena {
     }
 
     /// 句柄读（代数守卫在表内）。Frame/Array 臂步骤 2/3 接入前恒 None。
+    #[allow(dead_code)] // 句柄 API——步骤 2/3 接线
     pub(crate) fn get(&self, r: &VarRef) -> Option<&Var> {
         match &r.table {
             TableId::Global(i) => self.tables.get(*i as usize).and_then(|t| t.get_ref(r)),
@@ -642,6 +898,7 @@ impl VarArena {
     }
 
     /// 句柄写（代数守卫同上）。
+    #[allow(dead_code)] // 句柄 API——步骤 2/3 接线
     pub(crate) fn get_mut(&mut self, r: &VarRef) -> Option<&mut Var> {
         match &r.table {
             TableId::Global(i) => {
@@ -781,6 +1038,36 @@ mod tests {
         let fr = VarRef { table: TableId::Frame(0), slot: 0, gen: 0 };
         assert!(a.get(&fr).is_none());
         assert!(a.get_mut(&fr).is_none());
+    }
+
+    #[test]
+    fn insert_moving_matches_log_semantics() {
+        let mut t = VarTable::new();
+        // 无值占位（启动标记形）先入表、序位领先于后续插入。
+        let mut marker = Var::with_value(Value::unset());
+        marker.flags.insert(VarFlags::ARRAY);
+        t.insert(Rc::from("env"), marker);
+        t.insert(Rc::from("a"), v("A"));
+        t.insert(Rc::from("b"), v("B"));
+        fn seq(t: &VarTable) -> Vec<&str> {
+            t.order_entries()
+                .filter(|(_, v)| v.has_value())
+                .map(|(k, _)| k.as_ref())
+                .collect()
+        }
+        // 占位无值不列。
+        assert_eq!(seq(&t), vec!["a", "b"]);
+        // 上值 = 新建序位（镜像 map-insert-new 必进日志——env 落到末
+        // 尾，与平表重放逐字同）。
+        let mut ev = v("ENV");
+        ev.flags.insert(VarFlags::ARRAY);
+        t.insert_moving(Rc::from("env"), ev);
+        assert_eq!(seq(&t), vec!["a", "b", "env"]);
+        // 有值覆盖 = 原位（insert 不动序）。
+        t.insert(Rc::from("a"), v("A2"));
+        assert_eq!(seq(&t), vec!["a", "b", "env"]);
+        assert_eq!(t.get("a").map(|x| x.value.as_str()), Some("A2"));
+        assert!(t.get("env").unwrap().is_array());
     }
 
     #[test]

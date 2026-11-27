@@ -247,8 +247,8 @@ doc/*.n 章节）。
 7. `expr` 的 `017` 是十进制 17，而 `scan %i`/`%o` 的 `017` 仍是八进制
    15（C 语义）。两处都已按 oracle 分别钉死，勿当同一套字面量语法。
 8. 规则数口径：§2 写的「447 条规则」与实测不符——交接基线 `442f4ff`
-   上 `grep '^rule ' specs/*.allium` 为 242 条；本轮结束为 376 条
-   （新增 134 条）。§2 的 447 可能是含 probe/其他分支的旧数，后续以
+   上 `grep '^rule ' specs/*.allium` 为 242 条；本轮结束为 380 条
+   （新增 138 条）。§2 的 447 可能是含 probe/其他分支的旧数，后续以
    grep 计数为准。
 9. T7 指令面修正：9.1 的 `assemble` 菜单仍保留 `lshift`，移除的是
    `land`/`lor`；§3-C 写的「移除 land/lor/lshift」应改为「移除
@@ -296,6 +296,11 @@ doc/*.n 章节）。
       可观察对象（推荐，因为 `info class instances oo::Slot`、
       `oo::singleton` 等都可观察），要么至少把计数器推到 19。本任务
       不改码，登记为 T6 实现缺口。
+    - 9 个对象的规格已落地（oo.allium）：
+      `BootstrapPropertySlotObjects`（Obj11-14）、
+      `BootstrapAdditionalClassObjects`（Obj15-19）、
+      `BootstrapClassHierarchy`（metaclass vs plain class）、
+      `BootstrapSlotInventory`（oo::Slot 共 11 个实例）。
 16. `chan configure -inputmode` 在 9.1.0 **不存在**（option 清单是
     -blocking/-buffering/-buffersize/-encoding/-eofchar/-profile/
     -translation/-stat）。§3-C 的 T4 清单此处应删。
@@ -329,7 +334,7 @@ doc/*.n 章节）。
     断言。
 24. `regsub` 的替换结果经 `list` 包装时反斜杠元素会被加括号：
     `list ... [regsub {x} x {\\&}]` 得 `ihhi {\x}`，不是 `ihhi \x`。
-25. 自审脚本（2026-11-27）：解析 376 条规则，288 条 `when` 可直接
+25. 自审脚本（2026-11-27）：解析 380 条规则，292 条 `when` 可直接
     执行，对 9.1.0 **0 mismatch**；77 条因 `-- after:` 前态/多行/
     未定义变量跳过。已把 20+ 条依赖前态的规则改成自包含
     （io gets/read、variables 顶部 proc/array、trace、oo、error-deep
@@ -421,14 +426,14 @@ doc/*.n 章节）。
     名字/creationid 关系、命名/类共用计数器、info object isa（4 条）+
     destructor 链、method 默认值/args、methodtype/forward、oo::copy/
     rename、unknown method 文案（5 条）+ classvariable 跨实例共享、
-    property 种类/configure/未知属性/-get/-set/实例属性（6 条）。
+    property 种类/configure/未知属性/-get/-set/实例属性（6 条）+
+    9 个 bootstrap 对象（Obj11-19、类层次、Slot 清单，4 条）。
     对象计数绝对基准已按用户裁定钉死，不再留 open question。新增探针
     `oo_objcount91.tcl`、`oo_features91.tcl`、`pbr6_float_bits.tcl`
     （§4 授权）。
-- 门禁终态：`allium check specs/` 0 error（3 warning 为 memory-lifecycle
-  既有 unused entity/binding；3 info 为既有 unused field）；
+- 门禁终态：`allium check specs/` 0 error、0 warning、0 info；
   `allium analyse specs/` 0 finding。自审脚本
-  `python3 specs/scripts/audit-91.py`：checked=288 skipped=77
+  `python3 specs/scripts/audit-91.py`：checked=292 skipped=77
   mismatches=0（跳过的是 `-- after:` 前态/多行 trigger）。未改
   crates/judge 代码（仅按授权加 3 个探针 + 审计脚本），未跑 judge
   （规格-only 改动不触发代码门禁）。
@@ -439,7 +444,7 @@ doc/*.n 章节）。
 ## 9. 全量复核（2026-11-27）
 
 14 份规格：12 份行为规格全部 `Oracle: tclsh 9.1.0 (core-9-1-0)`；
-`memory-lifecycle.allium` 为实现资源契约（Oracle n/a），规则总数 376。
+`memory-lifecycle.allium` 为实现资源契约（Oracle n/a），规则总数 380。
 
 | 规格 | 规则 | 覆盖 | 状态 |
 |---|---:|---|---|
@@ -452,7 +457,7 @@ doc/*.n 章节）。
 | list | 25 | T2 + T4 lpop/lremove/ledit/lseq/lfilter/stride | 9.1 锚定 |
 | matching | 39 | T1 format/scan + T4 regsub + T7 regex/binary | 9.1 锚定 |
 | memory-lifecycle | 8 | 资源契约（值/通道/帧/OO/缓存/JIT） | Oracle n/a |
-| oo | 48 | T6 全量可测面（Obj20 基准） | 9.1 锚定 |
+| oo | 52 | T6 全量可测面（Obj20 基准 + Obj11-19 bootstrap） | 9.1 锚定 |
 | regex-spencer | 23 | T7 ARE 语义（23 条全量复跑） | 9.1 锚定 |
 | string | 19 | T1/T2/T3 | 9.1 锚定 |
 | trace | 22 | A5 + 现代 trace 面 | 9.1 锚定 |
@@ -462,7 +467,7 @@ doc/*.n 章节）。
 
 - 所有 `when` 的 oracle 结果以 tclsh 9.1.0 实测为准；`doc` 与实测
   冲突时按实测（如 `invokeStk1`、`chan configure -inputmode`）。
-- 自审 `specs/scripts/audit-91.py`：288 条可执行 `when`，0 mismatch；
+- 自审 `specs/scripts/audit-91.py`：292 条可执行 `when`，0 mismatch；
   77 条依赖 `-- after:` 前态/多行的规则保持伪代码形态。
 - 已修：io/variables/matching/oo/interp/memory 的头部锚与覆盖范围；
   expr/error-deep/matching 的 8.6-only 注释；io 的 D-30→D-29 引用。

@@ -114,6 +114,52 @@ type FastHashMap = HashMap<String, Value, FastBuild>;
 /// Maximum inline string length before heap allocation
 const INLINE_SIZE: usize = 23;
 
+/// 9.1 lazy arithmetic series (lseq): keeps the abstract parameters so
+/// `lindex`/`llength` on huge series do not materialize.  `start/step`
+/// are used when `is_double` is false; otherwise the rounded double form.
+#[derive(Debug, Clone, Copy)]
+pub struct SeriesRep {
+    pub is_double: bool,
+    pub start: i64,
+    pub step: i64,
+    pub dstart: f64,
+    pub dstep: f64,
+    pub len: i64,
+    pub precision: u32,
+}
+
+impl SeriesRep {
+    pub fn element(&self, i: i64) -> Value {
+        if self.is_double {
+            let d = if i == 0 {
+                self.dstart
+            } else {
+                self.dstart + (i as f64) * self.dstep
+            };
+            let d = if self.precision == 0 {
+                d
+            } else {
+                let scale = 10f64.powi(self.precision as i32);
+                (d * scale).round() / scale
+            };
+            Value::from_float(d)
+        } else {
+            Value::from_int(self.start.wrapping_add(i.wrapping_mul(self.step)))
+        }
+    }
+}
+
+const SERIES_MATERIALIZE_MAX: i64 = 536_870_909;
+
+fn series_values(s: &SeriesRep) -> Vec<Value> {
+    let n = s.len.max(0) as usize;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        out.push(s.element(i as i64));
+    }
+    out
+}
+
 /// Internal representation of a value.
 ///
 /// Mirrors jimtcl's `internalRep` union — a cached typed view of the
@@ -143,6 +189,8 @@ pub enum InternalRep {
     /// `Clone`/`Drop` 是手工实现：池槽位引用计数跟随 ValueInner 的 COW 深
     /// 拷贝与回收。
     HostStr(u32),
+    /// 9.1 lazy arithmetic series (see [`SeriesRep`]).
+    Series(SeriesRep),
     /// No internal representation yet
     None,
 }
@@ -157,6 +205,7 @@ impl Clone for InternalRep {
             InternalRep::Bool(b) => InternalRep::Bool(*b),
             InternalRep::List(v) => InternalRep::List(v.clone()),
             InternalRep::Dict(m) => InternalRep::Dict(m.clone()),
+            InternalRep::Series(s) => InternalRep::Series(*s),
             InternalRep::None => InternalRep::None,
             InternalRep::HostStr(idx) => {
                 // COW 深拷贝：两个 ValueInner 即将引用同一池槽位——加池引
@@ -1050,6 +1099,27 @@ impl Value {
         Self::from_list_cached(items.to_vec())
     }
 
+    /// Build a lazy arithmetic series (lseq's abstract representation).
+    pub fn from_series(s: SeriesRep) -> Self {
+        Value::from_vptr(VPtr::new(ValueInner {
+            string: StringRep::new(),
+            rep: InternalRep::Series(s),
+            rc: Cell::new(1),
+        }))
+    }
+
+    /// Borrow the arithmetic-series parameters, if this value has that rep.
+    pub fn series(&self) -> Option<SeriesRep> {
+        if self.is_imm() || self.is_unset() {
+            return None;
+        }
+        let inner = unsafe { self.heap_inner() };
+        match &inner.rep {
+            InternalRep::Series(s) => Some(*s),
+            _ => None,
+        }
+    }
+
     // ── lazy-string（§6）：宿主字符串池三态 ─────────────────────
 
     /// JsOnly 构造（lazy-string §6）：包一个宿主字符串池句柄为值。
@@ -1151,6 +1221,11 @@ impl Value {
                 InternalRep::HostStr(idx) => {
                     crate::host_string::with_backing(|b| b.to_bytes(*idx))
                         .unwrap_or_default()
+                }
+                InternalRep::Series(s) => {
+                    let items = series_values(s);
+                    materialize_below(items.iter());
+                    SmallVec::from_slice(serialize_list(&items).as_bytes())
                 }
                 InternalRep::None => SmallVec::new(),
             }
@@ -1383,6 +1458,13 @@ impl Value {
             InternalRep::Dict(map) => {
                 Some(map.iter().flat_map(|(k, v)| [Value::from_str(k), v.clone()]).collect())
             }
+            InternalRep::Series(s) => {
+                if s.len >= 0 && s.len <= SERIES_MATERIALIZE_MAX {
+                    Some(series_values(s))
+                } else {
+                    None
+                }
+            }
             _ => {
                 let s = self.to_str();
                 parse_list(&s)
@@ -1402,6 +1484,16 @@ impl Value {
             InternalRep::List(items) => Ok(items.clone()),
             InternalRep::Dict(map) => {
                 Ok(map.iter().flat_map(|(k, v)| [Value::from_str(k), v.clone()]).collect())
+            }
+            InternalRep::Series(s) => {
+                if s.len >= 0 && s.len <= SERIES_MATERIALIZE_MAX {
+                    Ok(series_values(s))
+                } else {
+                    Err(ListParseError {
+                        message: "max length of a Tcl list exceeded".to_string(),
+                        code: "TCL MEMORY",
+                    })
+                }
             }
             _ => {
                 let s = self.to_str();
@@ -1648,6 +1740,7 @@ impl Value {
             InternalRep::Bool(_) => "bool",
             InternalRep::List(_) => "list",
             InternalRep::Dict(_) => "dict",
+            InternalRep::Series(_) => "list",
         }
     }
 

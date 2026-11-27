@@ -6,7 +6,7 @@ use std::borrow::Cow;
 
 use crate::error::{Error, Result};
 use crate::interp::Interp;
-use crate::value::{is_tcl_space, Value};
+use crate::value::{is_tcl_space, SeriesRep, Value};
 
 
 /// Build an error whose message survives `catch` verbatim (the interp
@@ -319,6 +319,9 @@ pub fn cmd_llength(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         set_error_code(interp, "TCL WRONGARGS");
         return Err(wrong_args("llength", "list"));
     }
+    if let Some(s) = args[1].series() {
+        return Ok(Value::from_int(s.len));
+    }
     let list = strict_list_cow(interp, &args[1])?;
     Ok(Value::from_int(list.len() as i64))
 }
@@ -346,13 +349,22 @@ pub fn cmd_lindex(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     };
     for idx_val in &indices {
         let next = {
-            let list = strict_list_cow(interp, &current)?;
-            let idx_str = idx_val.as_str();
-            let len = list.len();
-            match parse_tcl_index(idx_str, len) {
-                Some(raw) if raw >= 0 && (raw as usize) < len => list[raw as usize].clone(),
-                Some(_) => return Ok(Value::empty()),
-                None => return Err(bad_index(interp, idx_str)),
+            if let Some(s) = current.series() {
+                let idx_str = idx_val.as_str();
+                match parse_tcl_index(idx_str, s.len.max(0) as usize) {
+                    Some(raw) if raw >= 0 && (raw as i64) < s.len => s.element(raw as i64),
+                    Some(_) => return Ok(Value::empty()),
+                    None => return Err(bad_index(interp, idx_str)),
+                }
+            } else {
+                let list = strict_list_cow(interp, &current)?;
+                let idx_str = idx_val.as_str();
+                let len = list.len();
+                match parse_tcl_index(idx_str, len) {
+                    Some(raw) if raw >= 0 && (raw as usize) < len => list[raw as usize].clone(),
+                    Some(_) => return Ok(Value::empty()),
+                    None => return Err(bad_index(interp, idx_str)),
+                }
             }
         };
         current = next;
@@ -1301,11 +1313,16 @@ pub fn cmd_lseq(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // bounded series only.  A length beyond the list guard fails instead
     // of OOMing.) ────────────────────────────────────────────────────────
     if len > MAX_LIST_ELEMENTS as i64 {
-        set_error_code(interp, "TCL MEMORY");
-        return Err(tcl_err(format!(
-            "max length of a Tcl list ({} elements) exceeded",
-            MAX_LIST_ELEMENTS
-        )));
+        let precision = prec_of(&start_obj).max(prec_of(&end_obj)).max(prec_of(&step_obj));
+        return Ok(Value::from_series(SeriesRep {
+            is_double: use_d,
+            start: istart,
+            step: istep,
+            dstart,
+            dstep,
+            len,
+            precision,
+        }));
     }
     let n = len as usize;
     let mut out = Vec::new();
@@ -1780,5 +1797,22 @@ mod tests {
     fn test_lsubst_bad_option() {
         let mut interp = Interp::new();
         assert!(interp.eval("lsubst -badopt {a b}").is_err());
+    }
+
+    #[test]
+    fn test_lseq_huge_is_lazy() {
+        let mut interp = Interp::new();
+        assert_eq!(
+            interp.eval("llength [lseq 0x7fffffff]").unwrap().as_str(),
+            "2147483647"
+        );
+        assert_eq!(
+            interp.eval("lindex [lseq 0x7fffffff] 0x80000000").unwrap().as_str(),
+            ""
+        );
+        assert_eq!(
+            interp.eval("lindex [lseq 0x7fffffff] 5").unwrap().as_str(),
+            "5"
+        );
     }
 }

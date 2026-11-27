@@ -313,9 +313,33 @@ doc/*.n 章节）。
     期望 `\ya+/\ma+` = 1；实测（8.6/9.1 同）是 0（'a' 不在词首）。
     已改为 " aa" + `a\M`，得 1 1 1。`LookbehindRejectedIn86` 改名
     `LookbehindRejected`（9.1 仍无 lookbehind）。
-21. `::tcl::*` 命令集实测 18 条（含 tcl::process），不是旧清单写的
-    27 vs 23；socket `-nodelay/-keepalive` 默认 0、可置 1；
-    `package files msgcat` 为 2 个脚本路径。均已按实测钉死。
+21. `::tcl::*` 命令集实测 17 条（新进程；加载 msgcat 后会多
+    `MacOSXPkgUnknown`），不是旧清单写的 27 vs 23；socket
+    `-nodelay/-keepalive` 默认 0、可置 1；`package files msgcat` 为
+    2 个脚本路径。均已按实测钉死。
+22. `lpop` 默认索引是**最后一个**元素（`lpop l` 弹尾，`lpop l 0` 弹
+    首）。本轮新写的 `LpopMutatesListVariable` 原先误写为首元素，已
+    修正为 `d {a b c}`。
+23. `(?:...)` 非捕获组在 8.6 与 9.1 都**支持**，原
+    `RegexpRejectsNonCapturingGroups` 是错的；已改为
+    `RegexpAcceptsNonCapturingGroups`。仍被拒绝的是 `(?<...)` 后行
+    断言。
+24. `regsub` 的替换结果经 `list` 包装时反斜杠元素会被加括号：
+    `list ... [regsub {x} x {\\&}]` 得 `ihhi {\x}`，不是 `ihhi \x`。
+25. 自审脚本（2026-11-27）：解析 351 条规则，260 条 `when` 可直接
+    执行，对 9.1.0 **0 mismatch**；91 条因 `-- after:` 前态/多行/
+    未定义变量跳过。借助自审把 11 条依赖前态的规则改成自包含
+    （io gets/read x3/rw、ArrayExistsAndSize、UnsetElementShrinksArray、
+    WhichVariableReportsNsVar、TraceRemove、ExecTraceHandlerError、
+    MixinCycle、InfoStubbed）。
+26. 自审又抓到两条期望错误：`GetsAtEof...` 的第二次 EOF `gets` 会
+    清空变量，必须先 `set got $v` 再读 EOF；`ReadWriteFile...` 输入
+    写 `AAA` 才得 `AAB`（写 `AAAA` 得 `AABA`）。均已修正。
+27. `regsub -command` 在 9.1 **是合法选项**（TIP 463），原
+    `RegsubHasNoCommandOption`（按 8.6 写成错误）已替换为
+    `RegsubRejectsUnknownOption`；bad option 菜单实测为
+    `-all, -command, -expanded, -line, -linestop, -lineanchor,
+    -nocase, -start, or --`（字母序）。
 
 ## 8. 交接记录
 
@@ -388,10 +412,11 @@ doc/*.n 章节）。
     对象计数绝对基准已按用户裁定钉死，不再留 open question。新增探针
     `oo_objcount91.tcl`、`oo_features91.tcl`、`pbr6_float_bits.tcl`
     （§4 授权）。
-- 门禁终态：`allium check specs/` 0 error（4 warning 为 memory-lifecycle
-  既有 unused entity/binding；5 info 为既有 unused field）；
-  `allium analyse specs/` 0 finding。未改 crates/judge，未跑 judge
-  （规格-only 改动不触发代码门禁）。
+- 门禁终态：`allium check specs/` 0 error（3 warning 为 memory-lifecycle
+  既有 unused entity/binding；3 info 为既有 unused field）；
+  `allium analyse specs/` 0 finding。自审 260 条可执行 `when` 对
+  9.1.0 0 mismatch。未改 crates/judge 代码（仅按授权加 3 个探针），
+  未跑 judge（规格-only 改动不触发代码门禁）。
 - git diff --stat 范围：`specs/*.allium`（已换锚的 12 份）+ 本文件 +
   `judge/probes/{oo_objcount91,oo_features91,pbr6_float_bits}.tcl`
   （§4 授权新增探针，只加不改）。

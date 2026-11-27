@@ -951,7 +951,7 @@ fn ns_which(interp: &Interp, args: &[Value]) -> Result<Value> {
                 // （http.tcl::_require_bridge 依赖，不回归）。
                 if let Some(owner) = interp.oo.my_commands.get(&qualified) {
                     let tail = qualified.rsplit("::").next().unwrap_or("");
-                    if matches!(tail, "self" | "next" | "nextto") {
+                    if matches!(tail, "self" | "next" | "nextto" | "classvariable") {
                         let owner_ns =
                             crate::interp::commands::oo::object_ns_owner(interp, owner);
                         if owner_ns.as_ref() == interp.current_namespace.as_ref() {

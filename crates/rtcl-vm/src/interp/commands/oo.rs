@@ -649,6 +649,12 @@ pub(crate) fn init(interp: &mut Interp) {
     register_oo_command(interp, "::oo::Helpers::nextto", "className ?arg ...?", cmd_oo_nextto);
     register_oo_command(interp, "::oo::Helpers::self", "subcommand ?arg ...?", cmd_oo_self);
     register_oo_command(interp, "::oo::Helpers::next", "?arg ...?", cmd_oo_next);
+    register_oo_command(
+        interp,
+        "::oo::Helpers::classvariable",
+        "variableName ?arg ...?",
+        cmd_oo_classvariable,
+    );
 
     // ::oo::InfoClass / ::oo::InfoObject subcommand natives — direct
     // delegation to the info machinery with the invoked name as the usage
@@ -1755,6 +1761,31 @@ extern "Rust" fn cmd_oo_object(interp: &mut Interp, args: &[Value]) -> Result<Va
 
 // ── my / self / next ───────────────────────────────────────────────────
 
+/// `::oo::Helpers::classvariable` (and its per-object hidden spelling):
+/// link names to the namespace of the class that defined the running
+/// method (all instances share it).  Object-defined methods link to the
+/// object namespace, matching the doc's namespace-upvar equivalence.
+extern "Rust" fn cmd_oo_classvariable(interp: &mut Interp, args: &[Value]) -> Result<Value> {
+    let (owner, obj_key) = match interp.oo.active.last() {
+        Some(a) => (
+            a.chain.get(a.index).map(|e| e.owner.clone()),
+            Some(Rc::clone(&a.obj)),
+        ),
+        None => (None, None),
+    };
+    let ns = match owner {
+        Some(Owner::Class(c)) => interp.oo.classes.get(&c).map(|x| x.ns.clone()),
+        Some(Owner::Object) => obj_key
+            .and_then(|k| interp.oo.objects.get(k.as_ref()).map(|x| x.ns.clone())),
+        None => None,
+    };
+    let ns = ns.ok_or_else(|| Error::Msg("classvariable: no active method".to_string()))?;
+    let prev = std::mem::replace(&mut interp.current_namespace, ns);
+    let r = super::namespace::cmd_variable(interp, args);
+    interp.current_namespace = prev;
+    r
+}
+
 extern "Rust" fn cmd_oo_my(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // Borrowed throughout (see cmd_oo_object).
     let typed = args[0].as_str();
@@ -2080,12 +2111,13 @@ fn next_ns(interp: &mut Interp) -> String {
 }
 
 fn attach_ns_commands(interp: &mut Interp, key: &str, ns: &str) {
-    for role in ["my", "self", "next", "nextto"] {
+    for role in ["my", "self", "next", "nextto", "classvariable"] {
         let cmd_key = format!("{}::{}", ns, role);
         let func: crate::command::CommandFunc = match role {
             "my" => cmd_oo_my,
             "self" => cmd_oo_self,
             "nextto" => cmd_oo_nextto,
+            "classvariable" => cmd_oo_classvariable,
             _ => cmd_oo_next,
         };
         if interp.commands.insert(cmd_key.clone(), func).is_none() {
@@ -2139,7 +2171,7 @@ fn detach_object(interp: &mut Interp, key: &str, ns: &str, keep_ns: bool) {
         interp.command_categories.remove(bare);
         interp.command_meta.remove(bare);
     }
-    for role in ["my", "self", "next", "nextto"] {
+    for role in ["my", "self", "next", "nextto", "classvariable"] {
         let cmd_key = format!("{}::{}", ns, role);
         interp.commands.remove(&cmd_key);
         interp.command_categories.remove(&cmd_key);
@@ -4935,6 +4967,14 @@ mod tests {
         assert_eq!(
             eval("oo::singleton create S {}; expr {[S new] eq [S new]}"),
             "1"
+        );
+    }
+
+    #[test]
+    fn test_oo_9_1_classvariable() {
+        assert_eq!(
+            eval("oo::class create Counted {variable number; constructor {} {classvariable count; set number [incr count]}; method report {} {classvariable count; list $number $count}}; set a [Counted new]; set b [Counted new]; list [$a report] [$b report]"),
+            "{1 2} {2 2}"
         );
     }
 

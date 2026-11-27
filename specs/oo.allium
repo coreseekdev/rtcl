@@ -315,12 +315,30 @@ rule InfoClassVariablesSplitsPrivate {
 rule AnonymousObjectNameAndCreationId {
     -- Anonymous objects are ::oo::Obj<digits>; creationid is the numeric
     -- suffix, stable for one object, and strictly increasing for later
-    -- objects. The absolute start value is implementation-defined and is
-    -- not pinned (9.1.0 starts at 20).
+    -- objects.
     when: Evaluates("set a [oo::object new]; set ia [info object creationid $a]; set b [oo::object new]; set ib [info object creationid $b]; list [string match {::oo::Obj*} $a] [expr {$ib == $ia + 1}] [expr {[info object creationid $a] == $ia}] [expr {$ib > $ia}]")
     ensures: completion.code = ok
     ensures: completion.value = "1 1 1 1"
-    -- probe: oo_objcount91 (normalized name; ids are relational)
+    -- probe: oo_objcount91
+}
+
+rule AnonymousObjectCounterStartsAt20 {
+    -- The core pre-creates 20 OO objects, so the first user-created object
+    -- (anonymous, named, or class) is ::oo::Obj20 / creationid 20. rtcl
+    -- pre-creates fewer internally but keeps the user-visible base at 20.
+    when: Evaluates("set o [oo::object new]; list $o [info object creationid $o]")
+    ensures: completion.code = ok
+    ensures: completion.value = "::oo::Obj20 20"
+    -- probe: oo_objcount91 (fresh interpreter; named and class objects
+    --   share the same counter and also start at 20)
+}
+
+rule NamedAndClassObjectsShareCounter {
+    -- The counter is shared across object/class creation.
+    when: Evaluates("oo::object create N20; oo::class create C20; list [info object creationid N20] [info object creationid C20]")
+    ensures: completion.code = ok
+    ensures: completion.value = "20 21"
+    -- probe: 2026-11-27 tclsh9.1 (fresh interpreter)
 }
 
 rule AnonymousObjectIdNotRecycledAfterDestroy {
@@ -339,5 +357,3 @@ rule InfoObjectIsaCategories {
     ensures: completion.value = "1 0 1 1"
     -- probe: oo_features91
 }
-
-open question "OO object counter base: tclsh 9.1.0 starts anonymous names at ::oo::Obj20; rtcl's pre-created set differs. The spec pins name shape and creationid relations, not the absolute base."

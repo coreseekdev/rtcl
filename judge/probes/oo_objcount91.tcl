@@ -1,24 +1,21 @@
 # oo_objcount91 — TclOO object identity/counter semantics (tclsh 9.1.0).
 #
-# Object names are ::oo::Obj<N> with a process-global counter.  The absolute
-# base is an implementation detail (9.1.0 starts at 20 because the core
-# pre-creates its metaclasses/slots); the spec pins only the relations:
+# Object names are ::oo::Obj<N> with a process-global counter.  The core
+# pre-creates 20 OO objects, so a fresh interpreter's first user object is
+# ::oo::Obj20 (creationid 20); named objects and classes share the counter.
+# Semantics pinned:
+#   - first user object is ::oo::Obj20 / creationid 20
 #   - anonymous names match ::oo::Obj<digits>
 #   - info object creationid is the suffix and is stable for an object
 #   - creation ids are strictly increasing, including after destroy
-# Output is normalized so the absolute base never enters the expectation.
-
-proc norm {name} {
-    regsub {^::oo::Obj[0-9]+$} $name {::oo::ObjN} name
-    return $name
-}
+# Run this file in a fresh tclsh; no OO objects may be created before `base`.
 
 proc t {label script} {
     set c [catch {uplevel 1 $script} r]
     puts "$label|$c|$r"
 }
 
-t first-name {norm [oo::object new]}
+t base {set o [oo::object new]; list $o [info object creationid $o]}
 t name-shape {string match {::oo::Obj*} [oo::object new]}
 t id-stable {set o [oo::object new]; list [info object creationid $o] [info object creationid $o]}
 t id-is-suffix {

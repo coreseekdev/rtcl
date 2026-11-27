@@ -488,10 +488,11 @@ doc/*.n 章节）。
     出的类 new 返回唯一实例、create 报错；
   - `next_obj_id = 19`，首个用户对象为 `::oo::Obj20`；
   - 新增单测 `test_oo_9_1_bootstrap_objects`，原 Obj15 断言改 Obj20。
-- 验证：`cargo test -p rtcl-vm --lib` 884 passed；单测覆盖
+- 验证：`cargo test -p rtcl-vm --lib` 889 passed；单测覆盖
   Obj11-19、类层次、Slot 11 实例、abstract/singleton、classvariable、
   property 种类/configure/自定义访问器、超大 lseq 惰性序列
-  （llength/lindex/lrange/foreach/lmap/lfilter + VM 内联路径）。
+  （llength/lindex/lrange/foreach/lmap/lfilter/lreverse/lassign + VM
+  内联路径）。
 - judge：`95 pass / 0 fail`（原 `gen/gen_lseq` lseq-4.11 已修：Value
   增加惰性 arithmetic series rep，lindex/llength 不再物化 2^31-1 元素）。
 - `classvariable`：`::oo::Helpers::classvariable` + 每对象隐藏命令入
@@ -502,7 +503,10 @@ doc/*.n 章节）。
   `configure` 读/写/无参字典、unknown `bad property` 文案、
   `oo::objdefine` 实例属性。默认访问器读写对象 ns 变量，自定义访问器
   用 `apply` 执行（正确传播 return/error）。
-- lseq 惰性 series：除 `lindex`/`llength` 外，`lrange`、`foreach`、
-  `lmap`、`lfilter`（含 VM 内联 foreach/lmap 路径）都按 series 参数
-  现算，不物化 2^31-1 元素；`lsearch`/`lsort` 等需要全序的消费者仍
-  走物化（超出预算时报 TCL MEMORY）。judge 95/95。
+- lseq 惰性 series：`llength`/`lindex`/`lrange`（返回子序列，不物化
+  窗口）/`lreverse`（负步长子序列）/`lassign`（剩余子序列）/
+  `foreach`/`lmap`/`lfilter`（含 VM 内联路径）都按参数现算。
+- 其余消费者分析：`lsearch` 可流式扫描（早停），但选项矩阵
+  （-all/-inline/-index/-stride/-sorted/-bisect/-command）需要逐项接；
+  `lsort` 无法避免 O(n) 物化（除非外部排序）；`linsert`/`lreplace`
+  需要新增 concat/rope 型 lazy rep 才能避免物化。judge 95/95。

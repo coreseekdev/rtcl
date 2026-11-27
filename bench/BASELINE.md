@@ -2980,3 +2980,31 @@ sweep 12 既有、workspace **cargo exit 0**（rtcl-vm 871/0）、wasm32 ✓、
   与 phantom_globals 镜像在 unset 走 global_remove 的重叠态分歧（步骤
   1 遗留，基线 36269a7 逐字复现，常设门禁不覆盖）——随步骤 3/4
   （链接/phantom 面迁移）收口。
+
+## D1 步骤 3——数组元素表迁入 VarArena（task/d1-vars3 @ eaffbb1，2026-11-28，子代理施工）
+
+- **子表形状**：元素表 = 独立 VarTable 驻宿主 Var.elements: Option<Box<VarTable>>，
+  身份 TableId::Array(Box<宿主VarRef>)；ARRAY 旗标收编进 Var.flags
+  （sync_elements 全写槽路径维护 is_array⟺elements.is_some 不变式）；
+  生命周期随宿主（数组 unset 子表整体回收、帧池 reset 清空、再建新句柄）。
+  elem_count 两域统一挂宿主 Var。
+- **路由收口**：咽喉元件感知（global_*/frame_local_* 的元素形键臂）——
+  T7 五面快径自动换道；land_element（覆盖写零分配/新键单分配）+
+  loc_elem_* 直访（免平键构建/再拆）；array 命令全族枚举走子表插入序；
+  搜索戳键换宿主 VarRef（ns delete 反查+死柄弃置）；启动 seeding 重写
+  （env/tcl_platform 容器先建）；oo copy/collect 根快照扫子表。trace 三
+  表仍字符串键（步骤 4 面）。
+- **对拍漏点 0**（路由一次到位）；顺序语义：unset 重建换位、ns/帧/
+  upvar 面 10 项压力脚本对 oracle 逐字节同；四探针（t7_arr_elem 等）
+  对 oracle 逐字节同。
+- 门禁（合并树）：judge **95/95**、crash-gate 128/128、probes 398/76、
+  sweep 12 既有、rtcl-vm **889/0**、workspace exit 0、wasm32 ✓、五特性 ✓。
+- 基准（ABBA 12×4 轮中位）：t7 数组全案 ±5% 内（size-80k O(1) 保持
+  0.26ms vs tclsh 90ms）；micro-read **-12.2%**、micro-incr -4.4%；帧/
+  全局面 string 三案 -3.9~-42.9%、info_locals -3.9%、ns_body -6.2%；
+  **RSS 50k/80k 元素负载 -17%/-22%**（12812/39360 vs 15500/50520 KB）。
+- wasm 体积 +5269B/+0.27%（size 轨）——子表机制成本，步骤 5 预期回收。
+- 预存登记（未盲修）：`upvar 0 a(e) x; set x 5; info exists a` =0 vs
+  oracle=1（帧域 flag-only 标记无基键值——baseexists 面归步骤 4）；`variable a(e)` 不报错（元素变量面批）；array statistics history 压缩
+  时机换子表触发形（BASELINE 登记）；步骤 1 的 phantom 对拍缺口随
+  步骤 4 收口。

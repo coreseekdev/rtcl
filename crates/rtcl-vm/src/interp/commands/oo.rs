@@ -203,6 +203,11 @@ pub(crate) struct OoObject {
     /// Per-object namespace (`::oo::ObjN`).  `Rc<str>`: the dispatcher
     /// hands it to `call_proc` (and `self namespace`) on every call.
     pub ns: Rc<str>,
+    /// Creation epoch（tclsh 的 `oPtr->creationEpoch`，TIP500）：与 ObjN
+    /// 命名共用一个计数器（tclOO.c AllocateObject：指定 ns 形也是
+    /// `++nsCount`）——`info object creationid` 的值。0 仅是占位，一切
+    /// 创建路径必须显式赋值。
+    pub epoch: usize,
     /// Canonical class key.
     pub class: String,
     /// Per-object mixins (canonical keys).
@@ -221,6 +226,8 @@ pub(crate) struct OoObject {
     /// fast path memoises on this list's identity (a declaration replaces
     /// the whole vector, so a pointer compare detects it).
     pub variables: Rc<Vec<String>>,
+    /// TIP500 `private variable` 声明（见 [`OoClass.private_variables`]）。
+    pub private_variables: Vec<String>,
 }
 
 /// A class (both the behaviour of its instances and, via `obj_*`, the
@@ -228,6 +235,8 @@ pub(crate) struct OoObject {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct OoClass {
     pub ns: Rc<str>,
+    /// Creation epoch — see [`OoObject.epoch`].
+    pub epoch: usize,
     pub superclasses: Vec<String>,
     /// Class-level mixins.
     pub mixins: Vec<String>,
@@ -250,6 +259,14 @@ pub(crate) struct OoClass {
     pub obj_methods: Vec<(String, MethodDef)>,
     pub obj_variables: Rc<Vec<String>>,
     pub obj_mixins: Vec<String>,
+    /// TIP500 私有 `private variable` 声明（本类方法内经 `my` 可见，
+    /// 不入标准 `variables` 清单——info class variables 不列）。
+    pub private_variables: Vec<String>,
+    /// TIP524 定义命名空间（`definitionnamespace ?kind? ns` 设置）：
+    /// `None` = 未设置（info class definitionnamespace → {}）。锁定值
+    /// （oo::object 的 instance / oo::class 的 class）与用户设置同形。
+    pub defns_class: Option<String>,
+    pub defns_instance: Option<String>,
 }
 
 /// A method execution in progress (`self`/`my`/`next` context).  The
@@ -305,6 +322,15 @@ pub(crate) struct OoCallCache {
 #[derive(Debug, Default)]
 pub(crate) struct OoState {
     pub next_obj_id: usize,
+    /// `private` 定义语境标志（TIP500）：`oo::define C {private ...}`
+    /// 求值期间为真，语境内的 method/forward 定义强制不导出、variable
+    /// 声明进 private 名单。`private` 无参返回它（oracle
+    /// IsPrivateDefine 布尔）。
+    pub define_private: bool,
+    /// 打开 `oo::define`/`oo::objdefine` 时的调用方命名空间：
+    /// `definitionnamespace` 的 ns 参数以**调用方** ns 解析
+    /// （GetNamespaceInOuterContext；`::oo::define` 语境自身的 ns 不对）。
+    pub define_caller_ns: Rc<str>,
     /// Objects and classes whose destruction is in progress. Destruction
     /// cascades (a class onto its instances) and runs destructors before
     /// the tables let go, so a destructor naming its own class re-entered
@@ -426,16 +452,19 @@ fn register_oo_command(interp: &mut Interp, key: &str, usage: &'static str, func
 /// table so `info object class ::oo::define::variable` → `::oo::Slot`.
 ///
 /// Insertion order per namespace table (tclhash replay-verified against
-/// `info commands ::oo::define::*` / `::oo::objdefine::*`).
+/// `info commands ::oo::define::*` / `::oo::objdefine::*`).  9.1 新增
+/// `definitionnamespace`（仅 define 侧——objdefine 词表没有它）与
+/// `private`（TIP500，两侧都有）。
 const DEFINE_WORDS: &[&str] = &[
     "method", "forward", "unexport", "mixin", "superclass", "variable", "self",
     "renamemethod", "filter", "export", "deletemethod", "destructor", "constructor",
+    "definitionnamespace", "private",
 ];
 /// Slot words: implemented by `::oo::Slot` instance objects.
 const DEFINE_SLOTS: &[&str] = &["mixin", "superclass", "variable", "filter"];
 const OBJDEFINE_WORDS: &[&str] = &[
     "class", "forward", "export", "method", "renamemethod", "filter", "variable",
-    "unexport", "deletemethod", "mixin",
+    "unexport", "deletemethod", "mixin", "private",
 ];
 const OBJDEFINE_SLOTS: &[&str] = &["filter", "variable", "mixin"];
 /// `::oo::Helpers` — the per-method helpers.  tclsh puts `self`/`next`/
@@ -449,11 +478,11 @@ const HELPERS_ORDER: &[&str] = &["nextto", "self", "next"];
 const INFOCLASS_ORDER: &[&str] = &[
     "instances", "mixins", "subclasses", "variables", "definition", "filters",
     "methodtype", "call", "forward", "superclasses", "constructor", "destructor",
-    "methods",
+    "methods", "definitionnamespace",
 ];
 const INFOOBJECT_ORDER: &[&str] = &[
     "mixins", "definition", "filters", "variables", "methodtype", "call",
-    "forward", "isa", "namespace", "methods", "vars", "class",
+    "forward", "isa", "namespace", "methods", "vars", "class", "creationid",
 ];
 
 /// Create the core classes and commands.  Called once from `Interp::new`.
@@ -474,8 +503,14 @@ pub(crate) fn init(interp: &mut Interp) {
 
     // ::oo::object — the root class.  `destroy` is its own (core) method so
     // that `info class methods oo::object` shows it and every instance's
-    // must-be list ends with `destroy`.
-    let mut root = OoClass { ns: Rc::from("::oo::Obj1"), ..Default::default() };
+    // must-be list ends with `destroy`.  TIP524 锁定值：oo::object 的
+    // instance 定义命名空间锁在 ::oo::objdefine（oo-42.3）。
+    let mut root = OoClass {
+        ns: Rc::from("::oo::Obj1"),
+        epoch: 1,
+        defns_instance: Some("::oo::objdefine".to_string()),
+        ..Default::default()
+    };
     root.methods.push(("destroy".to_string(), builtin_method("destroy")));
     // D-43⑤：oo::object 私有核心方法（tclsh must-be 清单含它们）。
     // D-43⑤：这四个是**私有**核心方法（tclsh：外部 o varname 报
@@ -493,7 +528,15 @@ pub(crate) fn init(interp: &mut Interp) {
     // order, `info class instances oo::class` oracle) plus all user
     // classes (classes resolve to the metaclass via object_class_of).
     let mut metaclass =
-        OoClass { ns: Rc::from("::oo::Obj2"), superclasses: vec!["::oo::object".to_string()], ..Default::default() };
+        OoClass {
+            ns: Rc::from("::oo::Obj2"),
+            epoch: 2,
+            superclasses: vec!["::oo::object".to_string()],
+            // TIP524 锁定值：oo::class 的 class 定义命名空间锁在
+            // ::oo::define（oo-42.6/42.7）。
+            defns_class: Some("::oo::define".to_string()),
+            ..Default::default()
+        };
     metaclass.methods.push(("create".to_string(), builtin_method("create")));
     metaclass.methods.push(("new".to_string(), builtin_method("new")));
     interp.oo.classes.insert("::oo::class".to_string(), metaclass);
@@ -509,6 +552,7 @@ pub(crate) fn init(interp: &mut Interp) {
         "::oo::Slot".to_string(),
         OoClass {
             ns: Rc::from("::oo::Obj3"),
+            epoch: 3,
             superclasses: vec!["::oo::object".to_string()],
             methods: vec![
                 ("-clear".to_string(), plain_method("-clear")),
@@ -520,18 +564,16 @@ pub(crate) fn init(interp: &mut Interp) {
     );
     interp.oo.creation_order.push("::oo::Slot".to_string());
 
-    // The seven slot objects (instances of ::oo::Slot, namespaces Obj4..10
-    // — tclsh burns Obj1..Obj10 on the bootstrap, so the first user object
-    // is ::oo::Obj11).  Creation order drives `info class instances
-    // oo::Slot`; each is a command whose dispatch defers to the def
-    // machinery inside a definition context and errors outside it.
-    // The seven slot objects (instances of ::oo::Slot, namespaces Obj4..10
-    // — tclsh burns Obj1..Obj10 on the bootstrap, so the first user object
-    // is ::oo::Obj11).  Creation order (drives `info class instances
-    // oo::Slot`) — their COMMAND registration notes land at the definition
-    // word positions below (the define/objdefine tables interleave slots
-    // and plain words; tclsh-verified orders).
-    let slots: [(&str, &str, &str); 7] = [
+    // The eleven slot objects (instances of ::oo::Slot, namespaces
+    // Obj4..14 — tclsh 9.1 burns Obj1..Obj14 on object+class+Slot+11
+    // slots, then Obj15..Obj19 on singleton/SingletonInstance/abstract/
+    // configuresupport::configurable/configurable (rtcl 尚未建那五个
+    // 类——编号口径残留差，见 TODO「对象编号计数口径」); rtcl burns
+    // Obj1..Obj14, so the first user object is ::oo::Obj15).  Creation
+    // order (drives `info class instances oo::Slot` — oo-34.2 的 11 元
+    // 清单含 4 个 configuresupport property slot) — their COMMAND
+    // registration notes land at the definition word positions below.
+    let slots: [(&str, &str, &str); 11] = [
         ("::oo::define::filter", "::oo::Obj4", "filter"),
         ("::oo::define::mixin", "::oo::Obj5", "mixin"),
         ("::oo::define::superclass", "::oo::Obj6", "superclass"),
@@ -539,18 +581,28 @@ pub(crate) fn init(interp: &mut Interp) {
         ("::oo::objdefine::filter", "::oo::Obj8", "filter"),
         ("::oo::objdefine::mixin", "::oo::Obj9", "mixin"),
         ("::oo::objdefine::variable", "::oo::Obj10", "variable"),
+        ("::oo::configuresupport::readableproperties", "::oo::Obj11", ""),
+        ("::oo::configuresupport::writableproperties", "::oo::Obj12", ""),
+        ("::oo::configuresupport::objreadableproperties", "::oo::Obj13", ""),
+        ("::oo::configuresupport::objwritableproperties", "::oo::Obj14", ""),
     ];
-    for (key, ns, word) in slots {
+    // ::oo::configuresupport — 9.1 boot 即建的 ns（tclOO.c
+    // InitFoundation），4 个 property slot 对象住在这里。
+    interp.ensure_ns_path("::oo::configuresupport");
+    for (i, (key, ns, word)) in slots.into_iter().enumerate() {
         interp.oo.objects.insert(
             key.to_string(),
             OoObject {
                 ns: Rc::from(ns),
+                epoch: i + 4,
                 class: "::oo::Slot".to_string(),
                 ..Default::default()
             },
         );
         interp.oo.creation_order.push(key.to_string());
-        interp.oo.slot_words.insert(key.to_string(), word.to_string());
+        if !word.is_empty() {
+            interp.oo.slot_words.insert(key.to_string(), word.to_string());
+        }
         attach_ns_commands(interp, key, ns);
     }
 
@@ -607,11 +659,12 @@ pub(crate) fn init(interp: &mut Interp) {
         interp.oo.slot_words.insert(key, word.to_string());
     }
 
-    // tclsh 的 ObjN 计数器在用户代码前已消耗到 10（核心内部对象
-    // Obj3..Obj10；可观察的核心名仍是 oo::object=Obj1 / oo::class=
-    // Obj2），首个用户对象是 ::oo::Obj11（实测 tclsh 8.6.17）。基线
-    // 对齐让对象名、info object namespace、errorstack 文本逐字一致。
-    interp.oo.next_obj_id = 10;
+    // tclsh 9.1 的 ObjN 计数器在用户代码前已消耗到 19（object/class/
+    // Slot=Obj1..3、11 个 slot=Obj4..14、singleton 系 5 个=Obj15..19；
+    // 可观察的核心名仍是 oo::object=Obj1 / oo::class=Obj2）。rtcl 未建
+    // singleton 系（编号口径残留差），只消耗到 Obj14——首个用户对象是
+    // ::oo::Obj15（实测 tclsh 9.1.0 是 ::oo::Obj20，残留差）。
+    interp.oo.next_obj_id = 14;
 }
 
 /// Register one definition word as a native command under `ns`.
@@ -2178,11 +2231,13 @@ fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) 
         )));
     }
     let ns = Rc::from(next_ns(interp));
+    let epoch = interp.oo.next_obj_id;
     if is_meta {
         interp.oo.classes.insert(
             canonical.clone(),
             OoClass {
                 ns: Rc::clone(&ns),
+                epoch,
                 superclasses: vec!["::oo::object".to_string()],
                 ..Default::default()
             },
@@ -2190,7 +2245,12 @@ fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) 
     } else {
         interp.oo.objects.insert(
             canonical.clone(),
-            OoObject { ns: Rc::clone(&ns), class: class_key.to_string(), ..Default::default() },
+            OoObject {
+                ns: Rc::clone(&ns),
+                epoch,
+                class: class_key.to_string(),
+                ..Default::default()
+            },
         );
     }
     interp.oo.mutation_ctr += 1;
@@ -2262,10 +2322,16 @@ fn oo_new(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) -> 
         ));
     }
     let name = next_ns(interp);
+    let epoch = interp.oo.next_obj_id;
     let ns: Rc<str> = Rc::from(name.as_str());
     interp.oo.objects.insert(
         name.clone(),
-        OoObject { ns: Rc::clone(&ns), class: class_key.to_string(), ..Default::default() },
+        OoObject {
+            ns: Rc::clone(&ns),
+            epoch,
+            class: class_key.to_string(),
+            ..Default::default()
+        },
     );
     interp.oo.mutation_ctr += 1;
     attach_object(interp, &name, &ns);
@@ -2507,7 +2573,14 @@ extern "Rust" fn cmd_oo_define(interp: &mut Interp, args: &[Value]) -> Result<Va
     };
     if args.len() == 3 {
         let script = args[2].as_str().to_string();
-        run_define_script(interp, DefineTarget::Class(canonical.to_string()), &script, true)
+        // definitionnamespace 的 ns 参数按调用方 ns 解析（p18 实测：
+        // `namespace eval ns1 {oo::define C definitionnamespace inner}`
+        // → ::ns1::inner）——进语境前捕获。
+        let prev_caller =
+            core::mem::replace(&mut interp.oo.define_caller_ns, Rc::clone(&interp.current_namespace));
+        let r = run_define_script(interp, DefineTarget::Class(canonical.to_string()), &script, true);
+        interp.oo.define_caller_ns = prev_caller;
+        r
     } else {
         // Multi-word form: the words form a single command evaluated in the
         // definition context, with no definition-script error frame
@@ -2515,7 +2588,9 @@ extern "Rust" fn cmd_oo_define(interp: &mut Interp, args: &[Value]) -> Result<Va
         interp.oo.define_stack.push(DefineTarget::Class(canonical.to_string()));
         let prev_prefix = interp.oo.define_cmd_prefix.replace(format!("oo::define {}", typed));
         let prev = core::mem::replace(&mut interp.current_namespace, Rc::from("::oo::define"));
+        let prev_caller = core::mem::replace(&mut interp.oo.define_caller_ns, prev.clone());
         let r = interp.dispatch_values(&args[2..]);
+        interp.oo.define_caller_ns = prev_caller;
         interp.current_namespace = prev;
         interp.oo.define_cmd_prefix = prev_prefix;
         interp.oo.define_stack.pop();
@@ -2539,13 +2614,20 @@ extern "Rust" fn cmd_oo_objdefine(interp: &mut Interp, args: &[Value]) -> Result
     };
     if args.len() == 3 {
         let script = args[2].as_str().to_string();
-        run_define_script(interp, DefineTarget::Object(canonical.to_string()), &script, false)
+        // caller-ns 捕获 — see cmd_oo_define.
+        let prev_caller =
+            core::mem::replace(&mut interp.oo.define_caller_ns, Rc::clone(&interp.current_namespace));
+        let r = run_define_script(interp, DefineTarget::Object(canonical.to_string()), &script, false);
+        interp.oo.define_caller_ns = prev_caller;
+        r
     } else {
         // Multi-word form — see cmd_oo_define.
         interp.oo.define_stack.push(DefineTarget::Object(canonical.to_string()));
         let prev_prefix = interp.oo.define_cmd_prefix.replace(format!("oo::objdefine {}", typed));
         let prev = core::mem::replace(&mut interp.current_namespace, Rc::from("::oo::define"));
+        let prev_caller = core::mem::replace(&mut interp.oo.define_caller_ns, prev.clone());
         let r = interp.dispatch_values(&args[2..]);
+        interp.oo.define_caller_ns = prev_caller;
         interp.current_namespace = prev;
         interp.oo.define_cmd_prefix = prev_prefix;
         interp.oo.define_stack.pop();
@@ -2626,11 +2708,24 @@ extern "Rust" fn cmd_oo_define_word(interp: &mut Interp, args: &[Value]) -> Resu
 
 /// The slot objects (`::oo::define::variable` etc — instances of
 /// `::oo::Slot`).  Inside a definition context the slot defers to the def
-/// machinery; outside it, any call raises the context error (tclsh probes
-/// sd-*/so-*/sc0/sc1 — the arity is never reached).
+/// machinery; outside it a **no-arg** call on the defaultOp=NULL slots
+/// （filter/variable + 4 个 property slot）走 unknown → --default-
+/// operation → `my -append`（0 值即返回，Slot_Append 的 skip==objc 短路
+/// ——oracle p12：`::oo::define::variable` → {}；dw5）；其余（-set
+/// 默认的 mixin/superclass、任何带参调用）→ 语境错误。
 extern "Rust" fn cmd_oo_slot(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let key = args[0].as_str();
     if interp.oo.define_stack.is_empty() {
+        let word = interp.oo.slot_words.get(key).map(|w| w.as_str());
+        // 默认操作为 -append（即 defaultOp=NULL 的槽）：filter/variable
+        // 两个词 + 4 个 property slot。mixin/superclass 的默认是 -set
+        // （带语境要求）。
+        let outside_get = args.len() == 1
+            && (matches!(word, Some("filter") | Some("variable"))
+                || key.starts_with("::oo::configuresupport::"));
+        if outside_get {
+            return Ok(Value::empty());
+        }
         return Err(Error::Msg(DEF_CONTEXT_ERR.to_string()));
     }
     let word = interp
@@ -2853,10 +2948,12 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
             }
             let name = rest[0].as_str().to_string();
             let params = parse_param_list(rest[1].as_str())?;
+            // TIP500：`private` 语境内的 method 定义强制不导出。
+            let exported = !interp.oo.define_private && name_exports(&name);
             let def = MethodDef {
                 params: params.into(),
                 body: Rc::from(rest[2].as_str()),
-                exported: name_exports(&name),
+                exported,
                 kind: MethodKind::Tcl,
                 proc_memo: fresh_memo(), head_cache: RefCell::new(None),
             };
@@ -2869,10 +2966,12 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
                 ));
             }
             let name = rest[0].as_str().to_string();
+            // TIP500：private 语境内的 forward 定义同样强制不导出。
+            let exported = !interp.oo.define_private && name_exports(&name);
             let def = MethodDef {
                 params: Vec::new().into(),
                 body: Rc::from(""),
-                exported: name_exports(&name),
+                exported,
                 kind: MethodKind::Forward {
                     cmd: rest[1].as_str().to_string(),
                     prefix: rest[2..].iter().map(|v| v.as_str().to_string()).collect(),
@@ -3117,6 +3216,31 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
             }
             for arg in rest {
                 let name = arg.as_str().to_string();
+                // TIP500：private 语境的 variable 声明进私有名单（标准
+                // variables 清单不列——oracle p18 实测）。
+                if interp.oo.define_private {
+                    match &target {
+                        DefineTarget::Class(name2) => {
+                            if let Some(c) = interp.oo.classes.get_mut(name2) {
+                                if !c.private_variables.contains(&name) {
+                                    c.private_variables.push(name);
+                                }
+                            }
+                        }
+                        DefineTarget::Object(name2) => {
+                            if let Some(o) = interp.oo.objects.get_mut(name2) {
+                                if !o.private_variables.contains(&name) {
+                                    o.private_variables.push(name);
+                                }
+                            } else if let Some(c) = interp.oo.classes.get_mut(name2) {
+                                if !c.private_variables.contains(&name) {
+                                    c.private_variables.push(name);
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 match &target {
                     DefineTarget::Class(name2) => {
                         if let Some(c) = interp.oo.classes.get_mut(name2) {
@@ -3186,10 +3310,121 @@ fn def_dispatch(interp: &mut Interp, word: &str, rest: &[Value]) -> Result<Value
             Ok(Value::empty())
         }
         "self" => {
+            // 定义语境的 self（TIP470/500，define.n METHOD: self）：
+            // 无参 → 当前定义目标名（oo-36.1：`oo::define oo::object
+            // self` → ::oo::object）。类定义语境（oo::define）的其余
+            // 形态 = 对该类做 oo::objdefine（`self <script>` 求值脚本、
+            // `self <word> <args>` 词派发，落到 obj_methods 表）；对象
+            // 定义语境（oo::objdefine）的 self 是 TIP470 原形——只收
+            // 无参，带参 → `wrong # args: should be "self"`（p7 实测）。
             if rest.is_empty() {
-                return Err(Error::wrong_args_with_usage(&cmd_name, 2, 1, "arg ?arg ...?"));
+                return Ok(Value::from_str(&def_target_name(&target)));
             }
-            interp.dispatch_values(rest)
+            match target {
+                DefineTarget::Object(_) => {
+                    return Err(Error::wrong_args_with_usage(&cmd_name, 1, rest.len() + 1, ""));
+                }
+                DefineTarget::Class(cname) => {
+                    let obj_target = DefineTarget::Object(cname.clone());
+                    let script = Value::from_list(rest);
+                    *interp.oo.define_stack.last_mut().unwrap() = obj_target.clone();
+                    let r = run_define_script(interp, obj_target, script.as_str(), false);
+                    // run_define_script 弹栈——恢复类目标（外层 define
+                    // 脚本还开着）。
+                    interp.oo.define_stack.push(DefineTarget::Class(cname));
+                    r
+                }
+            }
+        }
+        "definitionnamespace" => {
+            // TIP524（define.n METHOD: definitionnamespace）：仅
+            // oo::define 语境的词（objdefine 词表没有它——oracle p8：
+            // `oo::objdefine C1 definitionnamespace` → invalid command
+            // name）。根类锁定（C 源：ROOT_OBJECT|ROOT_CLASS 检查在
+            // 元数/kind 之前）→ `may not modify the definition namespace
+            // of the root classes`（EC TCL OO MONKEY_BUSINESS）。
+            if matches!(def_target_name(&target).as_str(), "::oo::object" | "::oo::class") {
+                super::list::set_error_code(interp, "TCL OO MONKEY_BUSINESS");
+                return Err(Error::Msg(
+                    "may not modify the definition namespace of the root classes".to_string(),
+                ));
+            }
+            if rest.len() != 1 && rest.len() != 2 {
+                return Err(Error::wrong_args_with_usage(
+                    &cmd_name, 2, rest.len() + 1, "?kind? namespace",
+                ));
+            }
+            let kind = if rest.len() == 2 {
+                const KINDS: &[&str] = &["-class", "-instance"];
+                match resolve_sub(rest[0].as_str(), KINDS) {
+                    Some(k) => k,
+                    None => {
+                        super::list::set_error_code(
+                            interp,
+                            &format!("TCL LOOKUP INDEX kind {}", rest[0].as_str()),
+                        );
+                        return Err(Error::Msg(format!(
+                            "bad kind \"{}\": must be -class or -instance",
+                            rest[0].as_str()
+                        )));
+                    }
+                }
+            } else {
+                "-class"
+            };
+            // ns 以**调用方** ns 解析（GetNamespaceInOuterContext；
+            // define_caller_ns 由 cmd_oo_define/objdefine 捕获）。空串 =
+            // 解除（doc：namespaceName 为空即断开）。
+            let ns_arg = rest[rest.len() - 1].as_str().to_string();
+            let ns_value = if ns_arg.is_empty() {
+                None
+            } else {
+                let caller = interp.oo.define_caller_ns.to_string();
+                let canon = if ns_arg.starts_with("::") {
+                    ns_arg.clone()
+                } else {
+                    super::namespace::qualify(&caller, &ns_arg)
+                };
+                if !interp.namespaces.contains_key(&canon) {
+                    super::list::set_error_code(
+                        interp,
+                        &format!("TCL LOOKUP NAMESPACE {ns_arg}"),
+                    );
+                    return Err(Error::Msg(format!(
+                        "namespace \"{}\" not found in \"{}\"",
+                        ns_arg, caller
+                    )));
+                }
+                Some(canon)
+            };
+            if let DefineTarget::Class(cname) = &target {
+                if let Some(c) = interp.oo.classes.get_mut(cname) {
+                    match kind {
+                        "-class" => c.defns_class = ns_value,
+                        _ => c.defns_instance = ns_value,
+                    }
+                }
+            }
+            Ok(Value::empty())
+        }
+        "private" => {
+            // TIP500（define.n METHOD: private）：无参 → 私有语境布尔
+            // （C 源 IsPrivateDefine；oracle p13：`oo::define C1 private`
+            // → 0）；`private <script>` / `private <cmd> <args...>` 在
+            // 私有语境里求值——语境内的 method/forward 定义不导出、
+            // variable 声明进私有名单。嵌套 private 无累积效应。
+            if rest.is_empty() {
+                return Ok(Value::from_str(if interp.oo.define_private { "1" } else { "0" }));
+            }
+            let saved = interp.oo.define_private;
+            interp.oo.define_private = true;
+            let r = if rest.len() == 1 {
+                interp.eval(rest[0].as_str())
+            } else {
+                def_dispatch(interp, rest[0].as_str(), &rest[1..])
+            };
+            interp.oo.define_private = saved;
+            r
         }
         _ => Err(Error::invalid_command(word)),
     }
@@ -3438,6 +3673,9 @@ extern "Rust" fn cmd_oo_copy(interp: &mut Interp, args: &[Value]) -> Result<Valu
         interp.oo.next_obj_id += 1;
         let new_ns = ns_override.unwrap_or_else(|| format!("::oo::Obj{}", interp.oo.next_obj_id));
         c.ns = Rc::from(new_ns.as_str());
+        // tclOO.c：指定 ns 的分配路径也 `++nsCount` 记 epoch（与 ObjN
+        // 名同计数器，指定名只是不渲染 ObjN 后缀）。
+        c.epoch = interp.oo.next_obj_id;
         interp.oo.classes.insert(full.clone(), c);
         interp.oo.creation_order.push(full.clone());
         interp.oo.mutation_ctr += 1;
@@ -3452,6 +3690,7 @@ extern "Rust" fn cmd_oo_copy(interp: &mut Interp, args: &[Value]) -> Result<Valu
     let new_ns = ns_override.unwrap_or_else(|| format!("::oo::Obj{}", interp.oo.next_obj_id));
     let mut copy = source.clone();
     copy.ns = Rc::from(new_ns.as_str());
+    copy.epoch = interp.oo.next_obj_id;
     interp.oo.objects.insert(full.clone(), copy);
     interp.oo.mutation_ctr += 1;
     attach_object(interp, &full, &new_ns);
@@ -3502,12 +3741,12 @@ extern "Rust" fn cmd_oo_copy(interp: &mut Interp, args: &[Value]) -> Result<Valu
 // ── info object / info class ───────────────────────────────────────────
 
 const OBJECT_SUBCMDS: &[&str] = &[
-    "call", "class", "definition", "filters", "forward", "isa", "methods", "methodtype",
+    "call", "class", "creationid", "definition", "filters", "forward", "isa", "methods", "methodtype",
     "mixins", "namespace", "variables", "vars",
 ];
 
 const CLASS_SUBCMDS: &[&str] = &[
-    "call", "constructor", "definition", "destructor", "filters", "forward", "instances",
+    "call", "constructor", "definition", "definitionnamespace", "destructor", "filters", "forward", "instances",
     "methods", "methodtype", "mixins", "subclasses", "superclasses", "variables",
 ];
 
@@ -3534,6 +3773,18 @@ fn resolve_object_arg(interp: &mut Interp, typed: &str) -> std::result::Result<S
     resolve_object_key(interp, typed)
         .map(|k| k.to_string())
         .ok_or_else(|| does_not_refer!(interp, true, typed))
+}
+
+/// 对象/类的 creation epoch（`info object creationid`）。0 只会出现在
+/// 非法键上——调用方先做对象解析。
+fn object_epoch(interp: &Interp, key: &str) -> usize {
+    if let Some(o) = interp.oo.objects.get(key) {
+        o.epoch
+    } else if let Some(c) = interp.oo.classes.get(key) {
+        c.epoch
+    } else {
+        0
+    }
 }
 
 fn methods_listing(
@@ -4033,6 +4284,23 @@ fn info_object(interp: &mut Interp, args: &[Value], prefix: &str) -> Result<Valu
                 }
             }
         }
+        "creationid" => {
+            // TIP500：`info object creationid objName`—— creationEpoch
+            // 与 ObjN 命名同计数器（tclOO.c AllocateObject），errorInfo
+            // 面：缺失 → `X does not refer to an object`（oo-16.17），
+            // 元数 → `info object creationid objName`（oo-16.18/18.1）。
+            if args.len() != 4 {
+                return Err(Error::wrong_args_with_usage(
+                    &usage_of(prefix, "creationid"),
+                    4,
+                    args.len(),
+                    "objName",
+                ));
+            }
+            let typed = args[3].as_str();
+            let key = resolve_object_arg(interp, typed)?;
+            Ok(Value::from_str(&object_epoch(interp, &key).to_string()))
+        }
         "isa" => {
             if args.len() < 5 {
                 return Err(Error::wrong_args_with_usage(
@@ -4207,7 +4475,10 @@ fn resolve_class_arg(interp: &mut Interp, typed: &str) -> std::result::Result<St
     if interp.oo.classes.contains_key(key.as_ref()) {
         Ok(key.to_string())
     } else {
-        Err(does_not_refer!(interp, false, typed))
+        // tclsh（TclOOGetClassFromObj）：存在但不是类 → `"X" is not a
+        // class`（带引号；实测 p16，与 info class 全部子命令一致）。
+        super::list::set_error_code(interp, &format!("TCL LOOKUP CLASS {typed}"));
+        Err(Error::Msg(format!("\"{}\" is not a class", typed)))
     }
 }
 
@@ -4329,6 +4600,48 @@ fn info_class(interp: &mut Interp, args: &[Value], prefix: &str) -> Result<Value
         // D-43⑦ 精化（2026-11-15 复测）：constructor/destructor 返回实体
         // ——ctor = {参数列表 体}（ct1 = `{a {b 2}} {set v $a}`），dtor =
         // {体}（ct2 = `my cleanup`）；未定义为空（ct3/ct4/ct5）。
+        "definitionnamespace" => {
+            // TIP524：`info class definitionnamespace className ?kind?`。
+            // 元数（oo-42.5）→ kind（oo-42.4，`gorp` 无横杠也认 kind 名）
+            // → 解析（缺失 → does not refer；非类 → "X" is not a class）
+            // → 直读本类字段（不沿链——oo::Slot -instance → {}，p6）。
+            if args.len() != 4 && args.len() != 5 {
+                return Err(Error::wrong_args_with_usage(
+                    &usage_of(prefix, "definitionnamespace"),
+                    4,
+                    args.len(),
+                    "className ?kind?",
+                ));
+            }
+            let key = resolve_class_arg(interp, args[3].as_str())?;
+            let kind = if args.len() == 5 {
+                const KINDS: &[&str] = &["-class", "-instance"];
+                match resolve_sub(args[4].as_str(), KINDS) {
+                    Some(k) => k,
+                    None => {
+                        super::list::set_error_code(
+                            interp,
+                            &format!("TCL LOOKUP INDEX kind {}", args[4].as_str()),
+                        );
+                        return Err(Error::Msg(format!(
+                            "bad kind \"{}\": must be -class or -instance",
+                            args[4].as_str()
+                        )));
+                    }
+                }
+            } else {
+                "-class"
+            };
+            Ok(
+                match interp.oo.classes.get(&key).map(|c| match kind {
+                    "-class" => c.defns_class.clone(),
+                    _ => c.defns_instance.clone(),
+                }) {
+                    Some(Some(ns)) => Value::from_str(&ns),
+                    _ => Value::empty(),
+                },
+            )
+        }
         "constructor" | "destructor" => {
             if args.len() != 4 {
                 return Err(Error::wrong_args_with_usage(
@@ -4533,7 +4846,7 @@ mod tests {
             eval("set r [list [oo::object create foo]]; foo destroy; lappend r [info commands foo]; set r"),
             "::foo {}"
         );
-        assert_eq!(eval("oo::object new"), "::oo::Obj11");
+        assert_eq!(eval("oo::object new"), "::oo::Obj15");
     }
 
     #[test]

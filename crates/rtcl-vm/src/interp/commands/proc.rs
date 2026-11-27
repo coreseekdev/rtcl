@@ -151,6 +151,23 @@ pub fn cmd_proc(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         compiled,
     };
 
+    // 自删体帧窗口的复活（basic-15.3 钉形；oracle n7/n8 实测）：窗口
+    // 内重建的命令名若在 ns 自删时的命令名单上，整个 ns 以**新空表**
+    // 归位（exists→1，旧命令不复返），本次定义落进复活后的 ns。名单
+    // 外的新名字无此效果（tclsh 只活到体帧退出，ns_eval 出口清扫）。
+    let resurrect_ns = interp
+        .ns_resurrect_cmds
+        .iter()
+        .find(|(ns, names)| {
+            (name.starts_with(&format!("{}::", ns.as_str())) || name.as_str() == ns.as_str())
+                && names.contains(&name)
+        })
+        .map(|(ns, _)| ns.clone());
+    if let Some(dead_ns) = resurrect_ns {
+        interp.ns_resurrect_cmds.remove(&dead_ns);
+        super::namespace::ensure_namespace(interp, &dead_ns);
+    }
+
     // Redefining a command is a silent delete+create (tclsh 8.6.17): no
     // rename/delete trace fires and the old command's stored traces are
     // dropped (trace-19.5, trace-20.3.1).
@@ -434,12 +451,22 @@ pub fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 
     // The level word is present iff args[1] merely LOOKS like a level —
-    // shape only, no arity check (`uplevel .2 {}` executes ".2 {}").
-    let has_level = level_shaped(args[1].as_str());
+    // shape only, no arity check (`uplevel .2 {}` executes ".2 {}") —
+    // AND parses as one: `0.2`/`1a` fail Tcl's integer grammar →
+    // TclObjGetFrame result=0 → the word is a SCRIPT word (apply/proc
+    // 内 `uplevel 0.2 {}` → `invalid command name "0.2"`，corpus
+    // 4.29/4.31/4.35；global 的隐式层级 1 落到下方 m>scopes_total 的
+    // bad level "1"，oracle u2 g-direct 同形)。`#0.2` 等 # 形失败仍
+    // 是 as-typed 的 bad level（4.30/4.32/4.34）。
+    let mut has_level = level_shaped(args[1].as_str());
     let spec = if has_level {
         match parse_level(args[1].as_str()) {
             Ok(s) => s,
-            Err(w) => return Err(bad_level(interp, &w)),
+            Err(w) if w.starts_with('#') => return Err(bad_level(interp, &w)),
+            Err(_) => {
+                has_level = false;
+                LevelSpec::Rel(1, "1".to_string())
+            }
         }
     } else {
         LevelSpec::Rel(1, "1".to_string())
@@ -470,12 +497,16 @@ pub fn cmd_uplevel(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         LevelSpec::Rel(n, word) => {
             // Relative levels count OUT from the innermost scope; past
-            // the top: bad level.  Negative levels report the decimal
-            // magnitude (`uplevel -1` at global → bad level "1").
-            let m = n.unsigned_abs() as usize;
+            // the top: bad level（引原词）。负层级：tclsh
+            // TclObjGetFrame 整数形 w<0 → 直接 bad level（引**原词**
+            // ——`-0xffffffff` 原样、`[expr -0xffffffff]` 的规范十进制
+            // "-4294967295"；corpus 4.17/4.19/4.21/4.23）。
+            if *n < 0 {
+                return Err(bad_level(interp, word));
+            }
+            let m = *n as usize;
             if m > scopes_total {
-                let shown = if *n < 0 { m.to_string() } else { word.clone() };
-                return Err(bad_level(interp, &shown));
+                return Err(bad_level(interp, word));
             }
             let target = scopes_total as isize - m as isize - 1;
             if target < 0 {
@@ -609,6 +640,15 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let spec = if has_level {
         match parse_level(args[1].as_str()) {
             Ok(s) => s,
+            // `#0.2` 等 # 形失败 → as-typed bad level；非整数词
+            // （1a/2.5/0.2/0x）→ TclObjGetFrame result=0：真全局（隐式
+            // 层级 1 无效）→ bad level "1"（oracle upvar_levels
+            // u12/u13/u15/u30）；帧内 → as-typed（corpus upvar-8.3
+            // `proc p1 {upvar a b c}` → bad level "a"）。
+            Err(w) if w.starts_with('#') => return Err(bad_level(interp, &w)),
+            Err(_) if interp.frames.is_empty() && interp.ns_stack.is_empty() => {
+                return Err(bad_level(interp, "1"));
+            }
             Err(w) => return Err(bad_level(interp, &w)),
         }
     } else {
@@ -631,10 +671,14 @@ pub fn cmd_upvar(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
         }
         LevelSpec::Rel(n, word) => {
-            let m = n.unsigned_abs() as usize;
+            // 负层级直接 bad level（引原词——tclsh TclObjGetFrame 整数
+            // 形 w<0 即 -1；upvar_levels u16）。
+            if *n < 0 {
+                return Err(bad_level(interp, word));
+            }
+            let m = *n as usize;
             if m > scopes_total {
-                let shown = if *n < 0 { m.to_string() } else { word.clone() };
-                return Err(bad_level(interp, &shown));
+                return Err(bad_level(interp, word));
             }
             let t = scopes_total as isize - m as isize - 1;
             if t < 0 {

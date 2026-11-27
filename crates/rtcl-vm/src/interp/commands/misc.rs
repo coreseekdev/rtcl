@@ -1453,38 +1453,32 @@ pub fn cmd_info(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 ));
             }
             let name = args[2].as_str();
-            let lookup = |k: &str| {
+            // 全局表命令以**裸名**注册（if/puts/…）：`::if` 形输入要归一
+            // 才查得到（9.1 语料 info-40.4/40.5/40.6 钉 `info cmdtype
+            // ::if/::puts/::yield` → native）。
+            let bare = name.trim_start_matches(':');
+            let prefixed = format!("::{}", bare);
+            let hit = |k: &str| {
                 interp.procs.contains_key(k)
                     || interp.commands.contains_key(k)
                     || interp.ensembles.contains_key(k)
                     || interp.import_aliases.contains_key(k)
-                    || {
-                        let alt = format!("::{}", k);
-                        interp.procs.contains_key(&alt)
-                            || interp.commands.contains_key(&alt)
-                            || interp.ensembles.contains_key(&alt)
-                            || interp.import_aliases.contains_key(&alt)
-                    }
             };
-            if !lookup(name) {
+            if !(hit(name) || hit(bare) || hit(prefixed.as_str())) {
                 set_error_code(interp, "TCL LOOKUP COMMAND");
                 return Err(tcl_err(format!("unknown command \"{}\"", name)));
             }
-            let bare = name.trim_start_matches("::");
-            let kind = if interp.procs.contains_key(name)
-                || interp.procs.contains_key(&format!("::{}", name))
+            let kind = if interp.procs.contains_key(bare)
+                || interp.procs.contains_key(&prefixed)
             {
                 "proc"
-            } else if interp.import_aliases.contains_key(name)
-                || interp
-                    .import_aliases
-                    .contains_key(&format!("::{}", name))
+            } else if interp.import_aliases.contains_key(bare)
+                || interp.import_aliases.contains_key(&prefixed)
             {
                 "alias"
             } else {
                 "native"
             };
-            let _ = bare;
             Ok(Value::from_str(kind))
         }
         "library" => Ok(interp

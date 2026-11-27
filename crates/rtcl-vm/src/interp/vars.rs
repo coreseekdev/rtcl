@@ -303,6 +303,15 @@ impl Interp {
                 from_map.is_some(),
                 "D1 对拍: remove {key:?}"
             );
+            // 步骤 1-2 登记的对拍缺口收口：整条 Var 摘除（remove_value
+            // 连 UNDEFINED 位一起离场）时镜像 phantom 位同步清除——重叠
+            // 态（链接 keep-alive + 有值）下 unset 走本咽喉后，镜像集若
+            // 残留键，下一次 dcheck 即 panic（debug 判官 gen_upvar/
+            // gen_trace/gen_set-old 实证）。占位条目（无值）不经此臂
+            // （remove_value 不动——归 forget_phantom 面）。
+            if from_arena.is_some() {
+                self.phantom_globals.remove(key);
+            }
             self.dcheck_global_mirror(key);
         }
         from_arena

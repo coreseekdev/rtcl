@@ -247,8 +247,8 @@ doc/*.n 章节）。
 7. `expr` 的 `017` 是十进制 17，而 `scan %i`/`%o` 的 `017` 仍是八进制
    15（C 语义）。两处都已按 oracle 分别钉死，勿当同一套字面量语法。
 8. 规则数口径：§2 写的「447 条规则」与实测不符——交接基线 `442f4ff`
-   上 `grep '^rule ' specs/*.allium` 为 242 条；本轮结束为 362 条
-   （新增 120 条）。§2 的 447 可能是含 probe/其他分支的旧数，后续以
+   上 `grep '^rule ' specs/*.allium` 为 242 条；本轮结束为 370 条
+   （新增 128 条）。§2 的 447 可能是含 probe/其他分支的旧数，后续以
    grep 计数为准。
 9. T7 指令面修正：9.1 的 `assemble` 菜单仍保留 `lshift`，移除的是
    `land`/`lor`；§3-C 写的「移除 land/lor/lshift」应改为「移除
@@ -326,12 +326,11 @@ doc/*.n 章节）。
     断言。
 24. `regsub` 的替换结果经 `list` 包装时反斜杠元素会被加括号：
     `list ... [regsub {x} x {\\&}]` 得 `ihhi {\x}`，不是 `ihhi \x`。
-25. 自审脚本（2026-11-27）：解析 351 条规则，260 条 `when` 可直接
-    执行，对 9.1.0 **0 mismatch**；91 条因 `-- after:` 前态/多行/
-    未定义变量跳过。借助自审把 11 条依赖前态的规则改成自包含
-    （io gets/read x3/rw、ArrayExistsAndSize、UnsetElementShrinksArray、
-    WhichVariableReportsNsVar、TraceRemove、ExecTraceHandlerError、
-    MixinCycle、InfoStubbed）。
+25. 自审脚本（2026-11-27）：解析 370 条规则，282 条 `when` 可直接
+    执行，对 9.1.0 **0 mismatch**；77 条因 `-- after:` 前态/多行/
+    未定义变量跳过。已把 20+ 条依赖前态的规则改成自包含
+    （io gets/read、variables 顶部 proc/array、trace、oo、error-deep
+    catch 系列、regex 等）。
 26. 自审又抓到两条期望错误：`GetsAtEof...` 的第二次 EOF `gets` 会
     清空变量，必须先 `set got $v` 再读 EOF；`ReadWriteFile...` 输入
     写 `AAA` 才得 `AAB`（写 `AAAA` 得 `AABA`）。均已修正。
@@ -340,6 +339,13 @@ doc/*.n 章节）。
     `RegsubRejectsUnknownOption`；bad option 菜单实测为
     `-all, -command, -expanded, -line, -linestop, -lineanchor,
     -nocase, -start, or --`（字母序）。
+28. catch 的 return 语义修正（8.6/9.1 一致，原规格两处写错）：
+    - 顶层 `catch {return hi}` → catch 2，opts `-code 0 -level 1`；
+      经 proc 边界 → catch 0，opts `-code 0 -level 0`。
+    - `return -code error boom` 经 proc → catch **1**（不是 2），
+      opts `-code 1 -level 0`。已把 `CatchNonErrorOptionsLevel` 改为
+      同时钉四组（return 顶层/proc、break、continue），
+      `CatchReturnCodeErrorViaProcIsError` 改为 `1 boom 1 0`。
 
 ## 8. 交接记录
 
@@ -398,24 +404,27 @@ doc/*.n 章节）。
   - T7：matching 补 regexp 编译错误文案（couldn't -> cannot；
     quantifier operand invalid -> invalid quantifier operand），并更新
     三条既有规则的注释；interp 补 assemble 指令面（swap 可用、land
-    移除、lshift 仍在）与栈平衡错误；matching 补 binary 浮点
-    Inf/NaN/-0.0 的 IEEE-754 位形（R/r/Q/q）。binary 不再挂裁定项。
+    移除、lshift 仍在）、栈平衡、9.1 新指令菜单（isEmpty/strge/
+    jumpTableNum/dictGetDef/dictPut/dictRemove/tclooId）与 strlt/
+    isEmpty 执行；matching 补 binary 浮点 Inf/NaN/-0.0 的 IEEE-754
+    位形（R/r/Q/q）。binary 不再挂裁定项。
   - T4 余项：已补 clock add weekdays / clock scan -validate、
     exec -encoding、info loaded/cmdtype、tcl::build-info、
     ::tcl::pkgconfig 键集、unicode 归一化、zipfs root、timerate 形状、
     socket -nodelay/-keepalive、package files、::tcl 命令集 18 条。
     T4 主面到此完成；timerate/zipfs 的文件/数值清单仍不钉（环境相关）。
-  - T6：已钉 abstract/singleton/private method/classmethod/
-    info class variables（5 条）+ 匿名对象首基准 Obj20、名字/creationid
-    关系、命名/类共用计数器、info object isa（4 条）。
-    properties/classvariable 因文档超前于 9.1.0 实现未写（§7-10）；
-    对象计数绝对基准已按用户裁定钉死，不再留 open question。新增探针
-    `oo_objcount91.tcl`、`oo_features91.tcl`、`pbr6_float_bits.tcl`
-    （§4 授权）。
+  - T6：已钉 abstract/singleton/private method/private variable/
+    classmethod/info class variables（6 条）+ 匿名对象首基准 Obj20、
+    名字/creationid 关系、命名/类共用计数器、info object isa（4 条）+
+    destructor 链、method 默认值/args、methodtype/forward、oo::copy/
+    rename、unknown method 文案（5 条）。properties/classvariable 因
+    文档超前于 9.1.0 实现未写（§7-10）；对象计数绝对基准已按用户裁定
+    钉死，不再留 open question。新增探针 `oo_objcount91.tcl`、
+    `oo_features91.tcl`、`pbr6_float_bits.tcl`（§4 授权）。
 - 门禁终态：`allium check specs/` 0 error（3 warning 为 memory-lifecycle
   既有 unused entity/binding；3 info 为既有 unused field）；
   `allium analyse specs/` 0 finding。自审脚本
-  `python3 specs/scripts/audit-91.py`：checked=260 skipped=91
+  `python3 specs/scripts/audit-91.py`：checked=282 skipped=77
   mismatches=0（跳过的是 `-- after:` 前态/多行 trigger）。未改
   crates/judge 代码（仅按授权加 3 个探针 + 审计脚本），未跑 judge
   （规格-only 改动不触发代码门禁）。

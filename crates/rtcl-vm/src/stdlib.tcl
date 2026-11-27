@@ -604,3 +604,80 @@ proc ::tcl::CopyDirectory {action src dest} {
     }
     return
 }
+
+# ── readFile / writeFile / foreachLine (tclsh 9.1, TIP 670) ─────────────
+# 9.1 library/readfile.tcl・writefile.tcl・foreachline.tcl 的忠实移植
+# （E1 批，oracle 钉形实测）。tcl::prefix match 在 rtcl 尚不存在，模式
+# 匹配按 prefix 算法内联：exact 胜出 → 唯一前缀采纳 → 无匹配 bad /
+# 多候选（含空串）ambiguous，errorCode TCL LOOKUP MODE <mode>。
+
+proc readFile {filename {mode text}} {
+    # Parse the mode (tcl::prefix match -message "mode" {binary text}）：
+    # {binary text} 无互为前缀的元素，exact 即唯一前缀，纯前缀扫描等价。
+    set hits {}
+    foreach m {binary text} {
+	if {$mode eq [string range $m 0 [expr {[string length $mode] - 1}]]} {
+	    lappend hits $m
+	}
+    }
+    if {[llength $hits] != 1} {
+	return -code error -errorcode [list TCL LOOKUP MODE $mode] \
+	    "[expr {[llength $hits] ? "ambiguous" : "bad"}] mode \"$mode\": must be binary or text"
+    }
+    set mode [lindex $hits 0]
+
+    # Read the file
+    set f [open $filename [dict get {text r binary rb} $mode]]
+    try {
+	return [read $f]
+    } finally {
+	close $f
+    }
+}
+
+proc writeFile {args} {
+    # Parse the arguments (9.1 writefile.tcl; switch -integer → if)
+    if {[llength $args] == 2} {
+	lassign $args filename data
+	set mode text
+    } elseif {[llength $args] == 3} {
+	lassign $args filename mode data
+	set hits {}
+	foreach m {binary text} {
+	    if {$mode eq [string range $m 0 [expr {[string length $mode] - 1}]]} {
+		lappend hits $m
+	    }
+	}
+	if {[llength $hits] != 1} {
+	    return -code error -errorcode [list TCL LOOKUP MODE $mode] \
+		"[expr {[llength $hits] ? "ambiguous" : "bad"}] mode \"$mode\": must be binary or text"
+	}
+	set mode [lindex $hits 0]
+    } else {
+	return -code error -errorcode {TCL WRONGARGS} \
+	    "wrong # args: should be \"writeFile filename ?mode? data\""
+    }
+
+    # Write the file
+    set f [open $filename [dict get {text w binary wb} $mode]]
+    try {
+	puts -nonewline $f $data
+    } finally {
+	close $f
+    }
+}
+
+proc foreachLine {varName filename body} {
+    upvar 1 $varName line
+    set f [open $filename "r"]
+    try {
+	while {[gets $f line] >= 0} {
+	    uplevel 1 $body
+	}
+    } on return {msg opt} {
+	dict incr opt -level
+	return -options $opt $msg
+    } finally {
+	close $f
+    }
+}

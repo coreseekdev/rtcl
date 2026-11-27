@@ -343,7 +343,7 @@ fn finish_gets(interp: &mut Interp, args: &[Value], line: Option<&str>) -> Resul
 
 pub fn cmd_seek(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 3 || args.len() > 4 {
-        return Err(Error::wrong_args_with_usage("seek", 3, args.len(), "seek channelId offset ?origin?"));
+        return Err(Error::wrong_args_with_usage("seek", 3, args.len(), "channel offset ?origin?"));
     }
     let chan_id = args[1].as_str();
     let offset = args[2].as_int().ok_or_else(|| {
@@ -402,7 +402,7 @@ pub fn cmd_seek(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 pub fn cmd_tell(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(Error::wrong_args_with_usage("tell", 2, args.len(), "tell channelId"));
+        return Err(Error::wrong_args_with_usage("tell", 2, args.len(), "channel"));
     }
     let chan_id = args[1].as_str();
     if !interp.channels.contains(chan_id) {
@@ -426,7 +426,7 @@ pub fn cmd_tell(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 pub fn cmd_eof(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(Error::wrong_args_with_usage("eof", 2, args.len(), "eof channelId"));
+        return Err(Error::wrong_args_with_usage("eof", 2, args.len(), "channel"));
     }
     let chan_id = args[1].as_str();
     // `chan create` channels report EOF through their read handler.
@@ -444,7 +444,7 @@ pub fn cmd_eof(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 pub fn cmd_flush(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(Error::wrong_args_with_usage("flush", 2, args.len(), "channelId"));
+        return Err(Error::wrong_args_with_usage("flush", 2, args.len(), "channel"));
     }
     let chan_id = args[1].as_str();
     if !interp.channels.contains(chan_id) {
@@ -464,7 +464,7 @@ pub fn cmd_flush(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
 pub fn cmd_fblocked(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 2 {
-        return Err(Error::wrong_args_with_usage("fblocked", 2, args.len(), "channelId"));
+        return Err(Error::wrong_args_with_usage("fblocked", 2, args.len(), "channel"));
     }
     let chan_id = args[1].as_str();
     if interp.reflected.contains_key(chan_id) {

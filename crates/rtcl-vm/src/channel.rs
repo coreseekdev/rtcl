@@ -3311,7 +3311,17 @@ pub(crate) fn open_file_channel(
     path: &str,
     mode: &str,
 ) -> io::Result<(Box<dyn Channel>, bool)> {
-    let mut binary = false;
+    // 具名 binary 形（tclsh 9.1 实测钉形：rb/wb/ab/rb+/wb+/ab+ = 同名
+    // 无后缀形的 access + binary 翻译/iso8859-1 编码；大小写敏感）。
+    let (mode, mut binary) = match mode {
+        "rb" => ("r", true),
+        "wb" => ("w", true),
+        "ab" => ("a", true),
+        "rb+" => ("r+", true),
+        "wb+" => ("w+", true),
+        "ab+" => ("a+", true),
+        m => (m, false),
+    };
     let file = match mode {
         "r" => {
             let f = std::fs::File::open(path)?;
@@ -3346,7 +3356,7 @@ pub(crate) fn open_file_channel(
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
-                        "invalid access mode \"{}\": must be RDONLY, WRONLY, RDWR, APPEND, BINARY, CREAT, EXCL, NOCTTY, NONBLOCK, or TRUNC",
+                        "invalid access mode \"{}\": must be APPEND, BINARY, CREAT, EXCL, NOCTTY, NONBLOCK, RDONLY, RDWR, TRUNC, or WRONLY",
                         mode
                     ),
                 ));

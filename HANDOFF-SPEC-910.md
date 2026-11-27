@@ -471,8 +471,8 @@ doc/*.n 章节）。
   77 条依赖 `-- after:` 前态/多行的规则保持伪代码形态。
 - 已修：io/variables/matching/oo/interp/memory 的头部锚与覆盖范围；
   expr/error-deep/matching 的 8.6-only 注释；io 的 D-30→D-29 引用。
-- 代码缺口：OO bootstrap 已对齐（§10）；仍缺 property/classvariable
-  的**运行时行为**（规格已按 9.1 钉，代码未接）。
+- 代码缺口：OO bootstrap 与 property/classvariable 已对齐（§10）；
+  judge 仅剩无 OO 关联的 `gen_lseq` 失败。
 
 
 ## 10. 代码对齐（2026-11-27）
@@ -488,9 +488,17 @@ doc/*.n 章节）。
     出的类 new 返回唯一实例、create 报错；
   - `next_obj_id = 19`，首个用户对象为 `::oo::Obj20`；
   - 新增单测 `test_oo_9_1_bootstrap_objects`，原 Obj15 断言改 Obj20。
-- 验证：`cargo test -p rtcl-vm --lib` 871 passed；新单测覆盖
-  Obj11-19、类层次、Slot 11 实例、abstract/singleton 行为。
+- 验证：`cargo test -p rtcl-vm --lib` 874 passed；单测覆盖
+  Obj11-19、类层次、Slot 11 实例、abstract/singleton、classvariable、
+  property 种类/configure/自定义访问器。
 - judge：`94 pass / 1 fail`，失败项 `gen/gen_lseq`（lseq-4.11，
   `lindex [lseq 0x7fffffff] 0x80000000`）与本次 OO 改动无关，单独记录。
-- 仍未接：`property` 定义方言与 `classvariable` 方法内命令的运行时
-  行为（`oo::configurable`/属性 slot 对象已就位，规格已钉 9.1 语义）。
+- `classvariable`：`::oo::Helpers::classvariable` + 每对象隐藏命令入
+  方法帧，按活动方法 owner 解析类/对象 ns，跨实例共享（Counted 例）。
+- `property`：`oo::configurable` 类获得 property 定义方言与 configure
+  内建方法；支持 `-kind readable|writable|readwrite`、`-get/-set`、
+  `info class properties` 默认/`-all/-readable/-writable`、
+  `configure` 读/写/无参字典、unknown `bad property` 文案、
+  `oo::objdefine` 实例属性。默认访问器读写对象 ns 变量，自定义访问器
+  用 `apply` 执行（正确传播 return/error）。
+- 仍未接：无（judge 唯一失败 `gen_lseq` 与 OO 无关）。

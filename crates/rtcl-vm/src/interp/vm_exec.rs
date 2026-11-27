@@ -171,6 +171,7 @@ struct ForeachFrame {
 enum ForeachList {
     Rep(Value),
     Owned(Vec<Value>),
+    Series(crate::value::SeriesRep),
 }
 
 impl ForeachList {
@@ -178,13 +179,18 @@ impl ForeachList {
         match self {
             ForeachList::Rep(v) => v.as_list_ref().map_or(0, <[Value]>::len),
             ForeachList::Owned(v) => v.len(),
+            ForeachList::Series(s) => usize::try_from(s.len.max(0)).unwrap_or(usize::MAX),
         }
     }
 
-    fn get(&self, i: usize) -> Option<&Value> {
+    fn get(&self, i: usize) -> Option<Value> {
         match self {
-            ForeachList::Rep(v) => v.as_list_ref().and_then(|s| s.get(i)),
-            ForeachList::Owned(v) => v.get(i),
+            ForeachList::Rep(v) => v.as_list_ref().and_then(|s| s.get(i)).cloned(),
+            ForeachList::Owned(v) => v.get(i).cloned(),
+            ForeachList::Series(s) => {
+                let i = i as i64;
+                if i < s.len { Some(s.element(i)) } else { None }
+            }
         }
     }
 }
@@ -2964,7 +2970,9 @@ fn op_foreach_start(
     // to the always-owned form.
     for _ in 0..ngroups {
         let v = st.pop_val();
-        if v.as_list_ref().is_some() {
+        if let Some(s) = v.series() {
+            lists.push(ForeachList::Series(s));
+        } else if v.as_list_ref().is_some() {
             lists.push(ForeachList::Rep(v));
         } else {
             lists.push(ForeachList::Owned(super::commands::list::strict_list(
@@ -3590,11 +3598,8 @@ fn foreach_bind(
     if let [g] = info.groups.as_slice() {
         if let [t] = g.as_slice() {
             if let (Some(slot), [list]) = (t.slot, ff.lists.as_slice()) {
-                let v = match list.get(idx) {
-                    Some(v) => v,
-                    None => &Value::empty(),
-                };
-                if interp.frame_slot_write(slot as usize, v) {
+                let v = list.get(idx).unwrap_or_else(Value::empty);
+                if interp.frame_slot_write(slot as usize, &v) {
                     return Ok(());
                 }
             }
@@ -3606,9 +3611,9 @@ fn foreach_bind(
     for (g, list) in info.groups.iter().zip(&ff.lists) {
         let n = g.len();
         for (vi, t) in g.iter().enumerate() {
-            let v: &Value = list.get(idx * n + vi).unwrap_or(&empty);
+            let v: Value = list.get(idx * n + vi).unwrap_or_else(|| empty.clone());
             match t.slot {
-                Some(s) if interp.frame_slot_write(s as usize, v) => {}
+                Some(s) if interp.frame_slot_write(s as usize, &v) => {}
                 _ => {
                     let name = code.get_const(t.name_idx).unwrap_or("");
                     if let Err(e) = interp.set_var(name, v.clone()) {

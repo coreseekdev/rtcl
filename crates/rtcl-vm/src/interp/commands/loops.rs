@@ -4,9 +4,47 @@ use std::borrow::Cow;
 
 use crate::error::{Error, Result};
 use crate::interp::Interp;
-use crate::value::Value;
+use crate::value::{SeriesRep, Value};
 
 use super::list::{set_error_code, strict_list, strict_list_cow, tcl_err};
+
+/// Foreach/lmap/lfilter source: an ordinary list slice or a lazy `lseq`
+/// series (never materialized just to iterate).
+pub(crate) enum ListData<'a> {
+    Slice(Cow<'a, [Value]>),
+    Series(SeriesRep),
+}
+
+impl ListData<'_> {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            ListData::Slice(s) => s.len(),
+            ListData::Series(s) => usize::try_from(s.len.max(0)).unwrap_or(usize::MAX),
+        }
+    }
+
+    pub(crate) fn get(&self, i: usize) -> Option<Value> {
+        match self {
+            ListData::Slice(s) => s.get(i).cloned(),
+            ListData::Series(s) => {
+                let i = i as i64;
+                if i < s.len {
+                    Some(s.element(i))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn list_data<'a>(interp: &mut Interp, v: &'a Value) -> Result<ListData<'a>> {
+    if let Some(s) = v.series() {
+        Ok(ListData::Series(s))
+    } else {
+        Ok(ListData::Slice(strict_list_cow(interp, v)?))
+    }
+}
 
 pub fn cmd_while(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() != 3 {
@@ -233,7 +271,7 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // var_names is a list: single var "x" or multi-var "{a b c}"
     struct VarGroup<'a> {
         vars: Vec<String>,
-        data: Cow<'a, [Value]>,
+        data: ListData<'a>,
     }
     let mut groups: Vec<VarGroup> = Vec::new();
     let mut i = 1;
@@ -249,8 +287,9 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         // A value already carrying a list rep is viewed in place — the
         // iteration never mutates the source (tclsh hands the foreach
-        // body pointers into the source list the same way).
-        let data = strict_list_cow(interp, &args[i + 1])?;
+        // body pointers into the source list the same way).  A lazy lseq
+        // series is indexed instead of materialized.
+        let data = list_data(interp, &args[i + 1])?;
         groups.push(VarGroup { vars, data });
         i += 2;
     }
@@ -270,7 +309,7 @@ pub fn cmd_foreach(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let n = g.vars.len();
             for (vi, var) in g.vars.iter().enumerate() {
                 let data_idx = idx * n + vi;
-                let value = g.data.get(data_idx).cloned().unwrap_or_else(Value::empty);
+                let value = g.data.get(data_idx).unwrap_or_else(Value::empty);
                 if let Err(e) = interp.set_var(var, value) {
                     // Tcl's compiled foreach appends a dedicated frame
                     // between the message and the enclosing command's
@@ -390,7 +429,7 @@ pub(crate) fn foreach_lexical(interp: &mut Interp, args: &[Value], kind: LoopKin
 
     struct VarGroup<'a> {
         vars: Vec<String>,
-        data: Cow<'a, [Value]>,
+        data: ListData<'a>,
     }
     let mut groups: Vec<VarGroup> = Vec::new();
     let mut i = 1;
@@ -403,7 +442,7 @@ pub(crate) fn foreach_lexical(interp: &mut Interp, args: &[Value], kind: LoopKin
             .split_whitespace()
             .map(str::to_string)
             .collect();
-        let data = strict_list_cow(interp, &args[i + 1])?;
+        let data = list_data(interp, &args[i + 1])?;
         groups.push(VarGroup { vars, data });
         i += 2;
     }
@@ -435,7 +474,6 @@ pub(crate) fn foreach_lexical(interp: &mut Interp, args: &[Value], kind: LoopKin
                 let value = g
                     .data
                     .get(idx * gn + vi)
-                    .cloned()
                     .unwrap_or_else(Value::empty);
                 if gi == 0 && vi == 0 && kind == LoopKind::Lfilter {
                     prime = Some(value.clone());

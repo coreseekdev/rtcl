@@ -418,6 +418,29 @@ pub fn cmd_lrange(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         set_error_code(interp, "TCL WRONGARGS");
         return Err(wrong_args("lrange", "list first last"));
     }
+    // Lazy lseq series: resolve the requested window without materializing
+    // the whole (possibly 2^31-1 element) list.
+    if let Some(s) = args[1].series() {
+        let len = usize::try_from(s.len.max(0)).unwrap_or(usize::MAX);
+        let first_raw = match parse_tcl_index(args[2].as_str(), len) {
+            Some(r) => r,
+            None => return Err(bad_index(interp, args[2].as_str())),
+        };
+        let last_raw = match parse_tcl_index(args[3].as_str(), len) {
+            Some(r) => r,
+            None => return Err(bad_index(interp, args[3].as_str())),
+        };
+        let first = first_raw.max(0);
+        let last = last_raw.min(len as i64 - 1);
+        if first <= last && (first as usize) < len {
+            let mut out = Vec::with_capacity((last - first + 1) as usize);
+            for i in first..=last {
+                out.push(s.element(i));
+            }
+            return Ok(Value::from_list(&out));
+        }
+        return Ok(Value::empty());
+    }
     let list = strict_list(interp, &args[1])?;
     let len = list.len();
     let first_raw = match parse_tcl_index(args[2].as_str(), len) {
@@ -665,9 +688,9 @@ pub fn cmd_lmap(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let body = &args[args.len() - 1];
     let mut collected: Vec<Value> = Vec::new();
 
-    struct VarGroup {
+    struct VarGroup<'a> {
         vars: Vec<String>,
-        data: Vec<Value>,
+        data: super::loops::ListData<'a>,
     }
     let mut groups: Vec<VarGroup> = Vec::new();
     let mut i = 1;
@@ -678,7 +701,7 @@ pub fn cmd_lmap(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             return Err(tcl_err("lmap varlist is empty"));
         }
         let vars: Vec<String> = var_list.iter().map(|v| v.as_str().to_string()).collect();
-        let data = strict_list(interp, &args[i + 1])?;
+        let data = super::loops::list_data(interp, &args[i + 1])?;
         groups.push(VarGroup { vars, data });
         i += 2;
     }
@@ -697,7 +720,7 @@ pub fn cmd_lmap(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let n = g.vars.len();
             for (vi, var) in g.vars.iter().enumerate() {
                 let data_idx = idx * n + vi;
-                let value = g.data.get(data_idx).cloned().unwrap_or_else(Value::empty);
+                let value = g.data.get(data_idx).unwrap_or_else(Value::empty);
                 if let Err(e) = interp.set_var(var, value) {
                     // Dispatched lmap decorates a loop-variable write
                     // failure exactly like dispatched foreach (probed
@@ -765,9 +788,9 @@ pub fn cmd_lfilter(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let body = &args[args.len() - 1];
     let mut collected: Vec<Value> = Vec::new();
 
-    struct VarGroup {
+    struct VarGroup<'a> {
         vars: Vec<String>,
-        data: Vec<Value>,
+        data: super::loops::ListData<'a>,
     }
     let mut groups: Vec<VarGroup> = Vec::new();
     let mut i = 1;
@@ -778,7 +801,7 @@ pub fn cmd_lfilter(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             return Err(tcl_err("lfilter varlist is empty"));
         }
         let vars: Vec<String> = var_list.iter().map(|v| v.as_str().to_string()).collect();
-        let data = strict_list(interp, &args[i + 1])?;
+        let data = super::loops::list_data(interp, &args[i + 1])?;
         groups.push(VarGroup { vars, data });
         i += 2;
     }
@@ -800,7 +823,7 @@ pub fn cmd_lfilter(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             let n = g.vars.len();
             for (vi, var) in g.vars.iter().enumerate() {
                 let data_idx = idx * n + vi;
-                let value = g.data.get(data_idx).cloned().unwrap_or_else(Value::empty);
+                let value = g.data.get(data_idx).unwrap_or_else(Value::empty);
                 if gi == 0 && vi == 0 {
                     prime = Some(value.clone());
                 }
@@ -1815,6 +1838,26 @@ mod tests {
         assert_eq!(
             interp.eval("lindex [lseq 0x7fffffff] 5").unwrap().as_str(),
             "5"
+        );
+        assert_eq!(
+            interp.eval("lrange [lseq 0x7fffffff] 3 5").unwrap().as_str(),
+            "3 4 5"
+        );
+        assert_eq!(
+            interp.eval("lrange [lseq 0x7fffffff] end-1 end").unwrap().as_str(),
+            "2147483645 2147483646"
+        );
+        assert_eq!(
+            interp.eval("lmap x [lseq 0x7fffffff] {if {$x > 2} break; set x}").unwrap().as_str(),
+            "0 1 2"
+        );
+        assert_eq!(
+            interp.eval("lfilter x [lseq 0x7fffffff] {if {$x > 2} break; expr 1}").unwrap().as_str(),
+            "0 1 2"
+        );
+        assert_eq!(
+            interp.eval("foreach x [lseq 0x7fffffff] {if {$x > 2} break; set x}; set x").unwrap().as_str(),
+            "3"
         );
     }
 }

@@ -2,8 +2,8 @@
 -- variables.allium
 -- Behaviour spec: variable scoping in Tcl — proc frames, global, upvar,
 -- namespaces, arrays. Oracle: tclsh 9.1.0 (core-9-1-0).
--- A/B rules re-anchored 2026-11-27; remaining C-class coverage tracked in
--- HANDOFF-SPEC-910.md §8.
+-- A/B + T5 rules re-anchored 2026-11-27; remaining C-class coverage tracked
+-- in HANDOFF-SPEC-910.md §8.
 --
 -- 9.1 namespace rule: an unqualified variable name inside a namespace eval
 -- body resolves only within the current namespace (plus variable links in
@@ -306,4 +306,97 @@ rule WhichVariableReportsNsVar {
     ensures: completion.code = ok
     ensures: completion.value = "::d::v"
     -- probe: namespace eval d {variable v; puts [namespace which -variable v]}
+}
+
+-- ── 9.1 namespace/upvar deep water (T5, 2026-11-27) ─────────────
+
+rule NamespaceInfoVarsExcludesGlobals {
+    -- info vars inside a namespace lists only that namespace's variables;
+    -- global names (argv, env, ...) are not visible.
+    when: Evaluates("namespace eval nn {set zz 2; expr {[lsearch -exact [info vars] zz] >= 0 && [lsearch -exact [info vars] argv] < 0}}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: q114b
+}
+
+rule UplevelFromNamespaceBodySeesNamespaceFrame {
+    -- A proc called from a namespace eval body has that body as its caller
+    -- frame: uplevel 1 {info vars} reports the namespace variables, not the
+    -- proc's own locals.
+    when: Evaluates("namespace eval s {variable x 0; variable y 1; proc show {} {uplevel 1 {info vars}}; show}")
+    ensures: completion.code = ok
+    ensures: completion.value = "x y"
+    -- probe: u72/p-uplevel-ns
+}
+
+rule NamespaceVariableWithoutValueIsUnset {
+    -- `variable x` declares without assigning: the declaration exists but
+    -- reads as unset until a value is assigned.
+    when: Evaluates("namespace eval t2 {variable x; list [info exists x] [catch {set x} m] $m}")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 1 {can't read \"x\": no such variable}"
+    -- probe: vm3
+}
+
+rule NamespaceVariableRecreatedAfterUnset {
+    -- After unset, a plain set in the namespace recreates the variable at
+    -- the same namespace-qualified location.
+    when: Evaluates("namespace eval t2 {variable x 5; unset x}; namespace eval t2 {set x 7}; list [set ::t2::x] [namespace eval t2 {namespace which -variable x}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "7 ::t2::x"
+    -- probe: vm3
+}
+
+rule ErrorCodeNotPresetBeforeFirstError {
+    -- ::errorCode and ::errorInfo do not exist until a real error occurs;
+    -- a successful evaluation does not create them.
+    when: Evaluates("list [info exists ::errorCode] [info exists ::errorInfo]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0"
+    -- probe: ec2 (fresh interp; after `error foo`, errorCode is NONE)
+}
+
+rule UpvarBadLevelMessage {
+    -- An unusable uplevel level is `bad level "<text>"`; level parsing is
+    -- not integer-literal based (#0, 0x, +2 are all rejected).
+    when: Evaluates("catch {upvar 99 x y} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad level \"99\""
+    -- probe: upvar_levels (u5/u6/u9/u14/u17)
+}
+
+rule UpvarRejectsSelfExistingAndTraced {
+    -- upvar refuses a self-link, a name already local in the target frame,
+    -- and a variable carrying traces.
+    when: Evaluates("apply {{} {set a 1; catch {upvar 0 a a} m1; catch {upvar b a} m2; trace add variable c write cb; catch {upvar b c} m3; list $m1 $m2 $m3}}")
+    ensures: completion.code = ok
+    ensures: completion.value = "{can't upvar from variable to itself} {variable \"a\" already exists} {variable \"c\" has traces: can't use for upvar}"
+    -- probe: upvar_levels (u20-u24)
+}
+
+rule IncrBadIncrementLeavesVariableUnchanged {
+    -- A failed incr neither changes an existing value nor creates a missing
+    -- variable.
+    when: Evaluates("set x 1; catch {incr x 1a}; list $x [info exists nosuch]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+    -- probe: incr_frame
+}
+
+rule NamespaceParentMustExist {
+    -- Writing through a qualified name whose parent namespace is missing
+    -- fails; variable declarations use the "can't define" wording.
+    when: Evaluates("list [catch {set ::nope::zz 1} m] $m [catch {namespace eval pns {variable sev:::en 7}} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {can't set \"::nope::zz\": parent namespace doesn't exist} 1 {can't define \"sev:::en\": parent namespace doesn't exist}"
+    -- probe: trv_p8
+}
+
+rule ExprArrayIndexParseErrors {
+    -- An unbalanced quote inside an array index is a parse error naming the
+    -- index, not an attempt to read a variable with a weird name.
+    when: Evaluates("catch {expr {$foo(\"x)}} m; string match {invalid character in array index*} $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: pidx/pidx3
 }

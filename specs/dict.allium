@@ -2,7 +2,8 @@
 -- dict.allium
 -- Behaviour spec: dictionaries — construction, key semantics, paths,
 -- iteration, update/with scoping, error surfaces.
--- Oracle: tclsh 8.6.17. 2026-11-03 deep-water round.
+-- Oracle: tclsh 9.1.0 (core-9-1-0). T4 rules re-anchored 2026-11-27.
+-- 2026-11-03 deep-water round.
 -- rtcl divergences from this spec are tracked in DIVERGENCES.md
 -- (D-12 … D-17；台账为准).
 
@@ -174,4 +175,31 @@ rule DictLookupErrorCarriesErrorCode {
     ensures: completion.code = ok
     ensures: completion.value = "TCL LOOKUP DICT b"
     -- rtcl: NONE  [D-16]
+}
+
+-- ── 9.1 dict lookups with defaults (T4, 2026-11-27) ─────────────
+
+rule DictGetdefReturnsValueOrDefault {
+    -- getdef walks the key path and returns the final key's value, or the
+    -- trailing default when the path is absent.
+    when: Evaluates("list [dict getdef {a {b c}} a b d] [dict getdef {a {b c}} a c d] [dict getdef {a b} q {x y z}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "c d {x y z}"
+    -- probe: dictgetdef91 (TIP 342)
+}
+
+rule DictGetwithdefaultReturnsDefault {
+    when: Evaluates("list [dict getwithdefault {a b} a c] [dict getwithdefault {a b} z c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "b c"
+    -- probe: dictgetdef91
+}
+
+rule DictSubcommandMenuIncludesDefaultForms {
+    -- The menu now contains getdef/getwithdefault, so one-letter prefixes
+    -- such as "ge" are ambiguous.
+    when: Evaluates("catch {dict gorp} m; string match {unknown or ambiguous subcommand \"gorp\": must be *getdef, getwithdefault*} $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: dictgetdef91 (dict ge => ambiguous)
 }

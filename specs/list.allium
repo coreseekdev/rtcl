@@ -2,7 +2,8 @@
 -- list.allium
 -- Behaviour spec: Tcl list values and list commands
 -- (list, llength, lindex, lrange, lset, lsort, lsearch, concat/split/join).
--- Oracle: tclsh 8.6.17.
+-- Oracle: tclsh 9.1.0 (core-9-1-0). T4 rules re-anchored 2026-11-27;
+-- T2 (64-bit indices) coverage tracked in HANDOFF-SPEC-910.md §8.
 
 use "./interp.allium" as interp
 
@@ -156,4 +157,61 @@ rule JoinUsesSeparator {
     when: Evaluates("join {a b} -")
     ensures: completion.code = ok
     ensures: completion.value = "a-b"
+}
+
+-- ── 9.1 list surface (T4, 2026-11-27) ───────────────────────────
+-- Probes: lpop91, lseq91, lfilter91; re-run on tclsh 9.1.0.
+
+rule LpopMutatesListVariable {
+    -- lpop removes and returns the element at index (default 0) from the
+    -- named variable; a nested index path descends into sublists.
+    when: Evaluates("set l {a b c d}; list [lpop l] $l")
+    ensures: completion.code = ok
+    ensures: completion.value = "a {b c d}"
+    -- probe: lpop91 (lpop n 1 2 => f; n => {{a b c} {d e} {g h i}})
+}
+
+rule LremoveReturnsFilteredCopy {
+    -- lremove returns a copy with the indexed elements removed; the source
+    -- string is unchanged.
+    when: Evaluates("list [lremove {a b c d e} 2] [lremove {a b c d e} end-1 1] [lremove {a b c d e} 2 end-2]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a b d e} {a c e} {a b d e}"
+    -- probe: lpop91
+}
+
+rule LeditReplacesRangeInPlace {
+    -- ledit replaces the first..last range of the named variable with the
+    -- given elements and returns the new value.
+    when: Evaluates("set l {c d e f g}; list [ledit l 1 2 X Y Z] $l")
+    ensures: completion.code = ok
+    ensures: completion.value = "{c X Y Z f g} {c X Y Z f g}"
+    -- probe: lpop91
+}
+
+rule LseqGeneratesNumericSeries {
+    -- lseq builds a numeric series; a direction mismatch yields the empty
+    -- list, and count/to/by spell the same forms.
+    when: Evaluates("list [lseq 3] [lseq 10 .. 1 by -2] [lseq 1 to 9 by 2] [lseq 9 to 1 by 2]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{0 1 2} {10 8 6 4 2} {1 3 5 7 9} {}"
+    -- probe: lseq91 (TIP 746: pure numeric, no expr behaviour)
+}
+
+rule LfilterCollectsFirstVariable {
+    -- lfilter collects the first loop variable of each varlist when the
+    -- body is true; break stops, continue skips.
+    when: Evaluates("list [lfilter x {1 2 3 4 5 6} {expr {$x > 2 && $x < 5}}] [lfilter x {1 2 3 4 5} {if {$x == 2} break {expr 1}}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{3 4} 1"
+    -- probe: lfilter91 (TIP 735)
+}
+
+rule LsearchStrideGroupsElements {
+    -- -stride scans fixed-size records; -index selects the comparison
+    -- column and the returned index is the record start.
+    when: Evaluates("list [lsearch -stride 3 -index 1 {a 1 x b 2 y c 3 z} 2] [lsearch -all -stride 2 -index 1 {a 10 b 20 c 30} 20]")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 2"
+    -- probe: 2026-11-27 tclsh9.1; stride 0 => "stride length must be at least 1"
 }

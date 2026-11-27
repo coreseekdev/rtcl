@@ -2,7 +2,7 @@
 -- control-flow.allium
 -- Behaviour spec: Tcl completion codes and their propagation —
 -- return / break / continue / catch / error / try, and loop results.
--- Oracle: tclsh 8.6.17.
+-- Oracle: tclsh 9.1.0 (core-9-1-0). T4 rules re-anchored 2026-11-27.
 --
 -- Numeric codes: ok=0, error=1, return=2, break=3, continue=4.
 
@@ -121,4 +121,57 @@ rule TryHandlersMatchOnCompletionCode {
     ensures: completion.code = ok
     ensures: completion.value = "boom"
     -- finally scripts always run; an unmatched completion re-propagates
+}
+
+-- ── 9.1 switch -integer / subst options / case removal (T4) ─────
+-- Probes: switchint91, substopts91; re-run on tclsh 9.1.0.
+
+rule SwitchIntegerMatchesNumericValues {
+    -- -integer compares the subject and patterns by integer value, so 05,
+    -- 0x1 and 007 match 5, 01 and 7 respectively.
+    when: Evaluates("list [switch -integer 05 {5 {set r B}}] [switch -integer 0x1 01 {string cat ok}] [switch -integer 007 {7 {set r G}}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "B ok G"
+    -- probe: switchint91
+}
+
+rule SwitchIntegerRejectsNonIntegers {
+    -- A non-integer subject is an error, not a string fallback.
+    when: Evaluates("catch {switch -integer 1.5 {1 {set E}}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "expected integer but got \"1.5\""
+    -- probe: switchint91
+}
+
+rule SwitchIntegerExcludesGlobAndNocase {
+    -- -integer conflicts with the other match modes.
+    when: Evaluates("list [catch {switch -integer -glob Foo Foo {set r OK}} m1] $m1 [catch {switch -integer -nocase Foo Foo {set r OK}} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {bad option \"-glob\": -integer option already found} 1 {-nocase option cannot be used with -integer option}"
+    -- probe: switchint91
+}
+
+rule CaseCommandRemoved {
+    -- The legacy case command is gone in 9.1 (switch covers it).
+    when: Evaluates("catch {case abc {a* {set x 1}}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "invalid command name \"case\""
+    -- probe: 2026-11-27 tclsh9.1; rtcl still exposes it (migration面)
+}
+
+rule SubstOptionsSelectFaces {
+    -- 9.1 subst grows -backslashes/-commands/-variables (and their -no*
+    -- opposites), selecting which substitution faces run.
+    when: Evaluates("set x 5; list [subst -commands {a[expr 1+1]b}] [subst -variables {a$x b}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "a2b {a5 b}"
+    -- probe: substopts91
+}
+
+rule SubstRejectsOppositeOptionMix {
+    -- Positive and negative forms of the same face cannot be combined.
+    when: Evaluates("catch {subst -backslashes -nocommands x} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "cannot combine positive and negative options"
+    -- probe: substopts91
 }

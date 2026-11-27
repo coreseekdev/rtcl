@@ -338,3 +338,30 @@ rule CommandModeExitPropagatesCode {
     -- oracle (tclsh): no output, process rc=7
     -- rtcl: "Error: exit with value: 7" on stderr, rc=1  [D-32 FIXED 2026-11-03]
 }
+
+-- ── 9.1 file path surface (T4, 2026-11-27) ───────────────────────
+
+rule FileTildeexpandExpandsHome {
+    -- file tildeexpand is the only command that expands ~; it maps ~ and
+    -- ~/x through HOME.
+    when: Evaluates("list [expr {[file home] eq $env(HOME)}] [expr {[file tildeexpand ~/x] eq \"$env(HOME)/x\"}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+    -- probe: file_attrs91 (file home / file tildeexpand)
+}
+
+rule FileNormalizeDoesNotExpandTilde {
+    -- 9.0 made ~ an ordinary path component: normalize keeps it literal.
+    when: Evaluates("expr {[file normalize ~] eq \"[pwd]/~\"}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: file_attrs91
+}
+
+rule FileTempdirIsDirectory {
+    -- file tempdir exists and names a directory (value is randomized).
+    when: Evaluates("file isdirectory [file tempdir]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: 2026-11-27 tclsh9.1
+}

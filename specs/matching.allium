@@ -296,3 +296,23 @@ rule GlobMatchesTclGlobSemantics {
     --   leading-dot matching diverge  [D-25]
     -- probe: glob -nocomplain **/*.md  — rtcl recurses; tclsh does not
 }
+
+-- ── 9.1 regsub -command (T4, 2026-11-27) ────────────────────────
+
+rule RegsubCommandEvaluatesPrefix {
+    -- -command evaluates the prefix with (whole match, captures...) per
+    -- match; its result replaces the match and & / \n lose template
+    -- meaning.
+    when: Evaluates("list [regsub -command {.x.} {abcxdef} {string length}] [regsub -all -command {(b)|(z)} {abcxdef} {list}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "ab3ef {ab b {}cxdef}"
+    -- probe: regsubcmd91 (TIP 463)
+}
+
+rule RegsubCommandEmptyPrefixErrors {
+    -- An empty command prefix is its own error.
+    when: Evaluates("catch {regsub -command {b} {abcxdef} {} v} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "command prefix must be a list of at least one element"
+    -- errorCode: TCL OPERATION REGSUB CMDEMPTY ; probe: regsubcmd91
+}

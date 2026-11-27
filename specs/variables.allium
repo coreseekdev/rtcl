@@ -400,3 +400,40 @@ rule ExprArrayIndexParseErrors {
     ensures: completion.value = "1"
     -- probe: pidx/pidx3
 }
+
+-- ── 9.1 array default / array for / const (T4, 2026-11-27) ──────
+
+rule ArrayDefaultFillsMissingElementWithoutCreatingIt {
+    -- Reading a missing element of a defaulted array returns the default,
+    -- but does not create the element or grow the array.
+    when: Evaluates("array set a {x 1}; array default set a foo; list $a(x) $a(y) [info exists a(y)] [array size a] [array default get a]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 foo 0 1 foo"
+    -- probe: arrayconst91 (TIP 508)
+}
+
+rule ArrayForIteratesKeyValuePairs {
+    -- array for binds {key value} in unspecified order; lsort makes it
+    -- observable.
+    when: Evaluates("array set f1 {b 2 a 1}; set out {}; array for {k v} f1 {lappend out $k=$v}; lsort $out")
+    ensures: completion.code = ok
+    ensures: completion.value = "a=1 b=2"
+    -- probe: arrayconst91
+}
+
+rule ConstFreezesVariable {
+    -- const assigns once and rejects later set/unset (including append/incr
+    -- which are set forms); the value remains readable.
+    when: Evaluates("const Z 5; list $Z [catch {set Z 9} m] $m [catch {unset Z} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "5 1 {can't set \"Z\": variable is a constant} 1 {can't unset \"Z\": variable is a constant}"
+    -- probe: arrayconst91 (Tcl_ConstObjCmd/VAR_CONSTANT)
+}
+
+rule InfoConstantsListsDeclared {
+    -- info consts lists constants; info constant returns the frozen value.
+    when: Evaluates("const CX 1; list [expr {[lsearch -exact [info consts] CX] >= 0}] [info constant CX]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+    -- probe: arrayconst91
+}

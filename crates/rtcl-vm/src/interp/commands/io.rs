@@ -1864,8 +1864,11 @@ pub fn cmd_format(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             match parse_tcl_int_strict($arg.as_str()) {
                 Some(v) => v,
                 None => {
-                    let msg = format!("expected integer but got \"{}\"", $arg.as_str());
-                    return fmt_err!(msg, "TCL VALUE INTEGER");
+                    // 9.1：* 宽度/精度的实参错误码同 VALUE NUMBER
+                    // （`catch {format %*d x 3}` → TCL VALUE NUMBER，
+                    // oracle 实测；format_grammarG 钉形）。
+                    let msg = crate::value::value_report("integer", $arg.as_str());
+                    return fmt_err!(msg, "TCL VALUE NUMBER");
                 }
             }
         };

@@ -909,7 +909,7 @@ fn test_format_strict_errors() {
         .unwrap();
     assert_eq!(
         r.as_str(),
-        "{expected integer but got \"x\"} {TCL VALUE INTEGER}"
+        "{expected integer but got \"x\"} {TCL VALUE NUMBER}"
     );
     // *.*: precision arg also strict
     let r = interp

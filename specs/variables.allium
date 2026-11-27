@@ -22,22 +22,21 @@ rule ProcMissingArgumentErrors {
     -- Calling a proc with fewer arguments than required (non-defaulted)
     -- parameters is a wrong-#-args error; the parameter is never
     -- silently bound to the empty string.
-    when: Evaluates("f 1    -- with proc f {a b} {...}")
+    when: Evaluates("proc f {a b} {return $b}; f 1")
     ensures: completion.code = error
     -- oracle message: wrong # args: should be "f a b"
-    -- probe: proc f {a b} {return $b}; f 1
 }
 
 rule ProcExtraArgumentErrors {
     -- Calling a proc with more arguments than parameters (and no args
     -- varargs parameter) is a wrong-#-args error.
-    when: Evaluates("f 1 2    -- with proc f {a} {...}")
+    when: Evaluates("proc f {a} {return $a}; f 1 2")
     ensures: completion.code = error
     -- oracle message: wrong # args: should be "f a"
 }
 
 rule ProcDefaultParameterFillsMissing {
-    when: Evaluates("f 1    -- with proc f {a {b 9}} {return $b}")
+    when: Evaluates("proc f {a {b 9}} {return $b}; f 1")
     ensures: completion.code = ok
     ensures: completion.value = "9"
 }
@@ -45,7 +44,7 @@ rule ProcDefaultParameterFillsMissing {
 rule ProcArgsCollectsRemainderAsList {
     -- A trailing parameter named `args` collects all remaining actual
     -- arguments as a proper list (round-trippable via llength/lindex).
-    when: Evaluates("f \"a b\" c    -- with proc f args {return [llength $args]}")
+    when: Evaluates("proc f args {return [llength $args]}; f \"a b\" c")
     ensures: completion.code = ok
     ensures: completion.value = "2"
     -- probe: proc f args {return $args}; puts [f "a}b" c] => a\}b c
@@ -55,20 +54,20 @@ rule ProcArgsCollectsRemainderAsList {
 
 rule ProcVariablesAreLocal {
     -- set inside a proc creates a local; it is invisible outside.
-    when: Evaluates("info exists x    -- after: proc f {} {set x 5}; f")
+    when: Evaluates("proc f {} {set x 5}; f; info exists x")
     ensures: completion.code = ok
     ensures: completion.value = "0"
 }
 
 rule GlobalLinksLocalToGlobal {
-    when: Evaluates("set x    -- after: set x 1; proc f {} {global x; set x 2}; f")
+    when: Evaluates("set x 1; proc f {} {global x; set x 2}; f; set x")
     ensures: completion.code = ok
     ensures: completion.value = "2"
 }
 
 rule UpvarLinksToCallerFrame {
     -- upvar 1 links a local name to a variable in the caller's frame.
-    when: Evaluates("set g    -- after: proc f {} {upvar 1 g l; set l 42}; set g 0; f")
+    when: Evaluates("set g 0; proc f {} {upvar 1 g l; set l 42}; f; set g")
     ensures: completion.code = ok
     ensures: completion.value = "42"
 }
@@ -82,7 +81,7 @@ rule UplevelBeyondStackIsError {
 }
 
 rule ArrayElementsAreVariables {
-    when: Evaluates("set a(1)    -- after: set a(1) x")
+    when: Evaluates("set a(1) x; set a(1)")
     ensures: completion.code = ok
     ensures: completion.value = "x"
 }
@@ -92,9 +91,9 @@ rule ArrayElementsAreVariables {
 rule ArrayNamesListsKeys {
     -- array names lists element names (pattern-filtered when given);
     -- a wholly missing array yields the empty list.
-    when: Evaluates("array names a    -- after: array set a {b 2 a 1}")
+    when: Evaluates("array set a {b 2 a 1}; array names a")
     ensures: completion.code = ok
-    -- oracle value: "a b" (tclsh 8.6.17 order for this shape; large
+    -- oracle value: "a b" (tclsh 9.1.0 order for this shape; large
     -- tables are hash order — consumers must not rely on ordering)
 }
 
@@ -116,7 +115,7 @@ rule UnsetElementShrinksArray {
 rule ArrayUnsetWholeRemovesVariable {
     -- `array unset a` without a pattern removes the array variable
     -- itself: info exists a => 0 afterwards.
-    when: Evaluates("info exists a    -- after: array set a {x 1}; array unset a")
+    when: Evaluates("array set a {x 1}; array unset a; info exists a")
     ensures: completion.code = ok
     ensures: completion.value = "0"
     -- rtcl: leaves the variable (info exists => 1)  [D-35]

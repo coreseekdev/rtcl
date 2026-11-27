@@ -357,3 +357,55 @@ rule InfoObjectIsaCategories {
     ensures: completion.value = "1 0 1 1"
     -- probe: oo_features91
 }
+
+rule PrivateVariableAccessAndIntrospection {
+    -- A private variable is usable by the class's methods but listed only
+    -- by info class variables -private, not in the public list.
+    when: Evaluates("oo::class create PVR {private variable pv; variable pub; method setp {} {set pv 1; set pub 2}; method getp {} {list $pv $pub}}; PVR create p; p setp; list [p getp] [info class variables PVR] [info class variables PVR -private]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{1 2} pub pv"
+    -- probe: 2026-11-27 tclsh9.1 (TIP 500)
+}
+
+rule DestructorMostSpecificUnlessNext {
+    -- Destruction runs the most specific destructor only; an explicit
+    -- next continues up the chain.
+    when: Evaluates("oo::class create DA {destructor {lappend ::d A}}; oo::class create DB {superclass DA; destructor {lappend ::d B}}; set ::d {}; DB create db; db destroy; set d1 $::d; oo::class create DC {destructor {lappend ::d2 C}}; oo::class create DD {superclass DC; destructor {lappend ::d2 D; next}}; set ::d2 {}; DD create dd; dd destroy; list $d1 $::d2")
+    ensures: completion.code = ok
+    ensures: completion.value = "B {D C}"
+    -- probe: 2026-11-27 tclsh9.1
+}
+
+rule MethodDefaultsAndArgsCollection {
+    -- Method parameters follow proc binding: defaults and a trailing args
+    -- list collect the remainder.
+    when: Evaluates("oo::class create MD {method m {a {b 5} args} {list $a $b $args}}; MD create mi; list [mi m 1] [mi m 1 2] [mi m 1 2 3 4]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{1 5 {}} {1 2 {}} {1 2 {3 4}}"
+    -- probe: 2026-11-27 tclsh9.1
+}
+
+rule InfoClassMethodtypeAndForward {
+    -- info class methodtype distinguishes method/forward; info class
+    -- forward returns the forwarded command prefix.
+    when: Evaluates("oo::class create MT {method m {} {}; forward fw ::set k}; list [info class methodtype MT m] [info class methodtype MT fw] [info class forward MT fw]")
+    ensures: completion.code = ok
+    ensures: completion.value = "method forward {::set k}"
+    -- probe: 2026-11-27 tclsh9.1
+}
+
+rule ObjectCopyAndRenameKeepIdentity {
+    -- oo::copy and rename preserve object identity and class membership.
+    when: Evaluates("oo::object create o1; oo::copy o1 o2; rename o2 o3; list [info object isa object o3] [info object class o3]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 ::oo::object"
+    -- probe: 2026-11-27 tclsh9.1
+}
+
+rule UnknownMethodMessageListsVisibleMethods {
+    -- Unknown-method errors carry the must-be list of visible methods.
+    when: Evaluates("oo::class create E {method m {} {}}; E create e; catch {e nosuch} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown method \"nosuch\": must be destroy or m"
+    -- probe: 2026-11-27 tclsh9.1
+}

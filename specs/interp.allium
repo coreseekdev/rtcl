@@ -171,3 +171,20 @@ rule AssembleReportsStackBalance {
     ensures: completion.value = "stack is unbalanced on exit from the code (depth=2)"
     -- probe: cmp_assemble
 }
+
+rule AssembleMenuIncludes9xInstructions {
+    -- The 9.1 instruction menu contains isEmpty/strge/jumpTableNum/
+    -- dictGetDef/dictPut/dictRemove/tclooId.
+    when: Evaluates("catch {tcl::unsupported::assemble {nosuchinstruction}} m; list [string match {*isEmpty*} $m] [string match {*strge*} $m] [string match {*jumpTableNum*} $m] [string match {*dictGetDef*} $m] [string match {*dictPut*} $m] [string match {*dictRemove*} $m] [string match {*tclooId*} $m]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 1 1 1 1"
+    -- probe: cmp_assemble/unsupported_assemble
+}
+
+rule AssembleStringComparisonsExecute {
+    -- strlt and isEmpty execute with normal stack semantics.
+    when: Evaluates("list [tcl::unsupported::assemble {push a; push b; strlt}] [tcl::unsupported::assemble {push {}; isEmpty}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+    -- probe: 2026-11-27 tclsh9.1
+}

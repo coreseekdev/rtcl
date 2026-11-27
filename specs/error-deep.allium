@@ -43,33 +43,27 @@ rule ErrorstackEntries {
     -- top-level probes.
     -- (2026-11-05 pinned; rtcl FIXED — err_pending_inner one-shot +
     --  call_proc error-exit CALL collection.)
-    when: Evaluates("dict get $o -errorstack    -- after: proc p1 {} {error x}; catch {p1} m o")
+    when: Evaluates("proc p1 {} {error x}; catch {p1} m o; dict get $o -errorstack")
     ensures: completion.code = ok
     ensures: completion.value = "INNER {returnImm x {}} CALL p1"
 }
 
 rule CatchNonErrorOptionsLevel {
-    -- Level bookkeeping in the options dict counts the frame the
-    -- completion crossed: a caught `return hi` is -code 0 -level 1
-    -- (the return was converted to ok at the proc boundary); caught
+    -- Top-level `return hi`: catch 2, options -code 0 -level 1. Through a
+    -- proc the return converts to ok: catch 0, options -code 0 -level 0.
     -- break/continue are -code 3/4 -level 0.
-    when: Evaluates("set o    -- after: catch {return hi} v o    -- proc call")
+    when: Evaluates("set r1 [catch {return hi} v o1]; proc f {} {return hi}; set r2 [catch {f} v o2]; list $r1 $o1 $r2 $o2 [catch {break} v o3] $o3 [catch {continue} v o4] $o4")
     ensures: completion.code = ok
-    ensures: completion.value = "-code 0 -level 1"
-    -- probe: proc f {} {return hi}; catch {f} v o; puts $o
-    -- rtcl: -code 2 -level 0  [D-3 FIXED 2026-11-03]
-    -- probe: catch {break} v o; puts $o  =>  -code 3 -level 0
-    -- rtcl: -level 1  [D-3 FIXED 2026-11-03]
+    ensures: completion.value = "2 {-code 0 -level 1} 0 {-code 0 -level 0} 3 {-code 3 -level 0} 4 {-code 4 -level 0}"
+    -- rtcl: -code 2 -level 0 / -level 1  [D-3 FIXED 2026-11-03]
 }
 
 rule CatchReturnCodeErrorViaProcIsError {
-    -- `return -code error msg` caught through a proc boundary reports
-    -- catch code 2 (a return completion) but the options dict shows the
-    -- decoded form: -code 1 -level 1 -errorcode NONE.
-    when: Evaluates("catch {f} m o    -- with proc f {} {return -code error boom}")
+    -- `return -code error boom` materialises as an error at the proc
+    -- boundary: catch returns 1 and the options dict is -code 1 -level 0.
+    when: Evaluates("proc f {} {return -code error boom}; list [catch {f} m o] $m [dict get $o -code] [dict get $o -level]")
     ensures: completion.code = ok
-    ensures: completion.value = "2"
-    -- oracle $o: -code 1 -level 1 -errorcode NONE
+    ensures: completion.value = "1 boom 1 0"
     -- rtcl: -code 2 -level 0 (undecoded)  [D-3 FIXED 2026-11-03]
 }
 
@@ -113,11 +107,10 @@ rule ReturnErrorcodeDoesNotPolluteGlobalErrorCode {
     -- return -errorcode on a NON-error completion must not write
     -- ::errorCode; the variable stays unset until a real error, so the
     -- next error's code is its own.
-    when: Evaluates("set errorCode    -- after: proc p {} {return -errorcode {A B} v}; catch p; catch {expr 1/0}")
-    ensures: completion.code = error
-    -- oracle value: ARITH DIVZERO {divide by zero}
+    when: Evaluates("proc p {} {return -errorcode {A B} v}; catch p; catch {expr 1/0}; set errorCode")
+    ensures: completion.code = ok
+    ensures: completion.value = "ARITH DIVZERO {divide by zero}"
     -- rtcl: A B (return -errorcode wrote ::errorCode even on ok)  [D-6 FIXED 2026-11-03]
-    -- probe: proc p {} {return -errorcode {A B} v}; catch p; catch {expr 1/0}; puts $errorCode
 }
 
 -- ── exit / throw ──────────────────────────────────────────────────

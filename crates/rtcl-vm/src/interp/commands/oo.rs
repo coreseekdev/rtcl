@@ -4846,7 +4846,7 @@ mod tests {
             eval("set r [list [oo::object create foo]]; foo destroy; lappend r [info commands foo]; set r"),
             "::foo {}"
         );
-        assert_eq!(eval("oo::object new"), "::oo::Obj11");
+        assert_eq!(eval("oo::object new"), "::oo::Obj15");
     }
 
     #[test]

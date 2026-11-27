@@ -2,10 +2,10 @@
 -- interp.allium
 -- Shared vocabulary for the rtcl behaviour specs.
 --
--- Scope: observable semantics of evaluating Tcl 8.6 scripts, as defined by
--- the oracle implementation (system tclsh 8.6.17). All sibling specs state
+-- Scope: observable semantics of evaluating Tcl scripts, as defined by
+-- the oracle implementation (tclsh 9.1.0). All sibling specs state
 -- claims about what an interpreter must observably do, not how rtcl is built.
--- Excludes: I/O channels, event loop, encodings, packages, Tk, performance.
+-- Excludes: I/O channels, encodings, packages, Tk, performance.
 
 entity Completion {
     -- Every evaluation of a script (or expression) ends in exactly one
@@ -29,4 +29,45 @@ surface Interpreter {
 
     provides:
         Evaluates(script)
+}
+
+given {
+    completion: Completion
+}
+
+-- ── 9.1 interpreter-level ensembles (T4, 2026-11-27) ────────────
+-- Probes: timer91, process91; re-run on tclsh 9.1.0.
+
+rule TimerInSchedulesAndCancelClears {
+    -- timer in returns an after#-shaped id that timer info reports; cancel
+    -- removes it silently (empty result).
+    when: Evaluates("set id [timer in 10 ms {set done 1}]; list [string match {after#*} $id] [expr {[lsearch -exact [timer info] $id] >= 0}] [timer cancel $id]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 {}"
+    -- probe: timer91 (timer at/idle share the after# namespace)
+}
+
+rule TimerUnitsResolveByPrefix {
+    -- Timer units are a fixed menu resolved by unique prefix; "m" is
+    -- ambiguous between ms/microseconds.
+    when: Evaluates("list [catch {timer in 1 bla s} m] $m [catch {timer in 1 m s} m2] $m2 [timer sleep for 1 micro]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {bad unit \"bla\": must be us, microseconds, milliseconds, ms, s, or seconds} 1 {ambiguous unit \"m\": must be us, microseconds, milliseconds, ms, s, or seconds} {}"
+    -- probe: timer91
+}
+
+rule ProcessAutopurgeDefaultsOnAndToggles {
+    -- tcl::process autopurge defaults to 1; setting returns the new value.
+    -- list/status are empty when no child is tracked.
+    when: Evaluates("list [tcl::process autopurge] [tcl::process autopurge false] [tcl::process autopurge] [tcl::process autopurge true] [tcl::process autopurge] [llength [tcl::process list]] [dict size [tcl::process status]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 0 1 1 0 0"
+    -- probe: process91
+}
+
+rule ProcessSubcommandMenu {
+    when: Evaluates("catch {tcl::process gorp} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown or ambiguous subcommand \"gorp\": must be autopurge, list, purge, or status"
+    -- probe: process91
 }

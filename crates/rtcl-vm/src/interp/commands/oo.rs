@@ -262,6 +262,12 @@ pub(crate) struct OoClass {
     /// TIP500 私有 `private variable` 声明（本类方法内经 `my` 可见，
     /// 不入标准 `variables` 清单——info class variables 不列）。
     pub private_variables: Vec<String>,
+    /// 9.1 `oo::abstract` 产生的类：禁止直接 create/new，子类可实例化。
+    pub abstract_class: bool,
+    /// 9.1 `oo::singleton` 产生的类：new 返回唯一实例，create 不可用。
+    pub singleton_class: bool,
+    /// singleton 类的唯一实例（首次 new 后写入）。
+    pub singleton_instance: Option<String>,
     /// TIP524 定义命名空间（`definitionnamespace ?kind? ns` 设置）：
     /// `None` = 未设置（info class definitionnamespace → {}）。锁定值
     /// （oo::object 的 instance / oo::class 的 class）与用户设置同形。
@@ -545,7 +551,7 @@ pub(crate) fn init(interp: &mut Interp) {
     // ::oo::Slot — the slot class tclsh ships as a direct subclass of
     // oo::object.  Its exported methods are the slot operations
     // (`-clear`/`-append`/`-set`, insertion order replaying to tclsh's
-    // `-clear -append -set` iteration); its instances are the seven slot
+    // `-clear -append -set` iteration); its instances are the eleven slot
     // objects below (creation order = tclsh's `info class instances
     // oo::Slot`).
     interp.oo.classes.insert(
@@ -567,12 +573,11 @@ pub(crate) fn init(interp: &mut Interp) {
     // The eleven slot objects (instances of ::oo::Slot, namespaces
     // Obj4..14 — tclsh 9.1 burns Obj1..Obj14 on object+class+Slot+11
     // slots, then Obj15..Obj19 on singleton/SingletonInstance/abstract/
-    // configuresupport::configurable/configurable (rtcl 尚未建那五个
-    // 类——编号口径残留差，见 TODO「对象编号计数口径」); rtcl burns
-    // Obj1..Obj14, so the first user object is ::oo::Obj15).  Creation
-    // order (drives `info class instances oo::Slot` — oo-34.2 的 11 元
-    // 清单含 4 个 configuresupport property slot) — their COMMAND
-    // registration notes land at the definition word positions below.
+    // configuresupport::configurable/configurable (created below); the
+    // first user object is ::oo::Obj20).  Creation order (drives
+    // `info class instances oo::Slot` — oo-34.2 的 11 元清单含 4 个
+    // configuresupport property slot) — their COMMAND registration notes
+    // land at the definition word positions below.
     let slots: [(&str, &str, &str); 11] = [
         ("::oo::define::filter", "::oo::Obj4", "filter"),
         ("::oo::define::mixin", "::oo::Obj5", "mixin"),
@@ -659,12 +664,38 @@ pub(crate) fn init(interp: &mut Interp) {
         interp.oo.slot_words.insert(key, word.to_string());
     }
 
+    // The nine 9.1 TclOO additions are created before user code:
+    // Obj15 oo::singleton, Obj16 oo::SingletonInstance, Obj17
+    // oo::abstract, Obj18 oo::configuresupport::configurable, Obj19
+    // oo::configurable.  singleton/abstract/configurable are metaclasses
+    // (superclass oo::class); SingletonInstance and
+    // configuresupport::configurable are plain classes.
+    let extra_classes: [(&str, &str, usize, &str); 5] = [
+        ("::oo::singleton", "::oo::Obj15", 15, "::oo::class"),
+        ("::oo::SingletonInstance", "::oo::Obj16", 16, "::oo::object"),
+        ("::oo::abstract", "::oo::Obj17", 17, "::oo::class"),
+        ("::oo::configuresupport::configurable", "::oo::Obj18", 18, "::oo::object"),
+        ("::oo::configurable", "::oo::Obj19", 19, "::oo::class"),
+    ];
+    for (key, ns, epoch, superclass) in extra_classes {
+        interp.oo.classes.insert(
+            key.to_string(),
+            OoClass {
+                ns: Rc::from(ns),
+                epoch,
+                superclasses: vec![superclass.to_string()],
+                ..Default::default()
+            },
+        );
+        interp.oo.creation_order.push(key.to_string());
+        register_object_command(interp, key, cmd_oo_object);
+    }
+
     // tclsh 9.1 的 ObjN 计数器在用户代码前已消耗到 19（object/class/
     // Slot=Obj1..3、11 个 slot=Obj4..14、singleton 系 5 个=Obj15..19；
-    // 可观察的核心名仍是 oo::object=Obj1 / oo::class=Obj2）。rtcl 未建
-    // singleton 系（编号口径残留差），只消耗到 Obj14——首个用户对象是
-    // ::oo::Obj15（实测 tclsh 9.1.0 是 ::oo::Obj20，残留差）。
-    interp.oo.next_obj_id = 14;
+    // 可观察的核心名仍是 oo::object=Obj1 / oo::class=Obj2）。首个用户
+    // 对象是 ::oo::Obj20（tclsh 9.1.0 实测）。
+    interp.oo.next_obj_id = 19;
 }
 
 /// Register one definition word as a native command under `ns`.
@@ -2211,6 +2242,18 @@ fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) 
     // 含自身，天然为真）。
     let is_meta = class_key == "::oo::class"
         || chain_contains(interp, class_key, "::oo::class");
+    if let Some(c) = interp.oo.classes.get(class_key) {
+        if c.abstract_class {
+            return Err(Error::Msg(
+                "unknown method \"create\": must be destroy".to_string(),
+            ));
+        }
+        if c.singleton_class {
+            return Err(Error::Msg(
+                "unknown method \"create\": must be destroy or new".to_string(),
+            ));
+        }
+    }
     if rest.is_empty() {
         let usage = if is_meta {
             "create objectName ?definitionScript?"
@@ -2239,6 +2282,8 @@ fn oo_create(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) 
                 ns: Rc::clone(&ns),
                 epoch,
                 superclasses: vec!["::oo::object".to_string()],
+                abstract_class: class_key == "::oo::abstract",
+                singleton_class: class_key == "::oo::singleton",
                 ..Default::default()
             },
         );
@@ -2321,6 +2366,19 @@ fn oo_new(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) -> 
             "unknown method \"new\": must be create or destroy".to_string(),
         ));
     }
+    // 9.1 abstract/singleton class semantics.
+    let (is_abstract, is_singleton, existing) = match interp.oo.classes.get(class_key) {
+        Some(c) => (c.abstract_class, c.singleton_class, c.singleton_instance.clone()),
+        None => (false, false, None),
+    };
+    if is_abstract {
+        return Err(Error::Msg(
+            "unknown method \"new\": must be destroy".to_string(),
+        ));
+    }
+    if let Some(inst) = existing {
+        return Ok(Value::from_str(&inst));
+    }
     let name = next_ns(interp);
     let epoch = interp.oo.next_obj_id;
     let ns: Rc<str> = Rc::from(name.as_str());
@@ -2363,6 +2421,11 @@ fn oo_new(interp: &mut Interp, class_key: &str, rest: &[Value], typed: &str) -> 
         if let Err(e) = r {
             detach_object(interp, &name, &ns, false);
             return Err(e);
+        }
+    }
+    if is_singleton {
+        if let Some(c) = interp.oo.classes.get_mut(class_key) {
+            c.singleton_instance = Some(name.clone());
         }
     }
     Ok(Value::from_str(&name))
@@ -4846,7 +4909,7 @@ mod tests {
             eval("set r [list [oo::object create foo]]; foo destroy; lappend r [info commands foo]; set r"),
             "::foo {}"
         );
-        assert_eq!(eval("oo::object new"), "::oo::Obj15");
+        assert_eq!(eval("oo::object new"), "::oo::Obj20");
     }
 
     #[test]

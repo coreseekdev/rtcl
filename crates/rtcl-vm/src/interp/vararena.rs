@@ -36,6 +36,8 @@ use std::rc::Rc;
 #[cfg(feature = "embedded")]
 use alloc::boxed::Box;
 #[cfg(feature = "embedded")]
+use alloc::collections::BTreeSet as HistSet;
+#[cfg(feature = "embedded")]
 use alloc::rc::Rc;
 #[cfg(feature = "embedded")]
 use alloc::vec;
@@ -43,6 +45,8 @@ use alloc::vec;
 use alloc::string::String;
 #[cfg(feature = "embedded")]
 use alloc::vec::Vec;
+#[cfg(not(feature = "embedded"))]
+use std::collections::HashSet as HistSet;
 #[cfg(not(feature = "embedded"))]
 use std::string::String;
 #[cfg(not(feature = "embedded"))]
@@ -495,30 +499,84 @@ impl VarTable {
     // 表后，宿主覆盖只发生在数组基键的空值落地，接管即保真）；非
     // ARRAY 条目子表归 None（回收）。
 
-    /// 槽内 Var 的子表/ARRAY 位同步（写槽后调用）。
+    /// 槽内 Var 的子表/ARRAY 位同步（写槽后调用）。宿主句柄只在补建
+    /// 臂构造（元素/标量写热径零分配——TableId::Array 的 Box 克隆不
+    /// 落在每次写上）。
     fn sync_elements(&mut self, sidx: u32) {
-        let host = self.ref_of(sidx);
-        let var = self.slots[sidx as usize].var.as_mut().expect("live slot");
-        if var.is_array() {
-            if var.elements.is_none() {
-                var.elements = Some(Box::new(VarTable::new_array(host)));
-            }
-        } else {
-            var.elements = None;
+        let is_array = self.slots[sidx as usize]
+            .var
+            .as_ref()
+            .expect("live slot")
+            .is_array();
+        if !is_array {
+            self.slots[sidx as usize].var.as_mut().expect("live slot").elements = None;
+            return;
         }
+        let has_sub = self.slots[sidx as usize]
+            .var
+            .as_ref()
+            .expect("live slot")
+            .elements
+            .is_some();
+        if !has_sub {
+            let host = self.ref_of(sidx);
+            let var = self.slots[sidx as usize].var.as_mut().expect("live slot");
+            var.elements = Some(Box::new(VarTable::new_array(host)));
+        }
+    }
+
+    /// 元素条目落地（子表咽喉——元素写位点共用）：`&str` 下标直落
+    /// （键 Rc 只在新键臂分配——覆盖写零分配），新键入档 history
+    /// （推槽键 Rc 的引计克隆——零新增分配）并按触发形压缩。返回是
+    /// 否新建。
+    pub(crate) fn land_element(&mut self, index: &str, v: Value) -> bool {
+        if let Some(sidx) = self.land_value_str(index, v) {
+            // history 推槽键 Rc 的引计克隆（零新增分配——键已在槽上）。
+            if let Some(k) = self.slots[sidx as usize].key.clone() {
+                self.history.push(k);
+            }
+            if self.history.len() > 2 * self.live + 64 {
+                // 活性集先行（不可变阶段——history 的借用随块收口），
+                // retain 前放借用。
+                let keep: Vec<bool> = {
+                    let mut seen: HistSet<&str> = HistSet::new();
+                    let mut keep = vec![false; self.history.len()];
+                    for (i, k) in self.history.iter().enumerate().rev() {
+                        if self.contains(k) && seen.insert(k.as_ref()) {
+                            keep[i] = true;
+                        }
+                    }
+                    keep
+                };
+                let mut i = 0;
+                self.history.retain(|_| {
+                    let k = keep[i];
+                    i += 1;
+                    k
+                });
+            }
+            return true;
+        }
+        false
     }
 
     /// 元素键入档（元素表专属；新键才推——调用方在元素新建位点调
     /// 用），超限压缩（活性过滤 + 末次出现保留——共享日志压缩同形，
     /// 桶轨迹统计面的边界行为与旧日志重放一致）。
+    #[allow(dead_code)] // land_element 内联了入档；独立形留给测试
     pub(crate) fn history_push(&mut self, index: &str) {
         self.history.push(Rc::from(index));
+        self.history_compact();
+    }
+
+    /// history 压缩（活性过滤 + 末次出现保留——触发形 `len > 2*live
+    /// + 64`；桶轨迹统计面的边界行为与旧日志重放一致）。
+    fn history_compact(&mut self) {
         if self.history.len() > 2 * self.live + 64 {
             // 活性集先行（不可变阶段——history 的借用随块收口），
             // retain 前放借用。
             let keep: Vec<bool> = {
-                let mut seen: std::collections::HashSet<&str> =
-                    std::collections::HashSet::with_capacity(self.history.len());
+                let mut seen: HistSet<&str> = HistSet::new();
                 let mut keep = vec![false; self.history.len()];
                 for (i, k) in self.history.iter().enumerate().rev() {
                     if self.contains(k) && seen.insert(k.as_ref()) {
@@ -805,6 +863,74 @@ impl VarTable {
             } else {
                 let r = self.insert_moving(Rc::from(key.as_str()), var);
                 (r, true)
+            }
+        }
+    }
+
+    /// [`Self::land_value`] 的 `&str` 形（元素写热径）：键 Rc 只在新
+    /// 键臂分配——覆盖写零分配（与 String 形同序位语义）。返回
+    /// `Some(槽号)` = 新建（新键/占位上值的移位新建），`None` = 有值
+    /// 覆盖。embedded 后备退 get+insert 双探测。
+    pub(crate) fn land_value_str(&mut self, key: &str, v: Value) -> Option<u32> {
+        #[cfg(not(feature = "embedded"))]
+        {
+            let bidx = bucket_of(key, self.buckets.len());
+            let mut idx = self.buckets[bidx];
+            while idx != NO_SLOT {
+                if self.slots[idx as usize].key.as_deref() == Some(key) {
+                    let sidx = idx;
+                    let (was_valued, flags, elem_count) = {
+                        let var = self.slots[sidx as usize].var.as_ref().expect("live slot");
+                        (var.has_value(), var.flags, var.elem_count)
+                    };
+                    let mut var = Var::with_value(v);
+                    var.flags = flags;
+                    var.elem_count = elem_count;
+                    let old_elements = self.slots[sidx as usize]
+                        .var
+                        .as_mut()
+                        .expect("live slot")
+                        .elements
+                        .take();
+                    if var.elements.is_none() {
+                        var.elements = old_elements;
+                    }
+                    if was_valued {
+                        self.slots[sidx as usize].var = Some(var);
+                        self.sync_elements(sidx);
+                        return None;
+                    }
+                    let old_pos = self.slots[sidx as usize].order_pos as usize;
+                    self.order[old_pos] = NO_SLOT;
+                    self.slots[sidx as usize].var = Some(var);
+                    self.sync_elements(sidx);
+                    self.order.push(sidx);
+                    self.slots[sidx as usize].order_pos = (self.order.len() - 1) as u32;
+                    self.maybe_compact_order();
+                    return Some(sidx);
+                }
+                idx = self.slots[idx as usize].next;
+            }
+            let sidx = self.alloc_slot(Rc::from(key), bidx);
+            self.slots[sidx as usize].var = Some(Var::with_value(v));
+            self.sync_elements(sidx);
+            self.order.push(sidx);
+            self.slots[sidx as usize].order_pos = (self.order.len() - 1) as u32;
+            self.live += 1;
+            self.maybe_grow_buckets();
+            self.maybe_compact_order();
+            Some(sidx)
+        }
+        #[cfg(feature = "embedded")]
+        {
+            let existing = self.get(key);
+            let was_valued = existing.is_some_and(|x| x.has_value());
+            if was_valued {
+                self.insert(Rc::from(key), Var::with_value(v));
+                None
+            } else {
+                let r = self.insert_moving(Rc::from(key), Var::with_value(v));
+                Some(r.slot)
             }
         }
     }
@@ -1140,6 +1266,13 @@ impl VarArena {
     #[inline]
     pub(crate) fn root(&self) -> &VarTable {
         &self.tables[0]
+    }
+
+    /// 按下标取命名空间表（步骤 3：搜索/戳条目的宿主名反查——目前
+    /// 只有 0 号根表，每命名空间一张的拆分随后续步骤接入）。
+    #[inline]
+    pub(crate) fn table(&self, i: u32) -> Option<&VarTable> {
+        self.tables.get(i as usize)
     }
 
     #[inline]

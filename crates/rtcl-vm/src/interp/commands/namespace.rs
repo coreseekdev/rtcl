@@ -613,13 +613,42 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             interp.var_nuke_pending.remove(&base);
         }
         // Trace registrations and searches living under the tree die with
-        // it.
+        // it.  D1 步骤 3：搜索/戳键 = 宿主 VarRef——宿主名经表反查
+        // （key_of；全局宿主），宿主已亡的条目一并清（死数组的搜索/
+        // 戳不可达——垃圾；可达面与旧 G: 前缀扫描同域）。
         let stamp_prefix = format!("G:{}", var_prefix);
         interp.var_traces.retain(|k, _| !k.starts_with(&stamp_prefix));
         interp.elem_traces.retain(|k, _| !k.starts_with(&stamp_prefix));
         interp.trace_phantoms.retain(|k, _| !k.starts_with(&stamp_prefix));
-        interp.array_searches.retain(|k, _| !k.starts_with(&stamp_prefix));
-        interp.array_stamps.retain(|k, _| !k.starts_with(&stamp_prefix));
+        let doomed: Vec<crate::interp::vararena::VarRef> = interp
+            .array_searches
+            .keys()
+            .chain(interp.array_stamps.keys())
+            .filter(|k| {
+                let crate::interp::vararena::TableId::Array(h) = &k.table else {
+                    return true;
+                };
+                match &h.table {
+                    // 帧宿主不归 ns 树清扫（旧 G: 前缀扫描同样不匹配帧
+                    // 键——随帧出清）。
+                    crate::interp::vararena::TableId::Frame(_) => false,
+                    crate::interp::vararena::TableId::Global(_) => {
+                        match interp.array_search_host_name(k) {
+                            Some(name) => name.starts_with(&var_prefix),
+                            // 宿主已亡（代数不符）→ 弃（死数组的搜索/
+                            // 戳不可达）。
+                            None => true,
+                        }
+                    }
+                    _ => true,
+                }
+            })
+            .cloned()
+            .collect();
+        for k in doomed {
+            interp.array_searches.remove(&k);
+            interp.array_stamps.remove(&k);
+        }
 
         // ── Command delete traces ──
         // When the deletion was initiated from OUTSIDE the tree the

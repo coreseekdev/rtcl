@@ -5,7 +5,7 @@
 //! locals (or follow upvar links to globals / other frames).
 
 use super::util::{has_ns_sep, is_array_element_name, split_array_ref};
-use super::vararena::{Var, VarFlags};
+use super::vararena::{TableId, Var, VarFlags, VarRef};
 use super::{tclhash, CallFrame, Interp, Rc, UpvarLink};
 use crate::error::{Error, ErrorCode, Result};
 use crate::value::Value;
@@ -28,9 +28,27 @@ impl Interp {
 
     /// 单键三位对拍（debug）：arena 与镜像的 value/phantom/array 位。
     /// release 零成本（对拍域整体退场——cfg! 常量折叠掉镜像读）。
+    /// D1 步骤 3：元素形键的对拍走宿主子表（value 位）——镜像平表
+    /// 在 debug 仍收元素键（对拍域），phantom/array 位对元素键无义。
     #[inline]
     fn dcheck_global_mirror(&self, key: &str) {
         if !cfg!(debug_assertions) {
+            return;
+        }
+        if let Some((base, index)) = split_array_ref(key) {
+            let m = self
+                .var_arena
+                .root()
+                .get(base)
+                .filter(|v| v.is_array())
+                .and_then(|v| v.elements())
+                .and_then(|t| t.get(index))
+                .is_some_and(|v| v.has_value());
+            debug_assert_eq!(
+                m,
+                self.globals.contains_key(key),
+                "D1 对拍: elem value presence {key:?}"
+            );
             return;
         }
         let m = self.var_arena.root().get(key);
@@ -54,8 +72,28 @@ impl Interp {
     // ── 读（arena 权威）───────────────────────────────────────────
 
     /// 全局标量读值（无值条目/缺席 → None——phantom 语义：读 miss）。
+    /// D1 步骤 3：元素形键（`base(index)`）路由到宿主 Var 的子表——
+    /// 平键域不再持有元素键；debug 对拍同走镜像平键（镜像仍收元素
+    /// 键——迁移期对拍域）。
     #[inline]
     pub(crate) fn global_get(&self, key: &str) -> Option<&Value> {
+        if let Some((base, index)) = super::util::split_array_ref(key) {
+            let v = self
+                .var_arena
+                .root()
+                .get(base)
+                .filter(|v| v.is_array())
+                .and_then(|v| v.elements())
+                .and_then(|t| t.get(index))
+                .filter(|v| v.has_value())
+                .map(|v| &v.value);
+            debug_assert_eq!(
+                v.is_some(),
+                self.globals.contains_key(key),
+                "D1 对拍: read {key:?}"
+            );
+            return v;
+        }
         let v = self
             .var_arena
             .root()
@@ -70,14 +108,23 @@ impl Interp {
         v
     }
 
-    /// 全局有值条目判定（⟺ 镜像 globals 含键）。
+    /// 全局有值条目判定（⟺ 镜像 globals 含键）。元素形键经子表。
     #[inline]
     pub(crate) fn global_has(&self, key: &str) -> bool {
-        let has = self
-            .var_arena
-            .root()
-            .get(key)
-            .is_some_and(|v| v.has_value());
+        let has = if let Some((base, index)) = super::util::split_array_ref(key) {
+            self.var_arena
+                .root()
+                .get(base)
+                .filter(|v| v.is_array())
+                .and_then(|v| v.elements())
+                .and_then(|t| t.get(index))
+                .is_some_and(|v| v.has_value())
+        } else {
+            self.var_arena
+                .root()
+                .get(key)
+                .is_some_and(|v| v.has_value())
+        };
         debug_assert_eq!(has, self.globals.contains_key(key), "D1 对拍: has {key:?}");
         has
     }
@@ -155,6 +202,11 @@ impl Interp {
     /// = 双域（array statistics 的历史面是 release 特性，活性过滤走
     /// arena——语义与「globals 含键」逐字同：日志键恒有值条目）。
     pub(crate) fn global_insert(&mut self, key: String, v: Value) -> bool {
+        // D1 步骤 3：元素形键 → 宿主 Var 子表（计数/历史/镜像/日志在
+        // global_elem_insert 内）。
+        if let Some((base, index)) = split_array_ref(&key) {
+            return self.global_elem_insert(base, &index, v);
+        }
         // 序位语义（land_value 单探测）：有值条目覆盖 = 原位（镜像
         // re-set 不进日志）；无值占位（phantom/启动标记）上值 = 新建
         // 序位（镜像 map-insert-new 必进日志——与平表重放逐字同）。
@@ -169,7 +221,12 @@ impl Interp {
             self.var_order.push(key.clone());
         }
         // A log grown far past the table (variables made and unset in a
-        // loop) is brought back to the live entries.
+        // loop) is brought back to the live entries.  D1 步骤 3：release
+        // 日志只收宿主键（元素键离场）——触发/活性按 arena；debug 日志
+        // 另收元素键（对拍域）——按镜像长度计、活性走镜像（两域压缩
+        // 后的宿主键序列逐字同：镜像在席 ⟺ arena 有值，元素键活性 ⟺
+        // 子表在席）。
+        #[cfg(not(debug_assertions))]
         if self.var_order.len() > 2 * self.var_arena.root().len() + 64 {
             let live = |k: &str| {
                 self.var_arena
@@ -179,6 +236,11 @@ impl Interp {
             };
             compact_order(&mut self.var_order, &live);
         }
+        #[cfg(debug_assertions)]
+        if self.var_order.len() > 2 * self.globals.len() + 64 {
+            let live = |k: &str| self.globals.contains_key(k);
+            compact_order(&mut self.var_order, &live);
+        }
         self.dcheck_global_mirror(&key);
         arena_new
     }
@@ -186,10 +248,52 @@ impl Interp {
     /// Remove from the global var table (log entry becomes stale; the
     /// iteration walk filters by table liveness and dedups to the last
     /// occurrence).  D1 步骤 1：双删（arena 只摘有值条目——占位条目归
-    /// [`Self::global_forget_phantom`]）。
+    /// [`Self::global_forget_phantom`]）。D1 步骤 3：元素形键经子表摘
+    /// 除（计数 −1，镜像平键双删 debug）。
     pub(crate) fn global_remove(&mut self, key: &str) -> Option<Value> {
+        if let Some((base, index)) = split_array_ref(key) {
+            let removed = self
+                .var_arena
+                .root_mut()
+                .get_mut(base)
+                .filter(|v| v.is_array())
+                .and_then(|var| {
+                    var.elements
+                        .as_deref_mut()
+                        .and_then(|t| t.remove(index))
+                        .map(|x| x.value)
+                });
+            if removed.is_some() {
+                self.global_elem_bump(base, -1);
+            }
+            #[cfg(debug_assertions)]
+            {
+                let from_map = self.globals.remove(key);
+                debug_assert_eq!(
+                    removed.is_some(),
+                    from_map.is_some(),
+                    "D1 对拍: remove {key:?}"
+                );
+                self.dcheck_global_mirror(key);
+            }
+            return removed;
+        }
         // 单探测：arena 有值才摘（remove_value）。镜像双删 = debug
-        // （对拍域；release 零成本）。
+        // （对拍域；release 零成本）。D1 步骤 3：宿主摘除（未经撤位
+        // 的路径）时子表随之回收——镜像元素键同步清账（debug 对拍域）。
+        #[cfg(debug_assertions)]
+        if self.var_arena.root().get(key).is_some_and(|v| v.is_array()) {
+            let idxs: Vec<String> = self
+                .var_arena
+                .root()
+                .get(key)
+                .and_then(|v| v.elements())
+                .map(|t| t.order_entries().map(|(k, _)| k.as_ref().to_string()).collect())
+                .unwrap_or_default();
+            for i in idxs {
+                self.globals.remove(&format!("{key}({i})"));
+            }
+        }
         let from_arena = self.var_arena.root_mut().remove_value(key);
         #[cfg(debug_assertions)]
         {
@@ -205,9 +309,34 @@ impl Interp {
     }
 
     /// 原地覆盖（存在有值条目才写；`set_var`/`store_var` 的链接写与
-    /// 覆写快径共用）。arena 权威 + 镜像重放。
+    /// 覆写快径共用）。arena 权威 + 镜像重放。D1 步骤 3：元素形键经
+    /// 子表格覆盖。
     /// Returns whether the write landed.
     pub(crate) fn global_overwrite(&mut self, key: &str, value: &Value) -> bool {
+        if let Some((base, index)) = split_array_ref(key) {
+            let landed = self
+                .var_arena
+                .root_mut()
+                .get_mut(base)
+                .filter(|v| v.is_array())
+                .and_then(|var| var.elements.as_deref_mut())
+                .and_then(|t| t.get_mut(index))
+                .filter(|v| v.has_value())
+                .map(|v| v.value = value.clone())
+                .is_some();
+            debug_assert_eq!(
+                landed,
+                self.globals.contains_key(key),
+                "D1 对拍: overwrite {key:?}"
+            );
+            #[cfg(debug_assertions)]
+            if landed {
+                if let Some(cell) = self.globals.get_mut(key) {
+                    *cell = value.clone();
+                }
+            }
+            return landed;
+        }
         let landed = match self.var_arena.root_mut().get_mut(key) {
             Some(var) if var.has_value() => {
                 var.value = value.clone();
@@ -234,12 +363,41 @@ impl Interp {
     /// 全局标量格的原地值变更（`incr`/`lappend`/`append`/`dict set` 的
     /// arena 权威格路径）。`f` 先施加于 arena 格，再**重放**于平表镜像
     /// 格（迁移期双写的实现方式——`f` 必须可重放：对被捕获状态纯函数、
-    /// 对格内容确定性）。
+    /// 对格内容确定性）。D1 步骤 3：元素形键经子表格。
     pub(crate) fn global_cell<R>(
         &mut self,
         key: &str,
         mut f: impl FnMut(&mut Value) -> R,
     ) -> Option<R> {
+        if let Some((base, index)) = split_array_ref(key) {
+            let has = self
+                .var_arena
+                .root()
+                .get(base)
+                .filter(|v| v.is_array())
+                .and_then(|v| v.elements())
+                .and_then(|t| t.get(index))
+                .is_some_and(|v| v.has_value());
+            debug_assert_eq!(has, self.globals.contains_key(key), "D1 对拍: cell {key:?}");
+            if !has {
+                return None;
+            }
+            let r = {
+                let var = self.var_arena.root_mut().get_mut(base).expect("checked");
+                let cell = var
+                    .elements
+                    .as_deref_mut()
+                    .expect("array subtable")
+                    .get_mut(index)
+                    .expect("checked");
+                f(&mut cell.value)
+            };
+            #[cfg(debug_assertions)]
+            if let Some(cell) = self.globals.get_mut(key) {
+                let _ = f(cell);
+            }
+            return Some(r);
+        }
         let has = self
             .var_arena
             .root()
@@ -304,7 +462,8 @@ impl Interp {
     /// 与启动种子；`None` 只落位——oo clone / auto_index 的 flag-only
     /// 面，与旧「只插 array_globals 不落计数」逐字同）。无条目时先建
     /// 无值 Var（启动窗口：标记先于基键落表——`init_special_vars` 的
-    /// 插入序红线不得重排）。
+    /// 插入序红线不得重排）。D1 步骤 3：标记即建元素子表（ARRAY ⟺
+    /// 子表 Some——VarTable 写槽路径统一同步）。
     pub(crate) fn global_mark_array(&mut self, key: &str, count: Option<u32>) {
         self.var_arena.root_mut().mark_array(key, count);
         if key != "env" && key != "tcl_platform" {
@@ -320,9 +479,81 @@ impl Interp {
         }
     }
 
-    /// 数组基摘标（整数组 unset / purge 面；元素计数随标同清；
-    /// `arrays_env_only` 按镜像集重算——与旧全等式逐字同）。
+    // ── 元素子表读写（D1 步骤 3：全局域）────────────────────────
+    //
+    // 元素形键（`base(index)`）的平键咽喉分派：权威 = 宿主 Var 的子
+    // 表（TableId::Array(host) 寻址）；计数挂宿主 Var.elem_count（镜
+    // 像 elem_counts 对拍）；镜像平表 + 共享日志收元素键 = debug 对拍
+    // 域（release 平键域不再持有元素键、日志不收——日志压缩触发形随
+    // 之按镜像长度计）。宿主必须已是数组（set_var/link 安装路径先
+    // mark——debug 断言守审计）。
+
+    /// 数组元素写入（全局域咽喉）：子表插入/覆盖（land_element——
+    /// 覆盖写零分配、新键 history 零新增分配），新建时计数 +1（宿主
+    /// Var 直加——免二次探测；镜像补建同步）、镜像平键 + 共享日志
+    /// （debug 对拍域）。返回是否新建。
+    fn global_elem_insert(&mut self, base: &str, index: &str, v: Value) -> bool {
+        #[cfg(debug_assertions)]
+        let mirror_v = v.clone();
+        let new = {
+            let var = self
+                .var_arena
+                .root_mut()
+                .get_mut(base)
+                .expect("array host entry");
+            debug_assert!(
+                var.is_array(),
+                "D1 步骤 3: element insert into non-array host {base:?}"
+            );
+            let new = var
+                .elements
+                .as_deref_mut()
+                .expect("array subtable")
+                .land_element(index, v);
+            if new {
+                var.elem_count += 1;
+            }
+            new
+        };
+        if new {
+            #[cfg(debug_assertions)]
+            {
+                let c = self.elem_counts.entry(base.to_string()).or_insert(0);
+                *c += 1;
+                self.globals.insert(format!("{base}({index})"), mirror_v);
+                self.var_order.push(format!("{base}({index})"));
+                // 元素键使日志长于宿主表——压缩按镜像长度计（镜像 =
+                // 宿主表 + 元素键，debug 域），活性过滤走镜像（元素
+                // 键活性 ⟺ 镜像在席）。
+                if self.var_order.len() > 2 * self.globals.len() + 64 {
+                    let live = |k: &str| self.globals.contains_key(k);
+                    compact_order(&mut self.var_order, &live);
+                }
+            }
+        }
+        new
+    }
+
+    /// 数组基摘标（整数组 unset / purge 面；元素计数随标同清；子表
+    /// 随位撤销整表回收；`arrays_env_only` 按镜像集重算——与旧全等式
+    /// 逐字同）。
     pub(crate) fn global_unmark_array(&mut self, key: &str) {
+        // D1 步骤 3：镜像元素键清账（debug 对拍域）——子表随 ARRAY 位
+        // 撤销回收，镜像平键同步清（重建后同名元素的读取对拍不得撞
+        // 残留键）。须在撤位前枚举（子表随位消亡）。
+        #[cfg(debug_assertions)]
+        {
+            let idxs: Vec<String> = self
+                .var_arena
+                .root()
+                .get(key)
+                .and_then(|v| v.elements())
+                .map(|t| t.order_entries().map(|(k, _)| k.as_ref().to_string()).collect())
+                .unwrap_or_default();
+            for i in idxs {
+                self.globals.remove(&format!("{key}({i})"));
+            }
+        }
         self.var_arena.root_mut().unmark_array(key);
         // arrays_env_only 重算：经 arena 的数组基快索引（release 镜像
         // 退场后它就是唯一真源；debug 下对拍位同步验证）。与旧全等式
@@ -344,13 +575,16 @@ impl Interp {
         }
     }
 
-    /// 全局数组存活元素计数增减（元素写/删位点；镜像同步）。
+    /// 全局数组存活元素计数增减（元素写/删位点；镜像同步）。D1 步骤
+    /// 3：镜像条目缺席时补建（flag-only 标记面——oo copy / auto_index
+    /// ——的镜像账随 bump 补齐，镜像 ⟺ arena 计数恒等）。
     pub(crate) fn global_elem_bump(&mut self, key: &str, delta: i64) {
         if let Some(var) = self.var_arena.root_mut().array_var_mut(key) {
             var.elem_count = ((var.elem_count as i64) + delta).max(0) as u32;
         }
         #[cfg(debug_assertions)]
-        if let Some(c) = self.elem_counts.get_mut(key) {
+        {
+            let c = self.elem_counts.entry(key.to_string()).or_insert(0);
             *c = ((*c as i64) + delta).max(0) as usize;
         }
     }
@@ -404,10 +638,26 @@ impl Interp {
 /// 单键两位对拍（debug）：vt 与平表镜像的 value 在席/数组基位。帧
 /// 元素计数（步骤 3 并入 vt 的 Var.elem_count——镜像 f.elem_counts 对
 /// 拍：ARRAY 位在席时计数逐字同）release 零成本（cfg! 常量折叠掉镜
-/// 像读）。
+/// 像读）。D1 步骤 3：元素形键的对拍走宿主子表（value 位）——镜像
+/// 平表在 debug 仍收元素键。
 #[inline]
 fn dcheck_frame_mirror(f: &CallFrame, key: &str) {
     if !cfg!(debug_assertions) {
+        return;
+    }
+    if let Some((base, index)) = split_array_ref(key) {
+        let m = f
+            .vt
+            .get(base)
+            .filter(|v| v.is_array())
+            .and_then(|v| v.elements())
+            .and_then(|t| t.get(index))
+            .is_some_and(|v| v.has_value());
+        debug_assert_eq!(
+            m,
+            f.locals.contains_key(key),
+            "D1 对拍: frame elem value {key:?}"
+        );
         return;
     }
     let m = f.vt.get(key);
@@ -431,9 +681,26 @@ fn dcheck_frame_mirror(f: &CallFrame, key: &str) {
 
 /// Frame-table read: the value of `key` (absent/valueless → None —
 /// phantom semantics, mirroring the old flat-map probe).  D1 步骤 2：
-/// vt 权威 + debug 双读对拍。
+/// vt 权威 + debug 双读对拍。D1 步骤 3：元素形键（`base(index)`）经
+/// 宿主 Var 的子表。
 #[inline]
 pub(crate) fn frame_local_get<'a>(f: &'a CallFrame, key: &str) -> Option<&'a Value> {
+    if let Some((base, index)) = split_array_ref(key) {
+        let v = f
+            .vt
+            .get(base)
+            .filter(|v| v.is_array())
+            .and_then(|v| v.elements())
+            .and_then(|t| t.get(index))
+            .filter(|v| v.has_value())
+            .map(|v| &v.value);
+        debug_assert_eq!(
+            v.is_some(),
+            f.locals.contains_key(key),
+            "D1 对拍: frame read {key:?}"
+        );
+        return v;
+    }
     let v = f
         .vt
         .get(key)
@@ -449,12 +716,28 @@ pub(crate) fn frame_local_get<'a>(f: &'a CallFrame, key: &str) -> Option<&'a Val
 
 /// Frame-table write cell: `key`'s value for in-place mutation (the
 /// caller replays the closure onto the debug mirror — same contract as
-/// the global-side `global_cell`).
+/// the global-side `global_cell`).  D1 步骤 3：元素形键经子表格。
 #[inline]
 pub(crate) fn frame_local_get_mut<'a>(
     f: &'a mut CallFrame,
     key: &str,
 ) -> Option<&'a mut Value> {
+    if let Some((base, index)) = split_array_ref(key) {
+        let v = f
+            .vt
+            .get_mut(base)
+            .filter(|v| v.is_array())
+            .and_then(|v| v.elements.as_deref_mut())
+            .and_then(|t| t.get_mut(index))
+            .filter(|v| v.has_value())
+            .map(|v| &mut v.value);
+        debug_assert_eq!(
+            v.is_some(),
+            f.locals.contains_key(key),
+            "D1 对拍: frame cell {key:?}"
+        );
+        return v;
+    }
     let v = f
         .vt
         .get_mut(key)
@@ -468,12 +751,93 @@ pub(crate) fn frame_local_get_mut<'a>(
     v
 }
 
+/// Frame-table element remove (D1 步骤 3 帧域咽喉——子表摘除；计数
+/// −1 与镜像清账归调用方 [`Interp::loc_elem_remove`]，此形供平键咽
+/// 喉 [`frame_local_remove`] 复用——计数亦在其内结清)。
+fn frame_elem_remove(f: &mut CallFrame, base: &str, index: &str) -> bool {
+    let removed = f
+        .vt
+        .get_mut(base)
+        .filter(|v| v.is_array())
+        .and_then(|var| {
+            var.elements
+                .as_deref_mut()
+                .and_then(|t| t.remove(index))
+                .map(|x| x.value)
+        })
+        .is_some();
+    #[cfg(debug_assertions)]
+    if removed {
+        let flat = format!("{base}({index})");
+        f.locals.remove(&flat);
+    }
+    removed
+}
+
 /// Frame-table presence (⟺ 镜像 locals 含键——「有值条目在表」）。
+/// D1 步骤 3：元素形键经子表。
 #[inline]
 pub(crate) fn frame_local_contains(f: &CallFrame, key: &str) -> bool {
+    if let Some((base, index)) = split_array_ref(key) {
+        let has = f
+            .vt
+            .get(base)
+            .filter(|v| v.is_array())
+            .and_then(|v| v.elements())
+            .and_then(|t| t.get(index))
+            .is_some_and(|v| v.has_value());
+        debug_assert_eq!(
+            has,
+            f.locals.contains_key(key),
+            "D1 对拍: frame has {key:?}"
+        );
+        return has;
+    }
     let has = f.vt.get(key).is_some_and(|v| v.has_value());
     debug_assert_eq!(has, f.locals.contains_key(key), "D1 对拍: frame has {key:?}");
     has
+}
+
+/// Frame-table element write (D1 步骤 3 帧域咽喉)：子表插入/覆盖，新
+/// 建时计数 +1、历史入档、镜像平键 + 共享日志（debug）。返回是否新
+/// 建。宿主必须已是数组（set_var/link 安装路径先 mark——debug 断言
+/// 守审计）。
+fn frame_elem_insert(f: &mut CallFrame, base: &str, index: &str, v: Value) -> bool {
+    #[cfg(debug_assertions)]
+    let mirror_v = v.clone();
+    let new = {
+        let var = f.vt.get_mut(base).expect("array host entry");
+        debug_assert!(
+            var.is_array(),
+            "D1 步骤 3: element insert into non-array host {base:?}"
+        );
+        let new = var
+            .elements
+            .as_deref_mut()
+            .expect("array subtable")
+            .land_element(index, v);
+        if new {
+            var.elem_count += 1;
+        }
+        new
+    };
+    if new {
+        #[cfg(debug_assertions)]
+        {
+            f.locals.insert(format!("{base}({index})"), mirror_v);
+            let count = f.vt.get(base).map(|v| v.elem_count as usize).unwrap_or(0);
+            f.elem_counts.insert(base.to_string(), count);
+            // 元素键入日志（debug 对拍域——release 日志不收元素键，
+            // T3 直列的元素过滤随之空转）；压缩按镜像长度计、活性走
+            // 镜像（元素键活性 ⟺ 镜像在席）。
+            f.locals_order.push(format!("{base}({index})"));
+            if f.locals_order.len() > 2 * f.locals.len() + 64 {
+                let live = |k: &str| f.locals.contains_key(k);
+                compact_order(&mut f.locals_order, &live);
+            }
+        }
+    }
+    new
 }
 
 /// Frame-table array-base mark (⟺ 镜像 array_locals 含键).  经 vt 的
@@ -493,7 +857,12 @@ pub(crate) fn frame_local_is_array(f: &CallFrame, key: &str) -> bool {
 /// 覆盖原位、无值占位上值 = 移位新建序位、新键追加；ARRAY/占位位逐
 /// 字保留), maintaining the frame's Tcl-order log.
 /// 返回是否新建（⟅ 插入序新增——调用方可免先行存在性探测）。
+/// D1 步骤 3：元素形键经宿主 Var 子表（frame_elem_insert）。
 pub(crate) fn frame_local_insert(f: &mut CallFrame, key: String, v: Value) -> bool {
+    if let Some((base, index)) = split_array_ref(&key) {
+        let base = base.to_string();
+        return frame_elem_insert(f, &base, index, v);
+    }
     #[cfg(debug_assertions)]
     let was = f.locals.contains_key(&key);
     let (_, arena_new) = f.vt.land_value(key.clone(), v);
@@ -508,6 +877,10 @@ pub(crate) fn frame_local_insert(f: &mut CallFrame, key: String, v: Value) -> bo
     if arena_new {
         f.locals_order.push(key.clone());
     }
+    // D1 步骤 3：release 日志只收宿主键——触发/活性按 vt；debug 日志
+    // 另收元素键（对拍域）——按镜像长度计、活性走镜像（两域压缩后的
+    // 宿主键序列逐字同）。
+    #[cfg(not(debug_assertions))]
     if f.locals_order.len() > 2 * f.vt.len() + 64 {
         // 活性集先行收集（vt 有值键——镜像在席的权威域），日志压缩
         // 期间不再借用 vt（compact_order 的 &str 谓词形保持）。
@@ -520,6 +893,11 @@ pub(crate) fn frame_local_insert(f: &mut CallFrame, key: String, v: Value) -> bo
         let livef = |k: &str| live.contains(k);
         compact_order(&mut f.locals_order, &livef);
     }
+    #[cfg(debug_assertions)]
+    if f.locals_order.len() > 2 * f.locals.len() + 64 {
+        let livef = |k: &str| f.locals.contains_key(k);
+        compact_order(&mut f.locals_order, &livef);
+    }
     dcheck_frame_mirror(f, &key);
     arena_new
 }
@@ -528,8 +906,55 @@ pub(crate) fn frame_local_insert(f: &mut CallFrame, key: String, v: Value) -> bo
 /// 旧平表 map-remove 的逐字对应：返回值 = 被摘的**值**（有值条目才
 /// Some——旧 locals 无占位条目，flag-only 数组基占位摘除返回 None）；
 /// 终态 = 无条目（vt 的占位条目一并摘除，与镜像「无条目」同）。
+/// D1 步骤 3：元素形键经子表摘除（计数 −1、镜像双删 debug）。
 pub(crate) fn frame_local_remove(f: &mut CallFrame, key: &str) -> Option<Value> {
+    if let Some((base, index)) = split_array_ref(key) {
+        let removed = f
+            .vt
+            .get_mut(base)
+            .filter(|v| v.is_array())
+            .and_then(|var| {
+                var.elements
+                    .as_deref_mut()
+                    .and_then(|t| t.remove(index))
+                    .map(|x| x.value)
+            });
+        if removed.is_some() {
+            let var = f.vt.get_mut(base).expect("array host");
+            var.elem_count = var.elem_count.saturating_sub(1);
+        }
+        #[cfg(debug_assertions)]
+        {
+            let from_map = f.locals.remove(key);
+            debug_assert_eq!(
+                removed.is_some(),
+                from_map.is_some(),
+                "D1 对拍: frame remove {key:?}"
+            );
+            if removed.is_some() {
+                if let Some(c) = f.elem_counts.get_mut(base) {
+                    *c = c.saturating_sub(1);
+                }
+            }
+            dcheck_frame_mirror(f, key);
+        }
+        return removed;
+    }
     let had_value = f.vt.get(key).is_some_and(|v| v.has_value());
+    // D1 步骤 3：宿主摘除（未经撤位的路径——drop_global_seeds 等）
+    // 时子表随之回收，镜像元素键同步清账（debug 对拍域）。
+    #[cfg(debug_assertions)]
+    if f.vt.get(key).is_some_and(|v| v.is_array()) {
+        let idxs: Vec<String> = f
+            .vt
+            .get(key)
+            .and_then(|v| v.elements())
+            .map(|t| t.order_entries().map(|(k, _)| k.as_ref().to_string()).collect())
+            .unwrap_or_default();
+        for i in idxs {
+            f.locals.remove(&format!("{key}({i})"));
+        }
+    }
     let v = if had_value {
         Some(f.vt.remove(key).expect("valued entry").value)
     } else {
@@ -625,8 +1050,22 @@ pub(crate) fn frame_local_mark_array(f: &mut CallFrame, key: &str) {
     dcheck_frame_mirror(f, key);
 }
 
-/// 数组基摘标（位随标清——快索引/计数/子表对账在 vt 内）。
+/// 数组基摘标（位随标清——快索引/计数/子表对账在 vt 内）。D1 步骤
+/// 3：子表随位撤销整表回收；镜像元素键同步清账（debug 对拍域——须
+/// 在撤位前枚举）。
 pub(crate) fn frame_local_unmark_array(f: &mut CallFrame, key: &str) {
+    #[cfg(debug_assertions)]
+    {
+        let idxs: Vec<String> = f
+            .vt
+            .get(key)
+            .and_then(|v| v.elements())
+            .map(|t| t.order_entries().map(|(k, _)| k.as_ref().to_string()).collect())
+            .unwrap_or_default();
+        for i in idxs {
+            f.locals.remove(&format!("{key}({i})"));
+        }
+    }
     f.vt.unmark_array(key);
     #[cfg(debug_assertions)]
     {
@@ -1550,6 +1989,115 @@ impl Interp {
         }
     }
 
+    // -- D1 步骤 3：元素直访（loc 域分派——免平键构建/再拆）--------
+
+    /// 元素读（loc 域）：宿主 Var 子表直取。debug 对拍走镜像平键
+    /// （咽喉形同 [`Self::loc_get`] 的元素臂——此处直取省平键构建，
+    /// 对拍显式落）。
+    fn loc_elem_get(&self, loc: &VarLoc, index: &str) -> Option<&Value> {
+        let v = match loc {
+            VarLoc::Global(n) => self
+                .var_arena
+                .root()
+                .get(n)
+                .filter(|v| v.is_array())
+                .and_then(|v| v.elements())
+                .and_then(|t| t.get(index))
+                .filter(|v| v.has_value())
+                .map(|v| &v.value),
+            VarLoc::Frame(i, n) => self
+                .frames
+                .get(*i)
+                .and_then(|f| f.vt.get(n))
+                .filter(|v| v.is_array())
+                .and_then(|v| v.elements())
+                .and_then(|t| t.get(index))
+                .filter(|v| v.has_value())
+                .map(|v| &v.value),
+        };
+        #[cfg(debug_assertions)]
+        {
+            let flat = loc.element_key(index);
+            let mirror = match loc {
+                VarLoc::Global(_) => self.globals.contains_key(flat.as_str()),
+                VarLoc::Frame(i, _) => self
+                    .frames
+                    .get(*i)
+                    .is_some_and(|f| f.locals.contains_key(flat.as_str())),
+            };
+            debug_assert_eq!(v.is_some(), mirror, "D1 对拍: elem read {flat:?}");
+        }
+        v
+    }
+
+    /// 元素插入（loc 域）：子表 land_element（计数/历史/镜像随新建
+    /// 在咽喉内）。返回是否新建。
+    fn loc_elem_insert(&mut self, loc: &VarLoc, index: &str, value: Value) -> bool {
+        match loc {
+            VarLoc::Global(n) => self.global_elem_insert(n, index, value),
+            VarLoc::Frame(i, _) => match self.frames.get_mut(*i) {
+                Some(f) => frame_elem_insert(f, loc.base_name(), index, value),
+                None => false,
+            },
+        }
+    }
+
+    /// 元素摘除（loc 域）：子表 remove + 计数 −1（咽喉内）+ 镜像平
+    /// 键双删（debug）。返回摘除前是否在席。
+    fn loc_elem_remove(&mut self, loc: &VarLoc, index: &str) -> bool {
+        let removed = match loc {
+            VarLoc::Global(n) => self
+                .var_arena
+                .root_mut()
+                .get_mut(n)
+                .filter(|v| v.is_array())
+                .and_then(|var| {
+                    var.elements
+                        .as_deref_mut()
+                        .and_then(|t| t.remove(index))
+                        .map(|x| x.value)
+                })
+                .is_some(),
+            VarLoc::Frame(i, _) => match self.frames.get_mut(*i) {
+                Some(f) => frame_elem_remove(f, loc.base_name(), index),
+                None => false,
+            },
+        };
+        if removed {
+            match loc {
+                VarLoc::Global(n) => self.global_elem_bump(n, -1),
+                VarLoc::Frame(i, n) => {
+                    if let Some(f) = self.frames.get_mut(*i) {
+                        if let Some(var) = f.vt.get_mut(n) {
+                            var.elem_count = var.elem_count.saturating_sub(1);
+                        }
+                        #[cfg(debug_assertions)]
+                        if let Some(c) = f.elem_counts.get_mut(n) {
+                            *c = c.saturating_sub(1);
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(debug_assertions)]
+        {
+            let flat = loc.element_key(index);
+            match loc {
+                VarLoc::Global(_) => {
+                    self.globals.remove(flat.as_str());
+                    self.dcheck_global_mirror(&flat);
+                }
+                VarLoc::Frame(i, _) => {
+                    if let Some(f) = self.frames.get_mut(*i) {
+                        f.locals.remove(flat.as_str());
+                        dcheck_frame_mirror(f, &flat);
+                    }
+                }
+            }
+        }
+        removed
+    }
+
     /// Insert a flat key in the scope owning `loc`.
     /// Insert a flat key in the scope owning `loc`; returns whether the
     /// key was NEW (insertion-log growth — callers drop a prior existence
@@ -1654,22 +2202,14 @@ impl Interp {
 
     /// Remove an entire array: all element keys, the array marker, and the
     /// base key (tclsh: `unset arr` kills the array itself).
+    /// D1 步骤 3：元素表 = 宿主 Var 的子表——宿主摘除/撤位即整表回收
+    /// （逐元素平键摘除循环退役：平键域不再持有元素键；镜像元素键的
+    /// 清账挂在撤位/宿主摘除两咽喉——见 global_unmark_array /
+    /// frame_local_unmark_array / frame_local_remove）。
     fn loc_remove_array(&mut self, loc: &VarLoc) {
         // (generation bump at the end of this function)
-        let prefix = format!("{}(", loc.base_name());
         match loc {
             VarLoc::Global(_) => {
-                // D1 步骤 1：arena 前缀枚举（插入序）+ 逐键双删。
-                let keys: Vec<Rc<str>> = self
-                    .var_arena
-                    .root()
-                    .keys_with_prefix(&prefix)
-                    .into_iter()
-                    .filter(|k| k.ends_with(')'))
-                    .collect();
-                for k in keys {
-                    self.global_remove(&k);
-                }
                 let base = loc.base_name().to_string();
                 // A deleted array's default dies with it (probe: unset
                 // then recreate -> no default).
@@ -1681,24 +2221,8 @@ impl Interp {
             }
             VarLoc::Frame(i, _) => {
                 if let Some(f) = self.frames.get_mut(*i) {
-                    // D1 步骤 2：元素键枚举/摘除走 vt（keys_with_prefix
-                    // 插入序；摘除全量——旧平表 map-remove 的逐字对
-                    // 应，枚举序不承载语义——无 trace 触发在此）。
-                    let keys: Vec<Rc<str>> = f
-                        .vt
-                        .keys_with_prefix(&prefix)
-                        .into_iter()
-                        .filter(|k| k.ends_with(')'))
-                        .collect();
-                    for k in keys {
-                        frame_local_remove(f, &k);
-                    }
                     let base = loc.base_name().to_string();
                     frame_local_unmark_array(f, &base);
-                    #[cfg(debug_assertions)]
-                    {
-                        f.elem_counts.remove(&base);
-                    }
                     frame_local_remove(f, &base);
                 }
                 if !self.array_defaults.is_empty() {
@@ -2126,73 +2650,108 @@ impl Interp {
                 && self.ns_transient.iter().all(|(k, _)| k != array_name)
             {
                 if let Some(frame) = self.var_frame() {
-                    if frame_local_is_array(frame, array_name)
-                        && (frame.upvars.is_empty()
-                            || !frame.upvars.contains_key(array_name))
-                    {
-                        // array default（TIP 508）：元素**缺**且宿主数
-                        // 组带默认值 -> 返回默认（不物化：info exists/
-                        // array size 不动；append/incr/lappend 的读同获
-                        // 默认）。已有元素永远优先。
-                        if let Some(v) = frame_local_get(frame, name) {
-                            return Ok(v);
+                    if frame.upvars.is_empty() || !frame.upvars.contains_key(array_name) {
+                        // D1 步骤 3：宿主单探测（vt 位 + 子表——T7 快径
+                        // 两跳，is_array 预探测并入宿主探测）。
+                        if let Some(host) = frame.vt.get(array_name) {
+                            if host.is_array() {
+                                let hit = host
+                                    .elements()
+                                    .and_then(|t| t.get(index))
+                                    .filter(|v| v.has_value())
+                                    .map(|v| &v.value);
+                                #[cfg(debug_assertions)]
+                                debug_assert_eq!(
+                                    hit.is_some(),
+                                    frame.locals.contains_key(name),
+                                    "D1 对拍: elem read {name:?}"
+                                );
+                                // array default（TIP 508）：元素**缺**且宿主数
+                                // 组带默认值 -> 返回默认（不物化：info exists/
+                                // array size 不动；append/incr/lappend 的读同获
+                                // 默认）。已有元素永远优先。
+                                if let Some(v) = hit {
+                                    return Ok(v);
+                                }
+                                if let Some(dv) = self.array_default_ref(array_name) {
+                                    return Ok(dv);
+                                }
+                                return Err(Error::runtime(
+                                    format!(
+                                        "can't read \"{}\": no such element in array",
+                                        name
+                                    ),
+                                    ErrorCode::NotFound,
+                                ));
+                            }
                         }
-                        if let Some(dv) = self.array_default_ref(array_name) {
-                            return Ok(dv);
+                    }
+                } else if self.current_namespace.as_ref() == "::" {
+                    // D1 步骤 3：宿主单探测（arena 位 + 子表）。
+                    if let Some(host) = self.var_arena.root().get(array_name) {
+                        if host.is_array() {
+                            let hit = host
+                                .elements()
+                                .and_then(|t| t.get(index))
+                                .filter(|v| v.has_value())
+                                .map(|v| &v.value);
+                            #[cfg(debug_assertions)]
+                            debug_assert_eq!(
+                                hit.is_some(),
+                                self.globals.contains_key(name),
+                                "D1 对拍: elem read {name:?}"
+                            );
+                            if let Some(v) = hit {
+                                return Ok(v);
+                            }
+                            if let Some(dv) = self.array_default_ref(array_name) {
+                                return Ok(dv);
+                            }
+                            return Err(Error::runtime(
+                                format!("can't read \"{}\": no such element in array", name),
+                                ErrorCode::NotFound,
+                            ));
                         }
-                        return Err(Error::runtime(
-                            format!(
-                                "can't read \"{}\": no such element in array",
-                                name
-                            ),
-                            ErrorCode::NotFound,
-                        ));
                     }
-                } else if self.current_namespace.as_ref() == "::"
-                    && self.global_is_array(array_name)
-                {
-                    if let Some(v) = self.global_get(name) {
-                        return Ok(v);
-                    }
-                    if let Some(dv) = self.array_default_ref(array_name) {
-                        return Ok(dv);
-                    }
-                    return Err(Error::runtime(
-                        format!("can't read \"{}\": no such element in array", name),
-                        ErrorCode::NotFound,
-                    ));
                 } else if self.current_namespace.as_ref() != "::"
                     && !has_ns_sep(array_name)
                     && self.flat_aliases.is_empty()
                     && self.ns_transient.is_empty()
                 {
-                    // T4 vars：ns 体平键数组读——宿主键与元素键栈上拼
-                    // （与 resolve_loc/element_key 逐字同）。宿主数组在
-                    // ns 表才进：miss = 元素缺（宿主已确证数组，全链同
-                    // 错文本）；宿主缺席时全链的 alt 判定（全局数组可
-                    // 见性——S8 已收敛为 ns-only）原样保留。
-                    let mut buf = [0u8; 96];
-                    if let Some((host, elem)) =
-                        stack_ns_elem_keys(self.current_namespace.as_ref(), array_name, index, &mut buf)
+                    // T4 vars：ns 体平键数组读——宿主键栈上拼（元素键
+                    // 构建退役——子表按 index 直取）。宿主数组在 ns 表
+                    // 才进：miss = 元素缺（宿主已确证数组，全链同错文
+                    // 本）；宿主缺席时全链的 alt 判定（全局数组可见性
+                    // ——S8 已收敛为 ns-only）原样保留。
+                    let mut buf = [0u8; 64];
+                    if let Some(host) =
+                        stack_ns_key(self.current_namespace.as_ref(), array_name, &mut buf)
                     {
                         // 宿主不是死链别名（deaden 后的裸名读不得穿到旧
                         // 目标——T7 守卫同款，对 canonical 键再查一遍）。
-                        if self.dead_flat.iter().all(|k| k != host)
-                            && self.global_is_array(host)
-                        {
-                            if let Some(v) = self.global_get(elem) {
-                                return Ok(v);
+                        if self.dead_flat.iter().all(|k| k != host) {
+                            if let Some(h) = self.var_arena.root().get(host) {
+                                if h.is_array() {
+                                    let hit = h
+                                        .elements()
+                                        .and_then(|t| t.get(index))
+                                        .filter(|v| v.has_value())
+                                        .map(|v| &v.value);
+                                    if let Some(v) = hit {
+                                        return Ok(v);
+                                    }
+                                    if let Some(dv) = self.array_default_ref(host) {
+                                        return Ok(dv);
+                                    }
+                                    return Err(Error::runtime(
+                                        format!(
+                                            "can't read \"{}\": no such element in array",
+                                            name
+                                        ),
+                                        ErrorCode::NotFound,
+                                    ));
+                                }
                             }
-                            if let Some(dv) = self.array_default_ref(host) {
-                                return Ok(dv);
-                            }
-                            return Err(Error::runtime(
-                                format!(
-                                    "can't read \"{}\": no such element in array",
-                                    name
-                                ),
-                                ErrorCode::NotFound,
-                            ));
                         }
                     }
                 }
@@ -2202,8 +2761,9 @@ impl Interp {
             // 读与元素写/info exists 同一落点（后两者已是 ns-only），
             // 同名全局数组在体里不可见（tclVar.c：TCL_NAMESPACE_ONLY）。
             if self.loc_is_array(&loc) {
-                let key = loc.element_key(index);
-                if self.loc_get(&loc, &key).is_none() {
+                // D1 步骤 3：元素读经子表直取（loc_elem_get——免平键
+                // 构建；对拍落镜像平键）。
+                if self.loc_elem_get(&loc, index).is_none() {
                     // Element miss: the host array's default answers the
                     // read (owned ref into the defaults table — a borrow
                     // of self, same shape as the table entries).
@@ -2215,7 +2775,7 @@ impl Interp {
                         ErrorCode::NotFound,
                     ));
                 }
-                return Ok(self.loc_get(&loc, &key).unwrap());
+                return Ok(self.loc_elem_get(&loc, index).unwrap());
             } else if self.loc_base_exists(&loc) {
                 Err(Error::runtime(
                     format!("can't read \"{}\": variable isn't array", name),
@@ -2510,31 +3070,54 @@ impl Interp {
             {
                 let mut wrote = false;
                 if let Some(frame) = self.var_frame_mut() {
-                    if frame_local_is_array(frame, array_name)
-                        && (frame.upvars.is_empty()
-                            || !frame.upvars.contains_key(array_name))
-                    {
-                        // D1 步骤 2：vt 权威格写 + 镜像重放（值词赋值可
-                        // 重放——对拍域）。
-                        let landed = match frame_local_get_mut(frame, name) {
-                            Some(cell) => {
-                                *cell = value.clone();
-                                true
-                            }
-                            None => false,
-                        };
-                        #[cfg(debug_assertions)]
-                        if landed {
-                            if let Some(cell) = frame.locals.get_mut(name) {
-                                *cell = value.clone();
+                    if frame.upvars.is_empty() || !frame.upvars.contains_key(array_name) {
+                        // D1 步骤 3：宿主单探测（vt 位 + 子表格——T7 快
+                        // 径两跳）+ 镜像重放（值词赋值可重放——对拍域）。
+                        if let Some(host) = frame.vt.get_mut(array_name) {
+                            if host.is_array() {
+                                let landed = match host
+                                    .elements
+                                    .as_deref_mut()
+                                    .and_then(|t| t.get_mut(index))
+                                    .filter(|v| v.has_value())
+                                {
+                                    Some(cell) => {
+                                        cell.value = value.clone();
+                                        true
+                                    }
+                                    None => false,
+                                };
+                                #[cfg(debug_assertions)]
+                                if landed {
+                                    if let Some(cell) = frame.locals.get_mut(name) {
+                                        *cell = value.clone();
+                                    }
+                                }
+                                wrote = landed;
                             }
                         }
-                        wrote = landed;
                     }
-                } else if self.current_namespace.as_ref() == "::"
-                    && self.global_is_array(array_name)
-                {
-                    if self.global_overwrite(name, &value) {
+                } else if self.current_namespace.as_ref() == "::" {
+                    // D1 步骤 3：arena 权威子表格写（宿主单探测）。
+                    let landed = {
+                        match self.var_arena.root_mut().get_mut(array_name) {
+                            Some(host) if host.is_array() => host
+                                .elements
+                                .as_deref_mut()
+                                .and_then(|t| t.get_mut(index))
+                                .filter(|v| v.has_value())
+                                .map(|cell| cell.value = value.clone())
+                                .is_some(),
+                            _ => false,
+                        }
+                    };
+                    #[cfg(debug_assertions)]
+                    if landed {
+                        if let Some(cell) = self.globals.get_mut(name) {
+                            *cell = value.clone();
+                        }
+                    }
+                    if landed {
                         wrote = true;
                     }
                 }
@@ -2573,14 +3156,13 @@ impl Interp {
             // 不再链到全局；元素读写同键）。
             let loc = self.resolve_loc(array_name);
             if self.loc_is_array(&loc) {
-                let key = loc.element_key(index);
-                // D1 步骤 1：存在性 = 插入的新建位（单探测免先行
-                // loc_get 大表探测）。
-                let existed = !self.loc_insert(&loc, key, value.clone());
+                // D1 步骤 1/3：存在性 = 插入的新建位；元素经子表直落
+                // （loc_elem_insert——免平键构建/再拆；计数/历史/镜像随
+                // 新建在咽喉内——计数位点与旧 elem_counts 同面）。
+                let existed = !self.loc_elem_insert(&loc, index, value.clone());
                 if !existed {
                     // New element: element-set mutation invalidates searches.
                     self.bump_stamp(&loc);
-                    self.loc_elem_count_bump(&loc, 1);
                 }
                 self.env_proc_sync(&base, &idx, Some(&value));
             } else if self.loc_base_exists(&loc) {
@@ -2599,9 +3181,7 @@ impl Interp {
                 let base_key = loc.base_name().to_string();
                 self.loc_mark_array(&loc);
                 self.loc_insert(&loc, base_key, Value::empty());
-                let key = loc.element_key(index);
-                self.loc_insert(&loc, key, value.clone());
-                self.loc_elem_count_bump(&loc, 1);
+                self.loc_elem_insert(&loc, index, value.clone());
                 self.env_proc_sync(&base, &idx, Some(&value));
             }
             self.clear_phantom(&base, &idx);
@@ -3136,38 +3716,56 @@ impl Interp {
             }
             let next;
             if let Some(frame) = self.var_frame_mut() {
-                if !(frame_local_is_array(frame, array_name)
-                    && (frame.upvars.is_empty()
-                        || !frame.upvars.contains_key(array_name)))
-                {
+                if !(frame.upvars.is_empty() || !frame.upvars.contains_key(array_name)) {
                     return None;
                 }
-                // D1 步骤 2：vt 权威格 + 镜像重放（from_int 确定性；
-                // 前置 ? 早退不触重放——与格未改同形）。
-                let cell = frame_local_get_mut(frame, name)?;
-                let current = cell.as_int()?;
+                // D1 步骤 3：宿主单探测（vt 位 + 子表格——T7 快径两跳）
+                // + 镜像重放（from_int 确定性；前置 ? 早退不触重放——
+                // 与格未改同形）。
+                let cell = match frame
+                    .vt
+                    .get_mut(array_name)
+                    .filter(|v| v.is_array())
+                    .and_then(|v| v.elements.as_deref_mut())
+                    .and_then(|t| t.get_mut(index))
+                    .filter(|v| v.has_value())
+                {
+                    Some(c) => c,
+                    None => return None,
+                };
+                let current = cell.value.as_int()?;
                 next = current.checked_add(amount)?;
-                *cell = Value::from_int(next);
+                cell.value.set_int_rep(next);
                 #[cfg(debug_assertions)]
                 if let Some(cell) = frame.locals.get_mut(name) {
                     *cell = Value::from_int(next);
                 }
             } else {
-                if self.current_namespace.as_ref() != "::"
-                    || !self.global_is_array(array_name)
-                {
+                if self.current_namespace.as_ref() != "::" {
                     return None;
                 }
-                // D1 步骤 1：arena 权威格 + 镜像重放（global_cell——
-                // set_int_rep 的整型 retag 可重放）。
-                next = self
-                    .global_cell(name, |cell| {
-                        let current = cell.as_int()?;
-                        let nxt = current.checked_add(amount)?;
-                        cell.set_int_rep(nxt);
-                        Some(nxt)
-                    })
-                    .flatten()?;
+                // D1 步骤 3：arena 权威子表格（宿主单探测）+ 镜像重放
+                // （set_int_rep 的整型 retag 可重放）。
+                let host = match self.var_arena.root_mut().get_mut(array_name) {
+                    Some(h) if h.is_array() => h,
+                    _ => return None,
+                };
+                let cell = match host
+                    .elements
+                    .as_deref_mut()
+                    .and_then(|t| t.get_mut(index))
+                    .filter(|v| v.has_value())
+                {
+                    Some(c) => c,
+                    None => return None,
+                };
+                let current = cell.value.as_int()?;
+                next = current.checked_add(amount)?;
+                cell.value.set_int_rep(next);
+                #[cfg(debug_assertions)]
+                if let Some(cell) = self.globals.get_mut(name) {
+                    cell.set_int_rep(next);
+                }
             }
             if !self.trace_phantoms.is_empty() {
                 self.clear_phantom(array_name, index);
@@ -3206,11 +3804,10 @@ impl Interp {
             // 数组基解析走 resolve_loc（Tcl 9：裸名只落当前 ns 的表）。
             let loc = self.resolve_loc(array_name);
             if self.loc_is_array(&loc) {
-                let key = loc.element_key(index);
-                if self.loc_remove(&loc, &key) {
-                    // Removed element: mutation invalidates searches.
+                if self.loc_elem_remove(&loc, index) {
+                    // Removed element: mutation invalidates searches
+                    // （D1 步骤 3：计数 −1 在摘除咽喉内）。
                     self.bump_stamp(&loc);
-                    self.loc_elem_count_bump(&loc, -1);
                     self.clear_phantom(&base, &idx);
                     self.env_proc_sync(&base, &idx, None);
                     // Unset traces fire after deletion; errors are
@@ -3283,6 +3880,9 @@ impl Interp {
                 for e in elems {
                     let _ = self.fire_traces_elem_only(&given, &e, "unset");
                 }
+                // D1 步骤 3：搜索/戳键 = 宿主 VarRef——宿主句柄须在摘
+                // 除前解出（摘除后代数即失效）。
+                let host = self.array_host_ref(&loc);
                 self.loc_remove_array(&loc);
                 // Element aliases into this array now error on write
                 // (var-1.17: `upvar 0 arr(1) foo; unset arr; set foo(3)` →
@@ -3292,8 +3892,10 @@ impl Interp {
                 // traces fire after the deletion, so drop the tables after
                 // firing them.
                 let sk = stamp_key(&loc);
-                self.array_searches.remove(&sk);
-                self.array_stamps.remove(&sk);
+                if let Some(r) = &host {
+                    self.array_searches.remove(r);
+                    self.array_stamps.remove(r);
+                }
                 let _ = self.fire_traces(&given, None, "unset");
                 self.var_traces.remove(&sk);
                 self.elem_traces.remove(&sk);
@@ -3386,31 +3988,51 @@ impl Interp {
             // Fast path (T7 vars): same flat-key-is-the-name guard set as
             // get_var/set_var — one contains probe, zero allocation
             // (this sits on `incr`'s hot path via cmd_incr).
+            // D1 步骤 3：宿主单探测（位 + 子表——is_array 预探测并入）。
             if !has_ns_sep(name)
                 && self.dead_flat.iter().all(|k| k != array_name)
                 && self.flat_aliases.iter().all(|(k, _)| k != array_name)
                 && self.ns_transient.iter().all(|(k, _)| k != array_name)
             {
                 if let Some(frame) = self.var_frame() {
-                    if frame_local_is_array(frame, array_name)
-                        && (frame.upvars.is_empty()
-                            || !frame.upvars.contains_key(array_name))
-                    {
-                        // D1 步骤 2：元素在席判定走 vt（frame_local_contains）。
-                        return frame_local_contains(frame, name);
+                    if frame.upvars.is_empty() || !frame.upvars.contains_key(array_name) {
+                        if let Some(host) = frame.vt.get(array_name) {
+                            if host.is_array() {
+                                let has = host
+                                    .elements()
+                                    .and_then(|t| t.get(index))
+                                    .is_some_and(|v| v.has_value());
+                                debug_assert_eq!(
+                                    has,
+                                    frame.locals.contains_key(name),
+                                    "D1 对拍: elem has {name:?}"
+                                );
+                                return has;
+                            }
+                        }
                     }
-                } else if self.current_namespace.as_ref() == "::"
-                    && self.global_is_array(array_name)
-                {
-                    return self.global_has(name);
+                } else if self.current_namespace.as_ref() == "::" {
+                    if let Some(host) = self.var_arena.root().get(array_name) {
+                        if host.is_array() {
+                            let has = host
+                                .elements()
+                                .and_then(|t| t.get(index))
+                                .is_some_and(|v| v.has_value());
+                            debug_assert_eq!(
+                                has,
+                                self.globals.contains_key(name),
+                                "D1 对拍: elem has {name:?}"
+                            );
+                            return has;
+                        }
+                    }
                 }
             }
             // Tcl 9: a bare array base is the current namespace's own
             // (resolve_loc already lands there; no global fallback).
             let loc = self.resolve_loc(array_name);
             if self.loc_is_array(&loc) {
-                let key = loc.element_key(index);
-                self.loc_get(&loc, &key).is_some()
+                self.loc_elem_get(&loc, index).is_some()
             } else {
                 // Element of a scalar / of a missing variable: never exists.
                 false
@@ -4180,18 +4802,57 @@ impl Interp {
     }
 
     /// Current mutation stamp of the array at `name` (0 if never mutated).
+    /// D1 步骤 3：键 = 宿主 VarRef（resolve 宿主；缺席 → 无戳 0——
+    /// 搜索/戳只对在席数组有意义）。
     pub(crate) fn array_stamp(&self, name: &str) -> u64 {
-        self.array_stamps.get(&self.array_stamp_key(name)).copied().unwrap_or(0)
+        self.array_stamp_ref(name)
+            .map(|r| self.array_stamps.get(&r).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    /// The array at `name`'s host handle (search/stamp map key; `None`
+    /// when the host entry is absent).
+    pub(crate) fn array_stamp_ref(&self, name: &str) -> Option<VarRef> {
+        self.array_host_ref(&self.resolve_loc(name))
+    }
+
+    /// The host [`VarRef`] of the array living at `loc`（搜索/戳的键）。
+    fn array_host_ref(&self, loc: &VarLoc) -> Option<VarRef> {
+        match loc {
+            VarLoc::Global(n) => self.var_arena.root().resolve(n),
+            VarLoc::Frame(i, n) => {
+                self.frames.get(*i).and_then(|f| f.vt.resolve(n))
+            }
+        }
+    }
+
+    /// 搜索/戳条目的宿主名反查（ns delete 清扫面）：全局宿主经 arena
+    /// 表 key_of；帧宿主/他类宿主 → None（调用方区分——帧宿主不归 ns
+    /// 树清扫，随帧出清）；宿主已亡 → None。
+    pub(crate) fn array_search_host_name(&self, r: &VarRef) -> Option<String> {
+        let TableId::Array(host) = &r.table else {
+            return None;
+        };
+        let TableId::Global(i) = &host.table else {
+            return None;
+        };
+        self.var_arena
+            .table(*i)
+            .and_then(|t| t.key_of(host))
+            .map(|s| s.to_string())
     }
 
     fn bump_stamp(&mut self, loc: &VarLoc) {
-        let k = stamp_key(loc);
-        *self.array_stamps.entry(k.clone()).or_insert(0) += 1;
-        // tclsh: any element-set change kills every search on the array;
-        // an emptied search list also resets the id counter.
-        if let Some(list) = self.array_searches.get_mut(&k) {
-            list.active.clear();
-            list.ctr = 0;
+        // D1 步骤 3：搜索戳键 = 宿主 VarRef。元素位点宿主必在席
+        // （set/unset 先过 loc_is_array）；trace-add 面先 mark_array。
+        if let Some(k) = self.array_host_ref(loc) {
+            *self.array_stamps.entry(k.clone()).or_insert(0) += 1;
+            // tclsh: any element-set change kills every search on the array;
+            // an emptied search list also resets the id counter.
+            if let Some(list) = self.array_searches.get_mut(&k) {
+                list.active.clear();
+                list.ctr = 0;
+            }
         }
     }
 
@@ -4223,119 +4884,93 @@ impl Interp {
         }
     }
 
-    /// The element keys of the array at `name` as the log has them: the
-    /// live ones, or with `live_only` off every key ever inserted — once,
-    /// at its last occurrence (what the table's size and bucket
-    /// statistics were built from; `array statistics`).
+    /// The element keys of the array at `name`: the live ones (in the
+    /// element table's insertion order — tclsh's bucket-walk replay), or
+    /// with `live_only` off every key ever inserted since the array's
+    /// (re)creation — once, at its last occurrence (what the table's size
+    /// and bucket statistics were built from; `array statistics`).
+    /// D1 步骤 3：元素表 = 宿主 Var 的子表——活性面走子表插入序向量，
+    /// 历史面走子表 history 入档（曾插入键各一次、末次出现位——与旧
+    /// 共享日志的历史重放同形）；debug 下活性面同走旧日志重放对拍
+    /// （顺序语义红线——「删了重建换新位置」的 tclsh 序）。
     fn array_elements(&self, name: &str, live_only: bool) -> Vec<String> {
         let loc = self.resolve_loc(name);
-        let prefix = format!("{}(", loc.base_name());
-        let is_element = |k: &str| k.starts_with(&prefix) && k.ends_with(')');
-        // An element key `a(k)` without its `a(` and `)`.
-        fn stripped<'k>(k: &'k String, from: usize) -> &'k str {
-            &k[from..k.len() - 1]
-        }
-        // The element names are slices of the log's entries all the way
-        // through the replay; only the result owns them.
-        let collect = |order: &[String],
-                       live: &dyn Fn(&str) -> bool,
-                       live_count: usize|
-         -> Vec<String> {
-            // The history starts at the array's (re)creation: after the
-            // marker key's last entry (the marker is written when the
-            // array is made, never while it lives).
-            let order = if live_only {
-                order
-            } else {
-                let base = loc.base_name();
-                match order.iter().rposition(|k| k.as_str() == base) {
-                    Some(i) => &order[i + 1..],
-                    None => order,
-                }
-            };
-            let keys: Vec<&str> = if live_only && order.len() == live_count {
-                // Nothing stale in the log: every entry is a live key, once.
-                // (A lookup per entry instead was the whole cost of listing
-                // a large array: random access into a large table.)
-                order
-                    .iter()
-                    .filter(|k| is_element(k))
-                    .map(|k| stripped(k, prefix.len()))
-                    .collect()
-            } else {
-                let mut seen: super::varmap::FxHashedMap<&str, usize> =
-                    super::varmap::FxHashedMap::default();
-                for (i, k) in order.iter().enumerate() {
-                    if is_element(k) && (!live_only || live(k)) {
-                        seen.insert(k.as_str(), i);
+        let base = loc.base_name().to_string();
+        let sub = match &loc {
+            VarLoc::Global(_) => self
+                .var_arena
+                .root()
+                .get(&base)
+                .filter(|v| v.is_array())
+                .and_then(|v| v.elements()),
+            VarLoc::Frame(i, _) => self
+                .frames
+                .get(*i)
+                .and_then(|f| f.vt.get(&base))
+                .filter(|v| v.is_array())
+                .and_then(|v| v.elements()),
+        };
+        let Some(sub) = sub else {
+            return Vec::new();
+        };
+        if live_only {
+            let keys: Vec<&str> = sub
+                .order_entries()
+                .filter(|(_, v)| v.has_value())
+                .map(|(k, _)| k.as_ref())
+                .collect();
+            let out: Vec<String> = tclhash::tcl_order(keys.iter().copied())
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            #[cfg(debug_assertions)]
+            {
+                // 旧路径对拍：共享日志的元素键子序列（活性 = 镜像在席
+                // ——镜像 debug 域收元素键），末次出现保留，同一
+                // tcl_order 重放。日志键 = `base(index)` 平键。
+                let prefix = format!("{base}(");
+                let is_element = |k: &str| k.starts_with(&prefix) && k.ends_with(')');
+                let log: &[String] = match &loc {
+                    VarLoc::Global(_) => &self.var_order,
+                    VarLoc::Frame(i, _) => self
+                        .frames
+                        .get(*i)
+                        .map(|f| &f.locals_order[..])
+                        .unwrap_or(&[]),
+                };
+                let live: &dyn Fn(&str) -> bool = match &loc {
+                    VarLoc::Global(_) => &|k: &str| self.globals.contains_key(k),
+                    VarLoc::Frame(i, _) => &|k: &str| {
+                        self.frames
+                            .get(*i)
+                            .is_some_and(|f| f.locals.contains_key(k))
+                    },
+                };
+                let mut seen: std::collections::HashSet<&str> =
+                    std::collections::HashSet::with_capacity(log.len());
+                let mut old: Vec<&str> = Vec::new();
+                for k in log.iter().rev() {
+                    if is_element(k) && live(k) && seen.insert(k.as_str()) {
+                        old.push(&k[prefix.len()..k.len() - 1]);
                     }
                 }
-                order
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, k)| seen.get(k.as_str()) == Some(i))
-                    .map(|(_, k)| stripped(k, prefix.len()))
-                    .collect()
-            };
+                old.reverse();
+                let old: Vec<String> = tclhash::tcl_order(old.iter().copied())
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+                debug_assert_eq!(out, old, "D1 对拍: array names 序");
+            }
+            out
+        } else {
+            // 历史面（array statistics）：子表 history 入档（曾插入键
+            // 各一次、末次出现位；压缩活性过滤落档——桶轨迹与旧共享
+            // 日志压缩后的重放同形）。
+            let keys: Vec<&str> = sub.history_keys().collect();
             tclhash::tcl_order(keys.iter().copied())
                 .into_iter()
                 .map(str::to_string)
                 .collect()
-        };
-        match &loc {
-            VarLoc::Global(_) => {
-                // D1 步骤 1：array names（live_only）走 arena 插入序向量
-                // 跳洞枚举（有值条目）+ 同一 tcl_order 重放；debug 下对
-                // 拍旧日志重放路径同序（顺序语义红线）。history 形
-                // （array statistics——需已删键）保留旧日志路径（日志镜
-                // 像迁移期保留）。
-                if live_only {
-                    let keys: Vec<&str> = self
-                        .var_arena
-                        .root()
-                        .order_entries()
-                        .filter(|(_, v)| v.has_value())
-                        .map(|(k, _)| k.as_ref())
-                        .filter(|k| is_element(k))
-                        .map(|k| &k[prefix.len()..k.len() - 1])
-                        .collect();
-                    let out: Vec<String> = tclhash::tcl_order(keys.iter().copied())
-                        .into_iter()
-                        .map(str::to_string)
-                        .collect();
-                    #[cfg(debug_assertions)]
-                    {
-                        let n = self.globals.len();
-                        let old =
-                            collect(&self.var_order, &|k| self.globals.contains_key(k), n);
-                        debug_assert_eq!(out, old, "D1 对拍: array names 序");
-                    }
-                    out
-                } else {
-                    // D1 步骤 1：历史面（array statistics）的活性过滤走
-                    // arena（release 镜像退场）；live_count 参数在该分支
-                    // 不被读取（快径条件只挂 live_only）。
-                    let n = self.var_arena.root().len();
-                    let live = |k: &str| {
-                        self.var_arena
-                            .root()
-                            .get(k)
-                            .is_some_and(|v| v.has_value())
-                    };
-                    collect(&self.var_order, &live, n)
-                }
-            }
-            VarLoc::Frame(i, _) => self
-                .frames
-                .get(*i)
-                .map(|f| {
-                    // D1 步骤 2：活性计数/过滤走 vt（frame_local_contains
-                    // ——镜像在席的权威读；日志重放保持，vt 插入序的对
-                    // 拍在 debug 块并跑）。
-                    let n = f.vt.len();
-                    collect(&f.locals_order, &|k| frame_local_contains(f, k), n)
-                })
-                .unwrap_or_default(),
         }
     }
 

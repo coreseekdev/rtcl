@@ -79,15 +79,19 @@ fn classify_id(id: &str, array_name: &str) -> IdShape {
 }
 
 /// Ok if `id` names an active, uninvalidated search on the array.
+/// D1 步骤 3：搜索/戳键 = 宿主 VarRef（array_stamp_ref——宿主缺席即
+/// 无搜索）。
 fn validate_search(interp: &Interp, array_name: &str, id: &str) -> Result<()> {
-    let key = interp.array_stamp_key(array_name);
     let stamp = interp.array_stamp(array_name);
-    if let Some(v) = interp.array_searches.get(&key) {
-        if let Some(s) = v.active.iter().find(|s| s.rendered == id) {
-            if s.stamp == stamp {
-                return Ok(());
-            }
-        }
+    let live = interp.array_stamp_ref(array_name).and_then(|key| {
+        interp
+            .array_searches
+            .get(&key)
+            .and_then(|v| v.active.iter().find(|s| s.rendered == id))
+            .map(|s| s.stamp == stamp)
+    });
+    if live == Some(true) {
+        return Ok(());
     }
     match classify_id(id, array_name) {
         IdShape::ForArray => Err(Error::runtime(
@@ -143,7 +147,7 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             require_array(interp, array_name)?;
             let id = args[3].as_str();
             validate_search(interp, array_name, id)?;
-            let key = interp.array_stamp_key(array_name);
+            let key = interp.array_stamp_ref(array_name).expect("validated live");
             let list = interp.array_searches.get_mut(&key).unwrap();
             let search = list.active.iter_mut().find(|s| s.rendered == id).unwrap();
             match subcmd.as_str() {
@@ -170,7 +174,7 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 return Err(usage("array", "startsearch", "arrayName"));
             }
             require_array(interp, array_name)?;
-            let key = interp.array_stamp_key(array_name);
+            let key = interp.array_stamp_ref(array_name).expect("require_array");
             let stamp = interp.array_stamp(array_name);
             let elements = interp.array_element_names(array_name);
             let list = interp
@@ -365,27 +369,26 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // one is no error (tclsh answers for a missing array first).
             #[cfg(any(feature = "regexp", feature = "regexp-lite"))]
             let listed = {
+                // D1 步骤 1/2/3：元素在席扫描经宿主 Var 的元素子表（平
+                // 键域不再持有元素键——前缀扫描退役）。
                 let (owner_fi, base) = interp.array_owner(array_name);
-                let prefix = format!("{}(", base);
-                // D1 步骤 1/2：元素在席扫描经表（帧域走 vt order_entries
-                // 有值过滤——镜像迭代序不承载语义；全局域同）。
-                interp.is_array_semantic(array_name)
-                    || match owner_fi {
-                        Some(i) => interp.frames[i].vt.order_entries().any(|(k, v)| {
-                            v.has_value()
-                                && k.as_ref().starts_with(&prefix)
-                                && k.as_ref().ends_with(')')
-                        }),
-                        None => interp
-                            .var_arena
-                            .root()
-                            .order_entries()
-                            .any(|(k, v)| {
-                                v.has_value()
-                                    && k.as_ref().starts_with(&prefix)
-                                    && k.as_ref().ends_with(')')
-                            }),
-                    }
+                let has_elems = match owner_fi {
+                    Some(i) => interp
+                        .frames
+                        .get(i)
+                        .and_then(|f| f.vt.get(&base))
+                        .filter(|v| v.is_array())
+                        .and_then(|v| v.elements())
+                        .is_some_and(|t| t.order_entries().any(|(_, v)| v.has_value())),
+                    None => interp
+                        .var_arena
+                        .root()
+                        .get(&base)
+                        .filter(|v| v.is_array())
+                        .and_then(|v| v.elements())
+                        .is_some_and(|t| t.order_entries().any(|(_, v)| v.has_value())),
+                };
+                interp.is_array_semantic(array_name) || has_elems
             };
             #[cfg(feature = "regexp")]
             let regex_engine: Option<std::rc::Rc<super::regexp_cmds::CachedEngine>> =
@@ -657,48 +660,36 @@ pub fn cmd_array(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 return Err(usage("array", "unset", "arrayName ?pattern?"));
             }
             let (owner_fi, base) = interp.array_owner(array_name);
-            let prefix = format!("{}(", base);
             let pattern = if args.len() > 3 { Some(args[3].as_str()) } else { None };
-            // D1 步骤 1：枚举经 arena（插入序；release 镜像退场后唯一
-            // 真源）。逐元素 unset trace 的触发序随之 = 插入序（与旧映
-            // 射迭代序不同源——judge 语料钉形验证）。
-            let elements_to_remove: Vec<String> = match owner_fi {
-                // D1 步骤 2：帧域元素枚举走 vt（插入序——全局域 D1 步
-                // 骤 1 已同换；逐元素 unset trace 触发序 = 插入序，与旧
-                // 映射迭代序不同源——judge 语料钉形验证）。
-                Some(i) => interp.frames[i]
-                    .vt
-                    .order_entries()
-                    .filter(|(k, v)| {
-                        let k = k.as_ref();
-                        v.has_value()
-                            && k.starts_with(&prefix)
-                            && k.ends_with(')')
-                            && match pattern {
-                                Some(pat) => glob_match(pat, &k[prefix.len()..k.len() - 1]),
-                                None => true,
-                            }
-                    })
-                    .map(|(k, _)| {
-                        let k = k.as_ref();
-                        k[prefix.len()..k.len() - 1].to_string()
-                    })
-                    .collect(),
-                None => interp
-                    .var_arena
-                    .root()
-                    .order_entries()
-                    .filter(|(k, v)| {
-                        v.has_value()
-                            && k.as_ref().starts_with(&prefix)
-                            && k.as_ref().ends_with(')')
-                    })
-                    .filter(|(k, _)| match pattern {
-                        Some(pat) => glob_match(pat, &k.as_ref()[prefix.len()..k.as_ref().len() - 1]),
-                        None => true,
-                    })
-                    .map(|(k, _)| k.as_ref()[prefix.len()..k.as_ref().len() - 1].to_string())
-                    .collect(),
+            // D1 步骤 3：枚举经宿主 Var 的元素子表（插入序——逐元素
+            // unset trace 的触发序 = 插入序，与旧平键枚举序逐字同）。
+            let elements_to_remove: Vec<String> = {
+                let sub = match owner_fi {
+                    Some(i) => interp
+                        .frames
+                        .get(i)
+                        .and_then(|f| f.vt.get(&base))
+                        .filter(|v| v.is_array())
+                        .and_then(|v| v.elements()),
+                    None => interp
+                        .var_arena
+                        .root()
+                        .get(&base)
+                        .filter(|v| v.is_array())
+                        .and_then(|v| v.elements()),
+                };
+                match sub {
+                    Some(t) => t
+                        .order_entries()
+                        .filter(|(_, v)| v.has_value())
+                        .filter(|(k, _)| match pattern {
+                            Some(pat) => glob_match(pat, k.as_ref()),
+                            None => true,
+                        })
+                        .map(|(k, _)| k.as_ref().to_string())
+                        .collect(),
+                    None => Vec::new(),
+                }
             };
             if pattern.is_none() {
                 // tclsh：无 pattern 的 array unset = 整数组 unset——变量

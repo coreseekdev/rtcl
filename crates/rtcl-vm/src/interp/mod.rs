@@ -840,10 +840,13 @@ pub struct Interp {
     pub(crate) ns_unknown: HashMap<String, String>,
     /// Live `namespace ensemble`s keyed by registered command name.
     pub(crate) ensembles: HashMap<String, EnsembleDef>,
-    /// Live array searches keyed by the owning scope's stamp key.
-    pub(crate) array_searches: HashMap<String, ArraySearchList>,
-    /// Mutation counters per array (element-set changes invalidate searches).
-    pub(crate) array_stamps: HashMap<String, u64>,
+    /// Live array searches keyed by the owning array's host handle
+    /// (D1 步骤 3：搜索键 = 宿主 VarRef——TableId::Array(宿主句柄)，
+    /// 代数守卫使旧数组亡后的残留键不可达；帧宿主随帧出清).
+    pub(crate) array_searches: HashMap<vararena::VarRef, ArraySearchList>,
+    /// Mutation counters per array (element-set changes invalidate
+    /// searches); keyed by the host handle, same as the searches.
+    pub(crate) array_stamps: HashMap<vararena::VarRef, u64>,
     /// Container-generation counters per array, bumped on array-level
     /// create/destroy only (`array get` uses them to spot a callback that
     /// destroyed and recreated the array — snapshot elements then skip).
@@ -1832,6 +1835,16 @@ impl Interp {
     /// Element keys (`arr(k)`) ride the same log and are filtered from
     /// the :: replay; their relative order drives per-array replay.
     fn init_special_vars(&mut self) {
+        // --- 启动数组容器先行（D1 步骤 3）：元素表 = 宿主 Var 的子表
+        // ——元素写入前宿主必须已是数组（标记建无值 Var + 子表；基键
+        // 的值随后照旧落表——插入序红线不动：无值标记被下方基键
+        // global_insert 按「占位上值 = 新建序位」搬到落表位）。
+        self.global_mark_array("tcl_platform", Some(0));
+        #[cfg(feature = "env")]
+        self.global_mark_array("env", Some(0));
+        #[cfg(not(feature = "env"))]
+        self.global_mark_array("env", None);
+
         // --- $env array (mirror OS environment; environ order) ---
         // `vars_os`: `std::env::vars()` panics on a variable that is not
         // valid Unicode, which made `Interp::new()` abort the host (one
@@ -1872,26 +1885,24 @@ impl Interp {
             "tcl_platform(user)".to_string(),
             Value::from_str(&std::env::var("USER").unwrap_or_default()),
         );
-        // D1 步骤 1：两个启动数组的位/计数入 arena（global_mark_array
-        // ——只落位与计数，不进插入日志；基键落表仍在下方 global_insert，
-        // 启动插入序红线不动）。env 无 env 特性时无计数（与旧平表同形）。
+        // D1 步骤 1/3：两个启动数组的位/计数入 arena（global_mark_array
+        // ——对已标记宿主只更新计数）。元素已在上方入子表（D1 步骤 3
+        // ——元素形键经 global_insert 落宿主子表，平键域不再持有元素
+        // 键；`array names` 序 = 子表插入序的重放，与旧平键序逐字同）。
+        // env 无 env 特性时无计数（与旧平表同形）。
         {
-            // D1 步骤 1：元素计数经 arena 前缀扫描（release 镜像退场
-            // ——globals 平表 debug 域才有维护）。
             let n = self
                 .var_arena
                 .root()
-                .keys_with_prefix("tcl_platform(")
-                .len();
+                .get("tcl_platform")
+                .and_then(|v| v.elements())
+                .map(|t| t.len())
+                .unwrap_or(0);
             self.global_mark_array("tcl_platform", Some(n as u32));
         }
         #[cfg(feature = "env")]
         {
             self.global_mark_array("env", Some(env_elems as u32));
-        }
-        #[cfg(not(feature = "env"))]
-        {
-            self.global_mark_array("env", None);
         }
         self.arrays_env_only = true;
 

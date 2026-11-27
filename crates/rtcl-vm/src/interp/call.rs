@@ -859,8 +859,15 @@ impl Interp {
             // `array startsearch` iterations and mutation stamps belong to
             // the frame: a proc that returns without `donesearch` must not
             // leak them into the next call reusing this frame index.
-            self.array_searches.retain(|k, _| !k.starts_with(&fkey));
-            self.array_stamps.retain(|k, _| !k.starts_with(&fkey));
+            // D1 步骤 3：搜索/戳键 = 宿主 VarRef——帧宿主（Frame(idx)）
+            // 的条目随帧出清（旧 F{idx}: 前缀扫描的键形对应）；全局宿主
+            // 条目不受影响。
+            let dead = super::vararena::TableId::Frame(self.frames.len() as u32);
+            let frame_host = |k: &super::vararena::VarRef| {
+                matches!(&k.table, super::vararena::TableId::Array(h) if h.table == dead)
+            };
+            self.array_searches.retain(|k, _| !frame_host(k));
+            self.array_stamps.retain(|k, _| !frame_host(k));
         }
         self.current_namespace = prev_namespace;
         self.call_depth -= 1;
@@ -1698,8 +1705,13 @@ impl Interp {
             // `array startsearch` iterations and mutation stamps belong to
             // the frame: a proc that returns without `donesearch` must not
             // leak them into the next call reusing this frame index.
-            self.array_searches.retain(|k, _| !k.starts_with(&fkey));
-            self.array_stamps.retain(|k, _| !k.starts_with(&fkey));
+            // D1 步骤 3：搜索/戳键 = 宿主 VarRef——帧宿主随帧出清。
+            let dead = super::vararena::TableId::Frame(self.frames.len() as u32);
+            let frame_host = |k: &super::vararena::VarRef| {
+                matches!(&k.table, super::vararena::TableId::Array(h) if h.table == dead)
+            };
+            self.array_searches.retain(|k, _| !frame_host(k));
+            self.array_stamps.retain(|k, _| !frame_host(k));
         }
         self.current_namespace = prev_namespace;
     }

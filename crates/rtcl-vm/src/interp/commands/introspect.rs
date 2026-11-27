@@ -299,15 +299,28 @@ pub fn cmd_collect(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // Snapshot the roots first: the mark phase only needs clones, and
     // finalizers below must run without any borrow of the tables held.
     let mut work: Vec<Value> = Vec::new();
-    // D1 步骤 1：根快照读经 arena（values 枚举——顺序不承载语义）。
+    // D1 步骤 1/3：根快照读经 arena（values 枚举——顺序不承载语义）；
+    // 数组元素的值驻宿主 Var 的子表——元素值一并入根域（引用句柄可
+    // 藏在元素值里）。
     for value in interp.var_arena.root().values() {
         work.push(value.value.clone());
+        if let Some(sub) = value.elements() {
+            for ev in sub.values().filter(|v| v.has_value()) {
+                work.push(ev.value.clone());
+            }
+        }
     }
     for frame in &interp.frames {
-        // D1 步骤 2：帧名键面根快照走 vt（values 枚举——顺序不承载
-        // 语义；has_value 过滤与旧平表同域——旧 locals 无占位条目）。
+        // D1 步骤 2/3：帧名键面根快照走 vt（values 枚举——顺序不承载
+        // 语义；has_value 过滤与旧平表同域——旧 locals 无占位条目）；
+        // 帧数组元素的值经子表一并入根域。
         for value in frame.vt.values().filter(|v| v.has_value()) {
             work.push(value.value.clone());
+            if let Some(sub) = value.elements() {
+                for ev in sub.values().filter(|v| v.has_value()) {
+                    work.push(ev.value.clone());
+                }
+            }
         }
         for value in &frame.slots {
             if !value.is_unset() {

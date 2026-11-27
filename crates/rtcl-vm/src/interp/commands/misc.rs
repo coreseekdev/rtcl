@@ -2247,7 +2247,7 @@ pub fn cmd_append(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // element names outright).  Creation, non-string cells, links and
     // namespaces take the generic rebuild below — same reads, same
     // errors, same trace firing (none when no traces are registered).
-    if let Some((array_name, _)) = crate::interp::util::split_array_ref(var_name) {
+    if let Some((array_name, elem_index)) = crate::interp::util::split_array_ref(var_name) {
         if !crate::interp::util::has_ns_sep(var_name)
             && interp.var_traces.is_empty()
             && interp.dead_flat.iter().all(|k| k != array_name)
@@ -2255,54 +2255,86 @@ pub fn cmd_append(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             && interp.ns_transient.iter().all(|(k, _)| k != array_name)
         {
             let slot = if let Some(frame) = interp.var_frame_mut() {
-                // D1 步骤 2：数组基位/权威格走帧 vt 咽喉（改格 ⟺ Some
-                // ——rep 前置拒绝都在改格前；镜像重放 debug 并跑）。
-                if crate::interp::vars::frame_local_is_array(frame, array_name)
-                    && (frame.upvars.is_empty()
-                        || !frame.upvars.contains_key(array_name))
-                {
-                    let r = crate::interp::vars::frame_local_get_mut(frame, var_name)
-                        .map(|c| {
-                            let mut in_place = true;
-                            for arg in &args[2..] {
-                                if !c.append_str_in_place(arg.as_str()) {
-                                    in_place = false;
-                                    break;
+                // D1 步骤 3：宿主单探测（vt 位 + 子表格——T7 快径两跳；
+                // 改格 ⟺ Some——rep 前置拒绝都在改格前；镜像重放 debug
+                // 并跑）。
+                if frame.upvars.is_empty() || !frame.upvars.contains_key(array_name) {
+                    if let Some(host) = frame.vt.get_mut(array_name) {
+                        if host.is_array() {
+                            let r = host
+                                .elements
+                                .as_deref_mut()
+                                .and_then(|t| t.get_mut(elem_index))
+                                .filter(|v| v.has_value())
+                                .map(|c| {
+                                    let mut in_place = true;
+                                    for arg in &args[2..] {
+                                        if !c.value.append_str_in_place(arg.as_str()) {
+                                            in_place = false;
+                                            break;
+                                        }
+                                    }
+                                    in_place.then(|| c.value.clone())
+                                });
+                            #[cfg(debug_assertions)]
+                            if r.is_some() {
+                                if let Some(c) = frame.locals.get_mut(var_name) {
+                                    let mut in_place = true;
+                                    for arg in &args[2..] {
+                                        if !c.append_str_in_place(arg.as_str()) {
+                                            in_place = false;
+                                            break;
+                                        }
+                                    }
+                                    let _ = in_place;
                                 }
                             }
-                            in_place.then(|| c.clone())
-                        });
-                    #[cfg(debug_assertions)]
-                    if r.is_some() {
-                        if let Some(c) = frame.locals.get_mut(var_name) {
-                            let mut in_place = true;
-                            for arg in &args[2..] {
-                                if !c.append_str_in_place(arg.as_str()) {
-                                    in_place = false;
-                                    break;
-                                }
-                            }
-                            let _ = in_place;
+                            r
+                        } else {
+                            None
                         }
+                    } else {
+                        None
                     }
-                    r
                 } else {
                     None
                 }
-            } else if interp.current_namespace.as_ref() == "::"
-                && interp.global_is_array(array_name)
-            {
-                // D1 步骤 1：arena 权威格 + 镜像重放（global_cell）。
-                interp.global_cell(var_name, |c| {
-                    let mut in_place = true;
-                    for arg in &args[2..] {
-                        if !c.append_str_in_place(arg.as_str()) {
-                            in_place = false;
-                            break;
-                        }
+            } else if interp.current_namespace.as_ref() == "::" {
+                // D1 步骤 3：arena 权威子表格（宿主单探测）+ 镜像重放。
+                let r = {
+                    match interp.var_arena.root_mut().get_mut(array_name) {
+                        Some(host) if host.is_array() => host
+                            .elements
+                            .as_deref_mut()
+                            .and_then(|t| t.get_mut(elem_index))
+                            .filter(|v| v.has_value())
+                            .map(|c| {
+                                let mut in_place = true;
+                                for arg in &args[2..] {
+                                    if !c.value.append_str_in_place(arg.as_str()) {
+                                        in_place = false;
+                                        break;
+                                    }
+                                }
+                                in_place.then(|| c.value.clone())
+                            }),
+                        _ => None,
                     }
-                    in_place.then(|| c.clone())
-                })
+                };
+                #[cfg(debug_assertions)]
+                if r.is_some() {
+                    if let Some(c) = interp.globals.get_mut(var_name) {
+                        let mut in_place = true;
+                        for arg in &args[2..] {
+                            if !c.append_str_in_place(arg.as_str()) {
+                                in_place = false;
+                                break;
+                            }
+                        }
+                        let _ = in_place;
+                    }
+                }
+                r
             } else {
                 None
             };

@@ -4045,11 +4045,12 @@ extern "Rust" fn cmd_oo_copy(interp: &mut Interp, args: &[Value]) -> Result<Valu
     // Copy namespace variables.
     let src_prefix = format!("{}::", ns.trim_start_matches(':'));
     let dst_prefix = format!("{}::", new_ns.trim_start_matches(':'));
-    // D1 步骤 1：复制枚举经 arena（global_entries_with_prefix——镜像
+    // D1 步骤 1/3：复制枚举经 arena（global_entries_with_prefix——镜像
     // 值词在 release 下可滞后于原地覆写，值读必须走 arena）；枚举序 =
     // arena 插入序（与旧映射迭代序不同源——judge 语料钉形验证）。数
-    // 组位经 global_mark_array（flag-only——与旧「只插 array_globals
-    // 不落计数」逐字同）。
+    // 组位经 global_mark_array（flag-only），元素的值从源子表逐键复制
+    // （插入序 = 源子表序——与旧平键复制面的元素序逐字同；计数随复
+    // 制经元素写入的计数位点自然长成）。
     let moving: Vec<(String, Value)> = interp.global_entries_with_prefix(&src_prefix);
     for (k, v) in moving {
         let new_key = format!("{}{}", dst_prefix, &k[src_prefix.len()..]);
@@ -4057,6 +4058,21 @@ extern "Rust" fn cmd_oo_copy(interp: &mut Interp, args: &[Value]) -> Result<Valu
         interp.global_insert(new_key.clone(), v);
         if is_array {
             interp.global_mark_array(&new_key, None);
+            let elems: Vec<(String, Value)> = interp
+                .var_arena
+                .root()
+                .get(&k)
+                .and_then(|v| v.elements())
+                .map(|t| {
+                    t.order_entries()
+                        .filter(|(_, ev)| ev.has_value())
+                        .map(|(ek, ev)| (ek.as_ref().to_string(), ev.value.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (idx, ev) in elems {
+                interp.global_insert(format!("{new_key}({idx})"), ev);
+            }
         }
     }
 

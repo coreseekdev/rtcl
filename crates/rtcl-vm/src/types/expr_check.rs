@@ -192,9 +192,20 @@ pub fn check_expr(expr: &str) -> Result<(), String> {
         last_operand: false,
     };
     loop {
-        // Skip whitespace between lexemes.
-        while c.pos < c.e.len() && is_tcl_ws(c.e[c.pos]) {
-            c.pos += 1;
+        // Skip whitespace between lexemes, plus TIP582 comments: a `#`
+        // runs to end-of-line wherever a new lexeme may start
+        // (`expr {1 # + 2}` → 1, `expr {max# c\n(1,2)}` → 2).
+        loop {
+            while c.pos < c.e.len() && is_tcl_ws(c.e[c.pos]) {
+                c.pos += 1;
+            }
+            if c.pos < c.e.len() && c.e[c.pos] == b'#' {
+                while c.pos < c.e.len() && c.e[c.pos] != b'\n' {
+                    c.pos += 1;
+                }
+                continue;
+            }
+            break;
         }
         let (lex0, scanned, start) = match c.scan_lexeme() {
             Ok(v) => v,
@@ -478,8 +489,19 @@ impl<'a> Checker<'a> {
     fn resolve_bareword(&self, start: usize, scanned: usize) -> BarewordResolve {
         let word = self.slice(start, start + scanned);
         let mut j = start + scanned;
-        while j < self.e.len() && is_tcl_ws(self.e[j]) {
-            j += 1;
+        // Function-name lookahead crosses whitespace AND TIP582 comments
+        // (`expr {max# comment\n(1,2)}` is a call).
+        loop {
+            while j < self.e.len() && is_tcl_ws(self.e[j]) {
+                j += 1;
+            }
+            if j < self.e.len() && self.e[j] == b'#' {
+                while j < self.e.len() && self.e[j] != b'\n' {
+                    j += 1;
+                }
+                continue;
+            }
+            break;
         }
         if j < self.e.len() && self.e[j] == b'(' {
             return BarewordResolve::Function;
@@ -863,6 +885,18 @@ fn scan_variable(e: &[u8], dollar: usize) -> Result<usize, ScanErr> {
                 b'$' => {
                     let end = scan_nested(e, i, scan_variable)?;
                     i = end;
+                }
+                // 9.1 index grammar（tclParse.c TYPE_BAD_ARRAY_INDEX =
+                // OPEN_PAREN | CLOSE_PAREN | QUOTE | BRACE）：未引号下标
+                // 文本里的 ( " { } 直接报 invalid character in array
+                // index（parseExpr-21.44 的 `"foo$bar(abc…"` 钉形），
+                // blame 前括号、scanned 含非法字符本身。
+                b'(' | b'"' | b'{' | b'}' => {
+                    return Err((
+                        "invalid character in array index".to_string(),
+                        open_paren,
+                        i - open_paren + 1,
+                    ));
                 }
                 _ => i += 1,
             }

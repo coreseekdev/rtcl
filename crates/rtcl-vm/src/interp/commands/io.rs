@@ -1634,7 +1634,7 @@ fn fmt_double_value(interp: &mut Interp, v: &Value) -> Result<f64> {
         Some(f) => Ok(f),
         None => {
             super::list::set_error_code(interp, "TCL VALUE NUMBER");
-            let msg = format!("expected floating-point number but got \"{}\"", v.as_str());
+            let msg = crate::value::value_report("floating-point number", v.as_str());
             Err(Error::ControlFlow {
                 kind: crate::error::ControlFlow::Error,
                 value: Some(Value::from_str(&msg)),
@@ -1725,26 +1725,60 @@ fn parse_tcl_int_ext(s: &str) -> Option<(bool, u128)> {
     Some((scan.neg, mag))
 }
 
-/// Format an integer conversion (`l` size) whose magnitude does not fit in
-/// i64: tclsh renders the bignum decimal directly.  Sign/flag handling
-/// mirrors `format_int`.
-fn format_bignum_int(neg: bool, mag: u128, plus: bool, space: bool) -> String {
-    let mut s = mag.to_string();
-    if neg {
-        s.insert(0, '-');
-    } else if plus {
-        s.insert(0, '+');
-    } else if space {
-        s.insert(0, ' ');
-    }
-    s
-}
-
 /// Result of the wide (`l`-size) integer parse: an in-range value renders
 /// exactly like the 64-bit path; a bignum renders from its magnitude.
 enum BigOrLit {
     Lit(i64),
     Big(bool, u128),
+}
+
+/// format 转换的 size 修饰符宽度档（9.1：无修饰符截 32 位，`ll`/`L`
+/// 全精度 bignum）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FmtSize {
+    None,
+    H,
+    L64,
+    Wide,
+}
+
+/// 组装一个整数转换域：符号 + 可选进制前缀（`#` 旗标；值为零时 tclsh
+/// 不加前缀——`%#x` 0 → `0`，`%p` 除外（恒带 0x））+ 按精度补零的数字
+/// 串。返回（域, 符号+前缀的字节数），供零填充把 0 插在前缀之后
+/// （`%#020d` 6 → `0d000000000000000006` 钉形）。
+fn int_field(
+    sign: &str,
+    prefix: &'static str,
+    hash: bool,
+    zero_val: bool,
+    mag: &str,
+    precision: Option<usize>,
+) -> (String, usize) {
+    let mut m = mag.to_string();
+    if let Some(p) = precision {
+        if m.len() < p {
+            let mut s = String::with_capacity(p);
+            for _ in 0..p - m.len() {
+                s.push('0');
+            }
+            s.push_str(&m);
+            m = s;
+        }
+    }
+    let pfx = if hash && !zero_val { prefix } else { "" };
+    let field = format!("{}{}{}", sign, pfx, m);
+    (field, sign.len() + pfx.len())
+}
+
+/// 无符号整数的进制串（x/X/o/b；u128 覆盖 i64/u64/u16/u32 与 bignum
+/// 幅度四档，Rust 原生支持 u128 的 {:x}/{:X}/{:o}/{:b}）。
+fn fmt_base(v: u128, ch: char) -> String {
+    match ch {
+        'x' => format!("{:x}", v),
+        'X' => format!("{:X}", v),
+        'o' => format!("{:o}", v),
+        _ => format!("{:b}", v),
+    }
 }
 
 /// Parse for `l`-size conversions: values that fit i64 render identically
@@ -1808,7 +1842,7 @@ pub fn cmd_format(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             match parse_tcl_int_strict($arg.as_str()) {
                 Some(v) => v,
                 None => {
-                    let msg = format!("expected integer but got \"{}\"", $arg.as_str());
+                    let msg = crate::value::value_report("integer", $arg.as_str());
                     return fmt_err!(msg, "TCL VALUE NUMBER");
                 }
             }
@@ -1819,7 +1853,7 @@ pub fn cmd_format(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             match parse_tcl_int_l($arg.as_str()) {
                 Some(v) => v,
                 None => {
-                    let msg = format!("expected integer but got \"{}\"", $arg.as_str());
+                    let msg = crate::value::value_report("integer", $arg.as_str());
                     return fmt_err!(msg, "TCL VALUE NUMBER");
                 }
             }
@@ -1830,8 +1864,11 @@ pub fn cmd_format(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             match parse_tcl_int_strict($arg.as_str()) {
                 Some(v) => v,
                 None => {
-                    let msg = format!("expected integer but got \"{}\"", $arg.as_str());
-                    return fmt_err!(msg, "TCL VALUE INTEGER");
+                    // 9.1：* 宽度/精度的实参错误码同 VALUE NUMBER
+                    // （`catch {format %*d x 3}` → TCL VALUE NUMBER，
+                    // oracle 实测；format_grammarG 钉形）。
+                    let msg = crate::value::value_report("integer", $arg.as_str());
+                    return fmt_err!(msg, "TCL VALUE NUMBER");
                 }
             }
         };
@@ -2001,19 +2038,37 @@ pub fn cmd_format(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
         }
 
-        // Size modifiers: one 'h' or a run of 'l's; anything further is
-        // treated as the conversion character.
-        let mut size_h = false;
-        let mut size_l = false;
-        if pos < len && bytes[pos] == b'l' {
-            while pos < len && bytes[pos] == b'l' {
-                pos += 1;
+        // Size modifiers, Tcl 9 口径：无修饰符 → 一律截 32 位；'h' →
+        // 16 位；单个 'l'（或 q/j/z/t = 64 位类型别名）→ 64 位；
+        // 'll'/'L' → 全精度 bignum（`%llb` 2**100 全位输出）。
+        // 后跟的第二个 'h' 落到转换字符位 → bad field specifier "h"。
+        let size = if pos < len {
+            match bytes[pos] {
+                b'l' => {
+                    let mut cnt = 0usize;
+                    while pos < len && bytes[pos] == b'l' {
+                        pos += 1;
+                        cnt += 1;
+                    }
+                    if cnt == 1 { FmtSize::L64 } else { FmtSize::Wide }
+                }
+                b'L' => {
+                    pos += 1;
+                    FmtSize::Wide
+                }
+                b'q' | b'j' | b'z' | b't' => {
+                    pos += 1;
+                    FmtSize::L64
+                }
+                b'h' => {
+                    pos += 1;
+                    FmtSize::H
+                }
+                _ => FmtSize::None,
             }
-            size_l = true;
-        } else if pos < len && bytes[pos] == b'h' {
-            size_h = true;
-            pos += 1;
-        }
+        } else {
+            FmtSize::None
+        };
 
         // Conversion character.
         if pos >= len {
@@ -2043,8 +2098,8 @@ pub fn cmd_format(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 if !matches!(
                     ch,
-                    'd' | 'i' | 'u' | 'b' | 'o' | 'x' | 'X' | 'c' | 's' | 'e' | 'E' | 'f'
-                        | 'g' | 'G'
+                    'd' | 'i' | 'u' | 'b' | 'o' | 'x' | 'X' | 'p' | 'c' | 's'
+                        | 'e' | 'E' | 'f' | 'g' | 'G'
                 ) {
                     let msg = format!("bad field specifier \"{}\"", ch);
                     return fmt_err!(msg, "TCL FORMAT BADTYPE");
@@ -2081,8 +2136,8 @@ pub fn cmd_format(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 }
                 if !matches!(
                     ch,
-                    'd' | 'i' | 'u' | 'b' | 'o' | 'x' | 'X' | 'c' | 's' | 'e' | 'E' | 'f'
-                        | 'g' | 'G'
+                    'd' | 'i' | 'u' | 'b' | 'o' | 'x' | 'X' | 'p' | 'c' | 's'
+                        | 'e' | 'E' | 'f' | 'g' | 'G'
                 ) {
                     let msg = format!("bad field specifier \"{}\"", ch);
                     return fmt_err!(msg, "TCL FORMAT BADTYPE");
@@ -2117,93 +2172,123 @@ pub fn cmd_format(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             }
         }
 
+        // 整数域的「符号+进制前缀」字节数：零填充必须插在前缀之后
+        // （tclsh `%#020d` 6 → `0d000000000000000006`）。非整数转换恒 0。
+        let mut int_head = 0usize;
         let formatted = match ch {
             's' => match precision {
                 Some(p) => arg.as_str().chars().take(p).collect::<String>(),
                 None => arg.as_str().to_string(),
             },
             'd' | 'i' => {
-                if size_l {
-                    match int_l_arg!(arg) {
-                        BigOrLit::Lit(v) => {
-                            format_int(v, 10, false, flag_plus, flag_space, flag_hash)
+                let (neg, mag) = match size {
+                    FmtSize::Wide => match int_l_arg!(arg) {
+                        BigOrLit::Lit(v) => (v < 0, v.unsigned_abs().to_string()),
+                        BigOrLit::Big(neg, mag) => (neg, mag.to_string()),
+                    },
+                    _ => {
+                        let mut v = int_arg!(arg);
+                        match size {
+                            FmtSize::H => v = (v as i16) as i64,
+                            FmtSize::None => v = (v as i32) as i64,
+                            _ => {}
                         }
-                        BigOrLit::Big(neg, mag) => {
-                            format_bignum_int(neg, mag, flag_plus, flag_space)
-                        }
+                        (v < 0, v.unsigned_abs().to_string())
                     }
+                };
+                let sign = if neg {
+                    "-"
+                } else if flag_plus {
+                    "+"
+                } else if flag_space {
+                    " "
                 } else {
-                    let mut v = int_arg!(arg);
-                    if size_h {
-                        v = (v as i16) as i64;
-                    }
-                    format_int(v, 10, false, flag_plus, flag_space, flag_hash)
-                }
+                    ""
+                };
+                let (f, head) = int_field(
+                    sign,
+                    "0d",
+                    flag_hash,
+                    !neg && mag == "0",
+                    &mag,
+                    precision,
+                );
+                int_head = head;
+                f
             }
             'u' => {
-                if size_l {
-                    match int_l_arg!(arg) {
+                let mag = match size {
+                    FmtSize::Wide => match int_l_arg!(arg) {
+                        BigOrLit::Lit(v) if v < 0 => {
+                            return fmt_err!(
+                                "unsigned bignum format is invalid",
+                                "TCL FORMAT BADUNSIGNED"
+                            );
+                        }
                         BigOrLit::Lit(v) => (v as u64).to_string(),
+                        BigOrLit::Big(true, _) => {
+                            return fmt_err!(
+                                "unsigned bignum format is invalid",
+                                "TCL FORMAT BADUNSIGNED"
+                            );
+                        }
                         BigOrLit::Big(false, mag) => mag.to_string(),
-                        BigOrLit::Big(true, mag) => format!("-{}", mag),
+                    },
+                    _ => {
+                        let v = int_arg!(arg);
+                        let uv: u64 = match size {
+                            FmtSize::H => (v as u16) as u64,
+                            FmtSize::L64 => v as u64,
+                            _ => (v as u32) as u64,
+                        };
+                        uv.to_string()
                     }
-                } else {
-                    let v = int_arg!(arg);
-                    let v = if size_h { (v as u16) as u64 } else { v as u64 };
-                    v.to_string()
-                }
-            }
-            'x' => {
-                let s = if size_l {
-                    match int_l_arg!(arg) {
-                        BigOrLit::Lit(v) => format!("{:x}", v),
-                        BigOrLit::Big(false, mag) => format!("{:x}", mag),
-                        BigOrLit::Big(true, mag) => format!("-{:x}", mag),
-                    }
-                } else {
-                    let v = int_arg!(arg);
-                    if size_h { format!("{:x}", v as u16) } else { format!("{:x}", v) }
                 };
-                if flag_hash { format!("0x{}", s) } else { s }
+                let (f, head) = int_field("", "", false, false, &mag, precision);
+                int_head = head;
+                f
             }
-            'X' => {
-                let s = if size_l {
-                    match int_l_arg!(arg) {
-                        BigOrLit::Lit(v) => format!("{:X}", v),
-                        BigOrLit::Big(false, mag) => format!("{:X}", mag),
-                        BigOrLit::Big(true, mag) => format!("-{:X}", mag),
+            'x' | 'X' | 'o' | 'b' => {
+                let (neg, mag, zero) = match size {
+                    FmtSize::Wide => match int_l_arg!(arg) {
+                        BigOrLit::Lit(v) => {
+                            (v < 0, fmt_base(v.unsigned_abs() as u128, ch), v == 0)
+                        }
+                        BigOrLit::Big(neg, m) => (neg, fmt_base(m, ch), !neg && m == 0),
+                    },
+                    _ => {
+                        let v = int_arg!(arg);
+                        let uv: u64 = match size {
+                            FmtSize::H => (v as u16) as u64,
+                            FmtSize::L64 => v as u64,
+                            _ => (v as u32) as u64,
+                        };
+                        (false, fmt_base(uv as u128, ch), uv == 0)
                     }
+                };
+                let sign = if neg { "-" } else { "" };
+                let prefix = match ch {
+                    'x' | 'X' => "0x",
+                    'o' => "0o",
+                    _ => "0b",
+                };
+                let (f, head) = int_field(sign, prefix, flag_hash, zero, &mag, precision);
+                int_head = head;
+                f
+            }
+            'p' => {
+                // %p = 64 位无指针宽度的 `%#x`：恒带 0x 前缀（零值也是
+                // `0x0`），+/空格/# 旗标与 h 修饰符之外的 size 无效；
+                // `h` 修饰的 %p 在 tclsh 9.1 恒渲染 `0x0`（实测钉形）。
+                let s = if size == FmtSize::H {
+                    "0".to_string()
                 } else {
                     let v = int_arg!(arg);
-                    if size_h { format!("{:X}", v as u16) } else { format!("{:X}", v) }
+                    fmt_base((v as u64) as u128, 'x')
                 };
-                if flag_hash { format!("0X{}", s) } else { s }
-            }
-            'o' => {
-                let s = if size_l {
-                    match int_l_arg!(arg) {
-                        BigOrLit::Lit(v) => format!("{:o}", v),
-                        BigOrLit::Big(false, mag) => format!("{:o}", mag),
-                        BigOrLit::Big(true, mag) => format!("-{:o}", mag),
-                    }
-                } else {
-                    let v = int_arg!(arg);
-                    if size_h { format!("{:o}", v as u16) } else { format!("{:o}", v) }
-                };
-                if flag_hash && !s.starts_with('0') { format!("0{}", s) } else { s }
-            }
-            'b' => {
-                let s = if size_l {
-                    match int_l_arg!(arg) {
-                        BigOrLit::Lit(v) => format!("{:b}", v),
-                        BigOrLit::Big(false, mag) => format!("{:b}", mag),
-                        BigOrLit::Big(true, mag) => format!("-{:b}", mag),
-                    }
-                } else {
-                    let v = int_arg!(arg);
-                    if size_h { format!("{:b}", v as u16) } else { format!("{:b}", v) }
-                };
-                if flag_hash { format!("0b{}", s) } else { s }
+                let (f, head) = int_field("", "0x", true, false, &s, precision);
+                int_head = head;
+                f
             }
             'c' => {
                 // 9.1 钉形（oracle 实测，utf-20.1）：Tcl_UniChar 已 32 位，
@@ -2283,7 +2368,10 @@ pub fn cmd_format(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         // ignored), strings/chars zero-fill left when '-' is present
         // (right otherwise), and floats zero-fill right unless '-' is
         // given (then left-justify with spaces). Without '0' or for
-        // infinity results the fill is spaces.
+        // infinity results the fill is spaces.  整数转换带精度时 '0'
+        // 旗标失效（C99，tclsh `%08.3llx` 5 → `     005` 空格垫）。
+        let is_int = matches!(ch, 'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'b' | 'p');
+        let flag_zero = flag_zero && !(is_int && precision.is_some());
         let w = width.unwrap_or(0);
         let disp = formatted.chars().count();
         if w > disp {
@@ -2298,6 +2386,15 @@ pub fn cmd_format(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     for _ in 0..pad {
                         result.push('0');
                     }
+                } else if int_head > 0 {
+                    // 符号+进制前缀在最前，零填其后再接数字
+                    // （`%#020d` 6 → `0d000000000000000006`）。
+                    let (head, rest) = formatted.split_at(int_head);
+                    result.push_str(head);
+                    for _ in 0..pad {
+                        result.push('0');
+                    }
+                    result.push_str(rest);
                 } else if formatted.starts_with('-')
                     || formatted.starts_with('+')
                     || formatted.starts_with(' ')
@@ -2330,16 +2427,6 @@ pub fn cmd_format(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
     }
     Ok(Value::from_str(&result))
-}
-
-fn format_int(v: i64, _base: u32, _upper: bool, plus: bool, space: bool, _hash: bool) -> String {
-    if v >= 0 {
-        if plus { format!("+{}", v) }
-        else if space { format!(" {}", v) }
-        else { v.to_string() }
-    } else {
-        v.to_string()
-    }
 }
 
 fn apply_sign(v: f64, abs_str: &str, plus: bool, space: bool) -> String {

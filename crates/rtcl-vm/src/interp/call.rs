@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use super::PrelinkEntry;
 
-use super::{CallFrame, Interp, ProcDef, UpvarMap, VarMap, VarSet};
+use super::{CallFrame, Interp, ProcDef, UpvarMap};
 use super::util::rfind_ns_sep;
 use crate::error::{Error, Result};
 use crate::value::Value;
@@ -129,11 +129,8 @@ impl Interp {
             None => Box::new(CallFrame {
                 // D1 步骤 2：帧变量表（TableId::Frame(帧栈下标) 身份）。
                 vt: super::vararena::VarTable::new_frame(self.frames.len() as u32),
-                locals: VarMap::default(),
                 locals_order: Vec::new(),
-                array_locals: VarSet::default(),
                 consts: None,
-                elem_counts: VarMap::default(),
                 upvars: UpvarMap::default(),
                 ns: None,
                 call_ns: None,
@@ -1316,11 +1313,8 @@ impl Interp {
             None => Box::new(CallFrame {
                 // D1 步骤 2：帧变量表（TableId::Frame(帧栈下标) 身份）。
                 vt: super::vararena::VarTable::new_frame(self.frames.len() as u32),
-                locals: VarMap::default(),
                 locals_order: Vec::new(),
-                array_locals: VarSet::default(),
                 consts: None,
-                elem_counts: VarMap::default(),
                 upvars: UpvarMap::default(),
                 ns: None,
                 call_ns: None,

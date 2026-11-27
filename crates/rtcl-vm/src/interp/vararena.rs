@@ -175,13 +175,6 @@ impl TraceSet {
         self.var.is_empty() && self.elem.is_empty()
     }
 
-    /// 注册记录总数（整变量 + 全部元素族）——快照火的调用侧对账用
-    /// （快径守卫真源是 `Interp::n_trace_hosts` 的宿主在席计数）。
-    #[inline]
-    pub(crate) fn record_count(&self) -> usize {
-        self.var.len() + self.elem.iter().map(|(_, v)| v.len()).sum::<usize>()
-    }
-
     /// 整变量族追加（注册；键在册位随之置位——lingering）。
     pub(crate) fn push_var(&mut self, t: super::VarTrace) {
         self.var.push(t);
@@ -373,7 +366,9 @@ impl Var {
         self.elements.as_deref()
     }
 
+    /// （测试面：子表句柄断言用。）
     #[inline]
+    #[cfg(test)]
     pub(crate) fn elements_mut(&mut self) -> Option<&mut VarTable> {
         self.elements.as_deref_mut()
     }

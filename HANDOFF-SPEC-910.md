@@ -488,11 +488,11 @@ doc/*.n 章节）。
     出的类 new 返回唯一实例、create 报错；
   - `next_obj_id = 19`，首个用户对象为 `::oo::Obj20`；
   - 新增单测 `test_oo_9_1_bootstrap_objects`，原 Obj15 断言改 Obj20。
-- 验证：`cargo test -p rtcl-vm --lib` 889 passed；单测覆盖
+- 验证：`cargo test -p rtcl-vm --lib` 890 passed；单测覆盖
   Obj11-19、类层次、Slot 11 实例、abstract/singleton、classvariable、
   property 种类/configure/自定义访问器、超大 lseq 惰性序列
-  （llength/lindex/lrange/foreach/lmap/lfilter/lreverse/lassign + VM
-  内联路径）。
+  （llength/lindex/lrange/lsearch/foreach/lmap/lfilter/lreverse/lassign
+  + VM 内联路径）。
 - judge：`95 pass / 0 fail`（原 `gen/gen_lseq` lseq-4.11 已修：Value
   增加惰性 arithmetic series rep，lindex/llength 不再物化 2^31-1 元素）。
 - `classvariable`：`::oo::Helpers::classvariable` + 每对象隐藏命令入

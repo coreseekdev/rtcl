@@ -4745,6 +4745,37 @@ p 1";
     }
 
     #[test]
+    fn test_f5_big_script_compiles_per_request() {
+        // D3 F5：超 parse-cache 门（默认 1MiB）的顶层 eval 按请求编译
+        // 执行——不再落树；按请求单元不进 parse_cache/bytecode_cache。
+        let mut interp = Interp::new();
+        let mut big = String::from("set acc {}\n");
+        let line = "lappend acc [expr {2 ** 3}]\n";
+        while big.len() <= 1_048_576 {
+            big.push_str(line);
+        }
+        big.push_str("llength $acc");
+        let big_len = big.len();
+        assert!(big_len > 1_048_576);
+        let r = interp.eval(&big).unwrap();
+        // 列表项数 = lappend 行数——结果正确即全单元执行完毕。
+        let n = big.matches(line).count();
+        assert_eq!(r.as_str(), n.to_string());
+        // 按请求单元不缓存（F5 门绕过键/存入）。
+        assert!(
+            !interp.parse_cache.contains_key(big.as_str()),
+            "big text must not enter parse_cache"
+        );
+        assert!(
+            !interp.bytecode_cache.contains_key(big.as_str()),
+            "big text must not enter bytecode_cache"
+        );
+        // 错误路径的字节一致形（>1MiB errorInfo 与小单元逐字节一致）由
+        // judge/audit-cases/f5-bigscript.sh 在 CLI 层验证（error_report
+        // 的文件语境帧归属），进程内不重复。
+    }
+
+    #[test]
     fn test_slot_statics_stay_name_keyed() {
         assert_both(
             "proc p {} { set c 5; return $c }; p",

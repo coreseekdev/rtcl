@@ -23,11 +23,12 @@ pub(crate) fn tcl_log_excerpt(text: &str) -> String {
     }
 }
 
-/// 大单元回落门（TREE-FALLBACK F5，码表第二步后的唯一回落门）：
-/// 超过该长度的顶层 eval 不走 parse-cache/bytecode 快路径。默认 1MiB
-/// （256KB 旧值是 C55 的触发门）；env `RTCL_PARSE_CACHE_MAX_SCRIPT`
-/// 显式字节值优先（OnceLock 一次读——进程内 env 语义不变，同
-/// RTCL_NO_BYTECODE 口径）。
+/// 大单元直编译门（TREE-FALLBACK F5）：超过该长度的顶层 eval 不走
+/// parse-cache/bytecode **缓存**快路径，改为按请求编译执行（F5 后
+/// 不再落树；D3 前这里就是大单元的落树点）。默认 1MiB（256KB 旧值
+/// 是 C55 的触发门）；env `RTCL_PARSE_CACHE_MAX_SCRIPT` 显式字节值
+/// 优先（OnceLock 一次读——进程内 env 语义不变，同 RTCL_NO_BYTECODE
+/// 口径）。
 fn parse_cache_max_script() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -191,10 +192,11 @@ impl Interp {
         // Entries are bounded: wasm32 is a target and one-shot scripts
         // (source files, trace callbacks) must not grow it unboundedly.
         const PARSE_CACHE_MAX: usize = 1024;
-        // D2 第二步：大单元回落门（F5）从 256KB 提到 1MiB（256KB 是
-        // C55 的触发门：big-unit 12000-loop ≈ 528KB 单元整段落树），
-        // env `RTCL_PARSE_CACHE_MAX_SCRIPT` 可配（字节）。F1 的 u16 操
-        // 作数上限已由宽操作数关闭，这是唯一的回落门。
+        // D2 第二步：大单元门（F5）从 256KB 提到 1MiB（256KB 是 C55 的
+        // 触发门：big-unit 12000-loop ≈ 528KB 单元整段落树），env
+        // `RTCL_PARSE_CACHE_MAX_SCRIPT` 可配（字节）。F1 的 u16 操作数
+        // 上限已由宽操作数关闭；F5 落地后超门单元按请求编译，这里只剩
+        // 「是否进缓存」的语义。
         let parse_cache_max_script = parse_cache_max_script();
         let cached = self.parse_cache.get(script).cloned();
         let unit = match cached {
@@ -308,8 +310,27 @@ impl Interp {
                 return r;
             }
         }
+        // F5：大单元直接编译入口——超 parse-cache 门的顶层 eval 不再落
+        // 树：按请求编译（同一形状决策 + 当前遮蔽面 + 当前 epoch 戳），
+        // **绕过 parse-cache 键/存入**（不进 parse_cache/bytecode_cache/
+        // const_pool——单次执行的大单元缓存即驻留税），执行后即弃。其余
+        // 门照旧：fallback 白名单外 / trace / 手动关断仍落树（tf_big）。
+        if script.len() > parse_cache_max_script {
+            if super::vm_exec::bytecode_applicable(self) {
+                let code = Self::compile_eval_unit(self, &unit.source, &unit.commands);
+                if !code.fallback {
+                    let r = super::vm_exec::exec_bytecode(self, &Rc::new(code));
+                    self.lexical_body = saved_lexical;
+                    self.in_locals_unit = saved_inl;
+                    self.in_file_script = saved_file_ctx;
+                    return r;
+                }
+            }
+            crate::interp::dbgtrace::event("tf_big", "");
+        }
         // 树遍历回落点（诊断写点）：走到这里 = 门未过——fallback /
-        // trace / 手动关断，或超 parse-cache 门（F5 前的大单元落树点）。
+        // trace / 手动关断（小单元），或大单元按请求编译拒绝（tf_big
+        // 已盖）。常规全字节码面（F3/F5/F6 落地后）零事件。
         crate::interp::dbgtrace::event("tf_eval", "");
         let r = self.eval_commands(&unit);
         self.lexical_body = saved_lexical;
@@ -335,10 +356,11 @@ impl Interp {
         let saved_file_ctx = self.in_file_script;
         self.in_file_script = false;
         const PARSE_CACHE_MAX: usize = 1024;
-        // D2 第二步：大单元回落门（F5）从 256KB 提到 1MiB（256KB 是
-        // C55 的触发门：big-unit 12000-loop ≈ 528KB 单元整段落树），
-        // env `RTCL_PARSE_CACHE_MAX_SCRIPT` 可配（字节）。F1 的 u16 操
-        // 作数上限已由宽操作数关闭，这是唯一的回落门。
+        // D2 第二步：大单元门（F5）从 256KB 提到 1MiB（256KB 是 C55 的
+        // 触发门：big-unit 12000-loop ≈ 528KB 单元整段落树），env
+        // `RTCL_PARSE_CACHE_MAX_SCRIPT` 可配（字节）。F1 的 u16 操作数
+        // 上限已由宽操作数关闭；F5 落地后超门单元按请求编译，这里只剩
+        // 「是否进缓存」的语义。
         let parse_cache_max_script = parse_cache_max_script();
         let cached = self.parse_cache.get(script).cloned();
         let unit = match cached {

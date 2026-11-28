@@ -1,0 +1,723 @@
+-- allium: 3
+-- string-extra.allium
+-- Behaviour spec: the remainder of the Tcl 9.1 `string` ensemble —
+-- subcommands and option faces not already pinned in string.allium.
+-- Oracle: tclsh 9.1.0 (core-9-1-0).
+--
+-- Scope: cat compare equal first index insert is last length map match
+-- range repeat replace reverse tolower totitle toupper trim trimleft
+-- trimright wordend wordstart, covering -nocase/-length/-strict/
+-- -failindex, negative and out-of-range indices, empty inputs, Unicode
+-- code-point indexing, and every `string is` class.
+-- Faces already pinned by string.allium (not repeated here): index
+-- offset terms and bad-index text, first/last -1, repeat -1, totitle
+-- whole-string, boolean abbreviations, 9.1 integer literals, the dict/
+-- digit/wideinteger probes, ambiguous-class menu, 64-bit indices.
+--
+-- All values below were measured on the oracle on 2026-11-28.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── cat ─────────────────────────────────────────────────────────
+
+-- cat concatenates every argument; with no arguments the result is empty.
+rule Str2CatConcatenatesAllArguments {
+    when: Evaluates("list [string cat] [string cat a] [string cat a b c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} a abc"
+}
+
+-- No separator is inserted and empty arguments contribute nothing.
+rule Str2CatJoinsWithoutSeparator {
+    when: Evaluates("list [string cat {a b} {c d}] [string cat a {} b]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a bc d} ab"
+}
+
+-- cat accepts no options: option-looking words are ordinary arguments.
+rule Str2CatTakesNoOptions {
+    when: Evaluates("list [string cat -x] [string cat -nocase]")
+    ensures: completion.code = ok
+    ensures: completion.value = "-x -nocase"
+}
+
+-- ── compare / equal ───────────────────────────────────────────
+
+-- compare returns -1, 0 or 1 by lexicographic order.
+rule Str2CompareReturnsSign {
+    when: Evaluates("list [string compare abc abd] [string compare abd abc] [string compare abc abc]")
+    ensures: completion.code = ok
+    ensures: completion.value = "-1 1 0"
+}
+
+-- -nocase folds case (including non-ASCII) before comparing.
+rule Str2CompareNocaseFoldsCase {
+    when: Evaluates("list [string compare -nocase ABC abc] [string compare ABC abc] [string compare -nocase É é]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 -1 0"
+}
+
+-- -length limits the compared prefix; a negative length is ignored.
+rule Str2CompareLengthTruncates {
+    when: Evaluates("list [string compare -length 2 abX abY] [string compare -length -1 abc abd] [string compare -length 0 abc xyz]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 -1 0"
+}
+
+-- A proper prefix sorts before the longer string.
+rule Str2CompareShorterPrefixSortsFirst {
+    when: Evaluates("list [string compare ab abc] [string compare abc ab] [string compare -length 10 abc abcdef]")
+    ensures: completion.code = ok
+    ensures: completion.value = "-1 1 -1"
+}
+
+-- bad option "-bogus": must be -nocase or -length
+rule Str2CompareBadOptionMenu {
+    when: Evaluates("catch {string compare -bogus a b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"-bogus\": must be -nocase or -length"
+}
+
+-- equal composes -nocase with -length; the prefix must match exactly.
+rule Str2EqualNocaseAndLength {
+    when: Evaluates("list [string equal -nocase ABC abc] [string equal -nocase -length 2 ABx aby] [string equal -length 2 abc axc]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 0"
+}
+
+-- A negative -length is ignored, so the whole strings are compared.
+rule Str2EqualNegativeLengthIgnored {
+    when: Evaluates("list [string equal -length -5 abc abc] [string equal -length -5 abc abd]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+}
+
+-- Two empty strings are equal; an empty string is never equal to a non-empty one.
+rule Str2EqualEmptyStrings {
+    when: Evaluates("list [string equal {} {}] [string equal {} a] [string equal -nocase YES yes]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 1"
+}
+
+-- -length larger than either string falls back to full comparison.
+rule Str2EqualLengthBeyondShorter {
+    when: Evaluates("list [string equal -length 10 abc abc] [string equal -length 10 abc abcdef] [string equal -length 0 abc xyz]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 1"
+}
+
+-- ── first / last ─────────────────────────────────────────────
+
+-- Start index restricts where a match may begin (doc/string.n example).
+rule Str2FirstStartIndexConstrains {
+    when: Evaluates("list [string first a 0a23456789abcdef 5] [string first a 0123456789abcdef 11]")
+    ensures: completion.code = ok
+    ensures: completion.value = "10 -1"
+}
+
+-- The empty needle never matches, not even in the empty haystack.
+rule Str2FirstEmptyNeedleNeverMatches {
+    when: Evaluates("list [string first {} abc] [string first {} abc 2] [string first {} {}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "-1 -1 -1"
+}
+
+-- A negative start clamps to 0; a start past the end yields -1; end is accepted.
+rule Str2FirstClampsNegativeStart {
+    when: Evaluates("list [string first a abc -5] [string first b abc 99] [string first bc abcabc 2] [string first a aaaa end]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 -1 4 3"
+}
+
+-- last index bounds the haystack prefix that may contain the match (doc example).
+rule Str2LastIndexBoundsSearch {
+    when: Evaluates("list [string last a 0a23456789abcdef 15] [string last a 0a23456789abcdef 9]")
+    ensures: completion.code = ok
+    ensures: completion.value = "10 1"
+}
+
+-- The empty needle never matches for last either.
+rule Str2LastEmptyNeedleNeverMatches {
+    when: Evaluates("list [string last {} abc] [string last {} abc 3] [string last {} {}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "-1 -1 -1"
+}
+
+-- An index past the end scans the whole string; -1/0 can still find index 0.
+rule Str2LastClampsIndexAndScansBackwards {
+    when: Evaluates("list [string last b abcabc 99] [string last b abcabc 0] [string last a aaaa end+1] [string last aa aaaa 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "4 -1 3 0"
+}
+
+-- ── index ────────────────────────────────────────────────────
+
+-- Out-of-range indices return the empty string, never an error.
+rule Str2IndexNegativeAndPastEndAreEmpty {
+    when: Evaluates("list [string index abc -1] [string index abc end+1] [string index {} 0] [string index abc 3]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {} {} {}"
+}
+
+-- 9.1 counts Unicode code points: an astral character is one index and length is 3.
+rule Str2IndexCountsCodePoints {
+    when: Evaluates("list [string index \"a𐀀c\" 1] [string length \"a𐀀c\"] [string index \"a𐀀c\" 2]")
+    ensures: completion.code = ok
+    ensures: completion.value = "𐀀 3 c"
+}
+
+-- ── insert (TIP 504) ─────────────────────────────────────────
+
+-- Index 0/-5 prepend; end and an index at the length append.
+rule Str2InsertPrependsClampsAndAppends {
+    when: Evaluates("list [string insert abc 0 X] [string insert abc -5 X] [string insert abc end X] [string insert abc 3 X]")
+    ensures: completion.code = ok
+    ensures: completion.value = "Xabc Xabc abcX abcX"
+}
+
+-- end-N inserts starting one past the resolved index (doc wording differs).
+rule Str2InsertEndRelativeAfterResolvedIndex {
+    when: Evaluates("list [string insert abcdef end-2 XYZ] [string insert abcdef end-1 XYZ]")
+    ensures: completion.code = ok
+    ensures: completion.value = "abcdXYZef abcdeXYZf"
+}
+
+-- Empty insertString is a no-op; inserting into the empty string works at 0.
+rule Str2InsertEmptyInsertString {
+    when: Evaluates("list [string insert abc 1 {}] [string insert {} 0 X]")
+    ensures: completion.code = ok
+    ensures: completion.value = "abc X"
+}
+
+-- wrong # args: should be "string insert string index insertString"
+rule Str2InsertWrongArgs {
+    when: Evaluates("catch {string insert abc 0} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"string insert string index insertString\""
+}
+
+-- ── string is: options, empty string and every class ─────────
+
+-- By default the empty string is a valid member of every class.
+rule Str2IsEmptyStringIsValidClassMember {
+    when: Evaluates("list [string is alpha {}] [string is integer {}] [string is double {}] [string is boolean {}] [string is list {}] [string is dict {}] [string is space {}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 1 1 1 1"
+}
+
+-- -strict makes the empty string a non-member of every class.
+rule Str2IsStrictRejectsEmptyString {
+    when: Evaluates("list [string is alpha -strict {}] [string is digit -strict {}] [string is space -strict {}] [string is ascii -strict {}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0 0 0"
+}
+
+-- Options come after the class name; a leading -strict is parsed as a class.
+rule Str2IsOptionsMustFollowClass {
+    when: Evaluates("catch {string is -strict alpha {}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad class \"-strict\": must be alnum, alpha, ascii, control, boolean, dict, digit, double, entier, false, graph, integer, list, lower, print, punct, space, true, upper, wideinteger, wordchar, or xdigit"
+}
+
+-- alnum is Unicode letters plus digits; underscore is neither.
+rule Str2IsAlnumAndAlpha {
+    when: Evaluates("list [string is alnum abc123] [string is alnum {ab c}] [string is alnum _] [string is alpha abc] [string is alpha ab1] [string is alpha é]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 0 1 0 1"
+}
+
+-- ascii covers code points 0..127 inclusive.
+rule Str2IsAsciiRange {
+    when: Evaluates("list [string is ascii [format %c 0]] [string is ascii [format %c 127]] [string is ascii [format %c 128]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 0"
+}
+
+-- 9.1 boolean accepts only 0/1 and the true/false words; numeric 2 is rejected.
+rule Str2IsBooleanTightenedToLiterals {
+    when: Evaluates("list [string is boolean 1] [string is boolean 0] [string is boolean true] [string is boolean yes] [string is boolean off] [string is boolean 2] [string is boolean 0x10] [string is boolean 1.0]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 1 1 0 0 0"
+}
+
+-- true/false restrict the boolean literals by value.
+rule Str2IsTrueAndFalseClasses {
+    when: Evaluates("list [string is true yes] [string is true 1] [string is true 2] [string is true no] [string is false no] [string is false 0] [string is false yes]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 0 0 1 1 0"
+}
+
+-- control includes format chars (U+200B); graph excludes space; print includes it.
+rule Str2IsControlGraphPrint {
+    when: Evaluates("list [string is control [format %c 0]] [string is control [format %c 10]] [string is control [format %c 0x200b]] [string is control a] [string is graph a] [string is graph { }] [string is print { }] [string is print [format %c 7]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 0 1 0 1 0"
+}
+
+-- A dict needs an even element count; when that is the only fault failindex is -1.
+rule Str2IsDictOddListFailindex {
+    when: Evaluates("list [string is dict { a 1 }] [string is dict {a 1 b 2 c}] [string is dict -failindex f1 {a 1 b 2 c}] $f1")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 0 -1"
+}
+
+-- An unbalanced brace fails at the element index where parsing breaks.
+rule Str2IsDictBadBraceFailindex {
+    when: Evaluates("list [string is dict -failindex f2 \"[format %c 123]a b\"] $f2")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0"
+}
+
+-- digit is Unicode-wide, including Adlam digits.
+rule Str2IsDigitUnicodeWide {
+    when: Evaluates("list [string is digit 5] [string is digit ٥] [string is digit [format %c 0x1E950]] [string is digit a]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 0"
+}
+
+-- double accepts Inf/NaN and the 9.1 integer literal forms.
+rule Str2IsDoubleAcceptsIntegerForms {
+    when: Evaluates("list [string is double 1.5] [string is double .5] [string is double 1e3] [string is double Inf] [string is double NaN] [string is double 0x10] [string is double 0b101] [string is double abc]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 1 1 1 1 0"
+}
+
+-- entier is documented as a synonym for integer.
+rule Str2IsEntierIsIntegerSynonym {
+    when: Evaluates("list [string is entier 42] [string is entier 0x10] [string is entier 123456789012345678901234567890] [string is entier 1.5] [string is integer 1.5]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 0 0"
+}
+
+-- integer allows surrounding whitespace, arbitrary precision and underscores.
+rule Str2IsIntegerWhitespaceAndPrecision {
+    when: Evaluates("list [string is integer { 42 }] [string is integer {4 2}] [string is integer {  }] [string is integer 123456789012345678901234567890] [string is integer 1_000]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 0 1 1"
+}
+
+-- A whitespace-only list is proper; an unmatched brace fails with its index.
+rule Str2IsListProperAndFailindex {
+    when: Evaluates("list [string is list {a b}] [string is list { }] [string is list \"a [format %c 123] b\"] [string is list -failindex f3 \"a [format %c 123] b\"] $f3")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 0 0 2"
+}
+
+-- lower/upper are Unicode classes; a title-case letter is neither.
+rule Str2IsLowerUpperUnicode {
+    when: Evaluates("list [string is lower abc] [string is lower aBc] [string is lower é] [string is lower ǅ] [string is upper ABC] [string is upper ABc] [string is upper ǅ]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 1 0 1 0 0"
+}
+
+-- punct includes connector punctuation but not symbols such as + or $.
+rule Str2IsPunctIncludesConnector {
+    when: Evaluates("list [string is punct ,] [string is punct _] [string is punct [format %c 0xA1]] [string is punct +] [string is punct {$}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 0 0"
+}
+
+-- space includes ZWSP/BOM but excludes NUL; trim's default set is different.
+rule Str2IsSpaceIncludesFormatCharsNotNul {
+    when: Evaluates("list [string is space { }] [string is space [format %c 9]] [string is space [format %c 0x200b]] [string is space [format %c 0xfeff]] [string is space [format %c 0]] [string is space a]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 1 0 0"
+}
+
+-- wideinteger is exactly the signed 64-bit range; overflow sets failindex -1.
+rule Str2IsWideIntegerBoundaryAndFailindex {
+    when: Evaluates("list [string is wideinteger 0x7fffffffffffffff] [string is wideinteger 0x8000000000000000] [string is wideinteger 0o17] [string is wideinteger -failindex f4 0x8000000000000000] $f4")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 1 0 -1"
+}
+
+-- wordchar is alnum plus Unicode connector punctuation.
+rule Str2IsWordcharIncludesConnector {
+    when: Evaluates("list [string is wordchar a] [string is wordchar _] [string is wordchar 5] [string is wordchar é] [string is wordchar ٣] [string is wordchar -] [string is wordchar .]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 1 1 0 0"
+}
+
+-- xdigit is exactly [0-9A-Fa-f]; a 0x prefix is not part of a single digit.
+rule Str2IsXdigit {
+    when: Evaluates("list [string is xdigit 0] [string is xdigit F] [string is xdigit g] [string is xdigit 0x10]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 0 0"
+}
+
+-- failindex is the code-point index of the first character outside the class.
+rule Str2IsFailindexReportsCodepoint {
+    when: Evaluates("list [string is alpha -failindex fa ab1cd] $fa [string is lower -failindex fl abC] $fl [string is ascii -failindex fs a[format %c 200]] $fs")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 2 0 2 0 1"
+}
+
+-- failindex is not written when the test succeeds.
+rule Str2IsFailindexUntouchedOnSuccess {
+    when: Evaluates("set k keep; list [string is alpha -failindex k abc] $k")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 keep"
+}
+
+-- boolean/true/false failures always report index 0.
+rule Str2IsBooleanFailindexAlwaysZero {
+    when: Evaluates("list [string is boolean -failindex bf 2] $bf [string is false -failindex ff yes] $ff")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0 0 0"
+}
+
+-- malformed radix and trailing junk report the offending index.
+rule Str2IsIntegerFailindexSyntaxPoint {
+    when: Evaluates("list [string is integer -failindex fi 0b2] $fi [string is double -failindex fd 1.2.3] $fd")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 1 0 3"
+}
+
+-- A unique class prefix is accepted as the class name.
+rule Str2IsClassUniqueAbbreviation {
+    when: Evaluates("list [string is int 42] [string is bool yes] [string is ent 42] [string is xd F]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 1"
+}
+
+-- A prefix matching several classes is an ambiguity error with the class menu.
+rule Str2IsClassAmbiguityNamesMenu {
+    when: Evaluates("catch {string is w x} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "ambiguous class \"w\": must be alnum, alpha, ascii, control, boolean, dict, digit, double, entier, false, graph, integer, list, lower, print, punct, space, true, upper, wideinteger, wordchar, or xdigit"
+}
+
+-- bad option "bogus": must be -strict or -failindex
+rule Str2IsBadOptionMenu {
+    when: Evaluates("catch {string is alpha bogus x} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"bogus\": must be -strict or -failindex"
+}
+
+-- ── length ───────────────────────────────────────────────────
+
+-- length is code points, not bytes; an astral character counts once.
+rule Str2LengthCountsCodePoints {
+    when: Evaluates("list [string length {}] [string length abc] [string length \"héllo\"] [string length \"𐀀\"]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 3 5 1"
+}
+
+-- Multi-byte UTF-8 characters each have length 1.
+rule Str2LengthIsNotByteLength {
+    when: Evaluates("list [string length é] [string length ǅ] [string length [format %c 0x1F600]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1"
+}
+
+-- ── map ──────────────────────────────────────────────────────
+
+-- Keys are tried in list order; an earlier shorter key masks a later longer one.
+rule Str2MapFirstMatchingKeyWins {
+    when: Evaluates("string map {1 0 ab 2 a 3 abc 1} 1abcaababcabababc")
+    ensures: completion.code = ok
+    ensures: completion.value = "02c322c222c"
+}
+
+-- With the longer key first the same input maps differently (doc examples).
+rule Str2MapLongerKeyWinsWhenListedFirst {
+    when: Evaluates("string map {abc 1 ab 2 a 3 1 0} 1abcaababcabababc")
+    ensures: completion.code = ok
+    ensures: completion.value = "01321221"
+}
+
+-- -nocase folds only the match; the replacement value keeps its own case.
+rule Str2MapNocaseFoldsKeysKeepsValueCase {
+    when: Evaluates("list [string map -nocase {AB x} aBAb] [string map -nocase {a B} ab]")
+    ensures: completion.code = ok
+    ensures: completion.value = "xx Bb"
+}
+
+-- The input is scanned once; replacement text is never remapped.
+rule Str2MapDoesNotRescanOutput {
+    when: Evaluates("list [string map {a b b c} ab] [string map {abc X} abcabc] [string map {b B} {}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "bc XX {}"
+}
+
+-- An empty key is ignored; an empty mapping returns the input.
+rule Str2MapEmptyKeyIsIgnored {
+    when: Evaluates("list [string map {{} X a Y} abc] [string map {} abc]")
+    ensures: completion.code = ok
+    ensures: completion.value = "Ybc abc"
+}
+
+-- char map list unbalanced
+rule Str2MapOddMappingErrors {
+    when: Evaluates("catch {string map {a b c} abc} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "char map list unbalanced"
+}
+
+-- ── match ────────────────────────────────────────────────────
+
+-- ? matches one character; [...] is a character set with ranges.
+rule Str2MatchWildcardsAndRanges {
+    when: Evaluates("list [string match {a?c} abc] [string match {a[bc]d} acd] [string match {a[a-c]d} abd] [string match {a[a-c]d} aed]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 0"
+}
+
+-- A backslash makes a wildcard character literal.
+rule Str2MatchBackslashEscapesSpecials {
+    when: Evaluates("list [string match {a\\*c} {a*c}] [string match {a\\*c} abc]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+}
+
+-- -nocase folds the pattern and the string, including range endpoints.
+rule Str2MatchNocaseFolds {
+    when: Evaluates("list [string match -nocase ABC abc] [string match -nocase {[A-Z]*} xyz]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+}
+
+-- The ASCII [A-z] range matches _ case-sensitively but not with -nocase.
+rule Str2MatchNocaseRangeDropsUnderscore {
+    when: Evaluates("list [string match {[A-z]} _] [string match -nocase {[A-z]} _]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+}
+
+-- * matches the empty string; ? and a non-empty pattern do not.
+rule Str2MatchEmptyPatternAndStar {
+    when: Evaluates("list [string match {} {}] [string match {} a] [string match * {}] [string match ? {}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 1 0"
+}
+
+-- ── range ────────────────────────────────────────────────────
+
+-- first below 0 clamps to 0; last past end clamps to end.
+rule Str2RangeClampsBothEnds {
+    when: Evaluates("list [string range abcdef 1 3] [string range abcdef -5 2] [string range abcdef 3 100]")
+    ensures: completion.code = ok
+    ensures: completion.value = "bcd abc def"
+}
+
+-- first > last, or a range entirely past the end, returns empty.
+rule Str2RangeReversedOrEmptyIsEmpty {
+    when: Evaluates("list [string range abcdef 4 2] [string range abc end+1 end+2] [string range {} 0 end]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {} {}"
+}
+
+-- end-relative indices work in range and are inclusive.
+rule Str2RangeEndRelative {
+    when: Evaluates("list [string range abcdef end-2 end] [string range abcdef 0 end-1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "def abcde"
+}
+
+-- ── repeat ───────────────────────────────────────────────────
+
+-- count 0 is empty; a positive count repeats the whole string.
+rule Str2RepeatCountsAndEmptyString {
+    when: Evaluates("list [string repeat ab 0] [string repeat ab 3] [string repeat {} 5] [string repeat ab 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} ababab {} ab"
+}
+
+-- The count uses 9.1 integer syntax (underscores) and repeats code points.
+rule Str2RepeatAcceptsIntegerGrammar {
+    when: Evaluates("list [string repeat a 1_0] [string length [string repeat é 3]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "aaaaaaaaaa 3"
+}
+
+-- expected integer but got "1.5"
+rule Str2RepeatRejectsNonIntegerCount {
+    when: Evaluates("catch {string repeat ab 1.5} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "expected integer but got \"1.5\""
+}
+
+-- ── replace ──────────────────────────────────────────────────
+
+-- The inclusive first..last range is removed; newstring is inserted in its place.
+rule Str2ReplaceRemovesOrSubstitutesRange {
+    when: Evaluates("list [string replace abcdef 1 3] [string replace abcdef 2 3 XY] [string replace abc 1 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "aef abXYef ac"
+}
+
+-- The range is clamped to the string before removal.
+rule Str2ReplaceClampsRange {
+    when: Evaluates("list [string replace abcdef -5 2] [string replace abcdef 3 100] [string replace abc 0 5 X]")
+    ensures: completion.code = ok
+    ensures: completion.value = "def abc X"
+}
+
+-- first > last, first >= length, or last < 0 leaves the string untouched.
+rule Str2ReplaceIgnoresReversedOrOutOfRange {
+    when: Evaluates("list [string replace abcdef 4 2] [string replace abc 5 9 X] [string replace abc -5 -1 X]")
+    ensures: completion.code = ok
+    ensures: completion.value = "abcdef abc abc"
+}
+
+-- end removes the last character; index == length is already out of range.
+rule Str2ReplaceEndIndexAndLengthBoundary {
+    when: Evaluates("list [string replace abcde end end X] [string replace abcde 5 5 X]")
+    ensures: completion.code = ok
+    ensures: completion.value = "abcdX abcde"
+}
+
+-- ── reverse ──────────────────────────────────────────────────
+
+-- reverse works on code points, not bytes.
+rule Str2ReverseReversesCodePoints {
+    when: Evaluates("list [string reverse abc] [string reverse {}] [string reverse \"a𐀀b\"]")
+    ensures: completion.code = ok
+    ensures: completion.value = "cba {} b𐀀a"
+}
+
+-- Reversal is per code point: the combining mark survives but moves first.
+rule Str2ReverseKeepsCombiningMarkAttached {
+    when: Evaluates("list [string length [string reverse \"e[format %c 0x301]\"]] [string index [string reverse \"e[format %c 0x301]\"] 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "2 e"
+}
+
+-- ── tolower / toupper / totitle ──────────────────────────────
+
+-- With no range, the whole string is case-mapped.
+rule Str2LowerUpperWholeString {
+    when: Evaluates("list [string tolower ABC] [string toupper abc] [string tolower ÀÉ]")
+    ensures: completion.code = ok
+    ensures: completion.value = "abc ABC àé"
+}
+
+-- One index affects one character; first+last affect the inclusive range.
+rule Str2LowerUpperRangeSingleIndex {
+    when: Evaluates("list [string tolower ABCDEF 2] [string tolower ABCDEF 1 3] [string toupper abcdef 0 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "ABcDEF AbcdEF ABcdef"
+}
+
+-- Ranges clamp to the string; an out-of-range single index changes nothing.
+rule Str2LowerUpperRangeClamps {
+    when: Evaluates("list [string tolower ABC -5 1] [string toupper abc 4 100] [string tolower ABC 5] [string tolower ABC end]")
+    ensures: completion.code = ok
+    ensures: completion.value = "abC abc ABC ABc"
+}
+
+-- The range form title-cases its first character and lowercases the rest of
+-- the range; the single-index form converts only that one character.
+rule Str2TotitleRangeTitlesAndLowers {
+    when: Evaluates("list [string totitle \"hELLO wORLD\" 6 10] [string totitle \"hello wORLD\" 6]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{hELLO World} {hello WORLD}"
+}
+
+-- totitle uses the Unicode title-case variant (ǆ -> ǅ), not plain uppercase.
+rule Str2TotitleUnicodeTitleCase {
+    when: Evaluates("list [string totitle \"ǆa\"] [string toupper ǆ] [string tolower Ǆ] [string totitle \"éCOLE\"]")
+    ensures: completion.code = ok
+    ensures: completion.value = "ǅa Ǆ ǆ École"
+}
+
+-- ── trim / trimleft / trimright ──────────────────────────────
+
+-- The default char set is whitespace; trimleft/trimright touch one side only.
+rule Str2TrimDefaultWhitespaceBothSides {
+    when: Evaluates("list [string trim \"  hi  \"] [string trimleft \"  hi  \"] [string trimright \"  hi  \"]")
+    ensures: completion.code = ok
+    ensures: completion.value = "hi {hi  } {  hi}"
+}
+
+-- chars is a set of characters, not a substring; every leading/trailing member goes.
+rule Str2TrimCharSetNotSubstring {
+    when: Evaluates("list [string trim abba ab] [string trim abcba abc] [string trim -x- -] [string trim {a b a} {a b}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {} x {}"
+}
+
+-- trim's default set also removes NUL, although NUL is not in the space class.
+rule Str2TrimDefaultRemovesNul {
+    when: Evaluates("list [string trim \"[format %c 0]a[format %c 0]\"] [string length [string trim \"[format %c 0]\"]] [string is space [format %c 0]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "a 0 0"
+}
+
+-- Zero-width space and BOM are default-trimmed because they are in space.
+rule Str2TrimRemovesZeroWidthSpace {
+    when: Evaluates("list [string trim [format %c 0x200b]] [string trim [format %c 0xfeff]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {}"
+}
+
+-- ── wordend / wordstart ──────────────────────────────────────
+
+-- wordend is one past the word's last character; wordstart is its first index.
+rule Str2WordBoundsAlnumRuns {
+    when: Evaluates("list [string wordstart \"foo bar\" 5] [string wordend \"foo bar\" 5] [string wordstart \"foo bar\" 1] [string wordend \"foo bar\" 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "4 7 0 3"
+}
+
+-- A non-word character such as . or - is a one-character word of its own.
+rule Str2WordBoundsNonWordCharIsSingle {
+    when: Evaluates("list [string wordstart a.b 1] [string wordend a.b 1] [string wordstart {foo-bar} 3] [string wordend {foo-bar} 3]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 2 3 4"
+}
+
+-- Underscore (connector punctuation) keeps a run in the same word.
+rule Str2WordBoundsIncludeConnectorUnderscore {
+    when: Evaluates("list [string wordstart \"a_b c\" 2] [string wordend \"a_b c\" 0]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 3"
+}
+
+-- Word boundaries count code points, not bytes.
+rule Str2WordBoundsCountCodePoints {
+    when: Evaluates("list [string wordstart \"héllo wörld\" 7] [string wordend \"héllo wörld\" 7]")
+    ensures: completion.code = ok
+    ensures: completion.value = "6 11"
+}
+
+-- Out-of-range indices clamp; the empty string has word bounds 0.
+rule Str2WordBoundsClampOutOfRange {
+    when: Evaluates("list [string wordstart abc -1] [string wordend abc 99] [string wordstart abc 100] [string wordend {} 0]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 3 0 0"
+}
+
+-- ── subcommand resolution and arity errors ───────────────────
+
+-- Any unique subcommand prefix is accepted.
+rule Str2SubcommandUniqueAbbreviation {
+    when: Evaluates("list [string len abc] [string rev abc] [string tolow ABC] [string ins abc 1 X] [string com abc abd] [string eq abc abc] [string fi b abc] [string la b abc]")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 cba abc aXbc -1 1 1 1"
+}
+
+-- rep is ambiguous between repeat and replace and reports the full menu.
+rule Str2AmbiguousSubcommandNamesMenu {
+    when: Evaluates("catch {string rep ab 2} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown or ambiguous subcommand \"rep\": must be cat, compare, equal, first, index, insert, is, last, length, map, match, range, repeat, replace, reverse, tolower, totitle, toupper, trim, trimleft, trimright, wordend, or wordstart"
+}
+
+-- An unknown subcommand reports the same menu (unknown or ambiguous).
+rule Str2UnknownSubcommandNamesMenu {
+    when: Evaluates("catch {string gorp a} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown or ambiguous subcommand \"gorp\": must be cat, compare, equal, first, index, insert, is, last, length, map, match, range, repeat, replace, reverse, tolower, totitle, toupper, trim, trimleft, trimright, wordend, or wordstart"
+}
+
+-- Subcommands without options do not parse them; arity errors name the form.
+rule Str2WrongArgsMessages {
+    when: Evaluates("list [catch {string length -nocase abc} m1] $m1 [catch {string index abc} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {wrong # args: should be \"string length string\"} 1 {wrong # args: should be \"string index string charIndex\"}"
+}

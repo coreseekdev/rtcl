@@ -33,7 +33,7 @@ rule TraceInfoRoundTripsAndOrdersOps {
     -- regardless of registration order (2026-11-27 re-probed on both
     -- 8.6.17 and 9.1.0; the earlier "read, write, unset, array" note was
     -- wrong for 8.6 as well).
-    when: Evaluates("lindex [trace info variable x] 0    -- after: trace add variable x {write unset} cb")
+    when: Evaluates("proc cb {args} {}; trace add variable x {write unset} cb; lindex [trace info variable x] 0")
     ensures: completion.code = ok
     ensures: completion.value = "{write unset} cb"
     -- the full command returns a list of such pairs: {{write unset} cb}
@@ -52,8 +52,9 @@ rule TraceRemoveRemovesOneExactMatch {
 
 rule TraceFiresNewestFirst {
     -- Within one variable, the most recently added trace fires first.
-    when: Evaluates("set log    -- after: two write traces T1 then T2; set x 0")
+    when: Evaluates("set log {}; proc t1 {args} {lappend ::log T1}; proc t2 {args} {lappend ::log T2}; trace add variable x write t1; trace add variable x write t2; set x 0; set log")
     ensures: completion.code = ok
+    ensures: completion.value = "T2 T1"
     -- oracle: T2 T1
 }
 
@@ -63,9 +64,9 @@ rule WriteTraceRunsAfterCommit {
     -- A write trace runs after the write is committed: on trace error
     -- the value is still set (error can't set "x"), and a callback that
     -- writes the variable changes the final visible value.
-    when: Evaluates("set v [set x 0]    -- with write trace {set x 9;#}")
+    when: Evaluates("proc w {args} {set ::x 9}; trace add variable x write w; set v [set x 0]; list $v $x")
     ensures: completion.code = ok
-    ensures: completion.value = "9"
+    ensures: completion.value = "9 9"
     -- probe: puts [list $v [set x]]  =>  9 9   (tclsh)
     -- rtcl: FIXED 2026-11-04（trace_active 重入位 + 写后重读）
 }
@@ -74,8 +75,9 @@ rule TraceReentrancyDoesNotRefire {
     -- tclsh guards re-entrant access (VAR_TRACE_ACTIVE): a read/write
     -- of the traced variable from inside its own trace callback does
     -- not re-fire the trace.
-    when: Evaluates("set n    -- after: read trace {incr ::n; set y $x;#}; set x 1; set x")
+    when: Evaluates("set n 0; proc r {args} {incr ::n; set y [set ::x]}; trace add variable x read r; set x 1; set x; set n")
     ensures: completion.code = ok
+    ensures: completion.value = "1"
     -- oracle: n = 1 (one fire, inner read silent)
     -- rtcl: FIXED 2026-11-04（同 D-36）
 }
@@ -90,7 +92,7 @@ rule UnsetTraceFiresEvenOnFailure {
     -- An unset that names a missing variable still fires unset traces
     -- (and removes the records); for elements, a missing-element unset
     -- fires {a k unset} and drops the element's records.
-    when: Evaluates("set log    -- after: trace on nosuch unset; catch {unset nosuch}")
+    when: Evaluates("set log {}; proc cb {args} {lappend ::log $args}; trace add variable nosuch unset cb; catch {unset nosuch}; set log")
     ensures: completion.code = ok
     ensures: completion.value = "{nosuch {} unset}"
     -- rtcl: FIXED 2026-11-05（两条路径都触发；元素还抹记录）
@@ -99,7 +101,7 @@ rule UnsetTraceFiresEvenOnFailure {
 rule UnsetWholeArrayFiresElementTraces {
     -- `unset a` fires the unset trace of every element ({a k unset} for
     -- each k) in addition to whole-array traces.
-    when: Evaluates("set log    -- after: trace on a(1) unset; unset a")
+    when: Evaluates("set log {}; proc cb {args} {lappend ::log $args}; set a(1) x; trace add variable a(1) unset cb; unset a; set log")
     ensures: completion.code = ok
     ensures: completion.value = "{a 1 unset}"
     -- rtcl: FIXED 2026-11-05（删除前枚举元素，elem-only 扫描通道）
@@ -108,7 +110,7 @@ rule UnsetWholeArrayFiresElementTraces {
 rule ArrayUnsetFiresWholeNotElements {
     -- `array unset a` (no pattern) behaves like `unset a`: ONE whole-
     -- variable {a {} unset} fire, not per-element fires.
-    when: Evaluates("set log    -- after: trace on a unset; array unset a")
+    when: Evaluates("set log {}; proc cb {args} {lappend ::log $args}; set a(1) x; trace add variable a unset cb; array unset a; set log")
     ensures: completion.code = ok
     ensures: completion.value = "{a {} unset}"
     -- rtcl: FIXED 2026-11-05（无 pattern 委托 unset_var 全链；D-35 同修）
@@ -118,8 +120,9 @@ rule ArrayOpFiringSurface {
     -- The array op fires: when array set adds to an ALREADY existing
     -- array; when array get / names / size / exists name a MISSING
     -- array (one fire each); and on array unset.
-    when: Evaluates("set log    -- after: trace on a array w; array set a {2 2}    -- a existed with (1)")
+    when: Evaluates("set log {}; proc cb {args} {lappend ::log A}; set a(1) 1; trace add variable a array cb; array set a {2 2}; set log")
     ensures: completion.code = ok
+    ensures: completion.value = "A"
     -- oracle: log = A  (one fire)
     -- rtcl: FIXED 2026-11-05（五子命令分派级恒触发；旧 array.rs 注释
     --   的 trace-5.8 解读被实测矩阵推翻）
@@ -128,7 +131,7 @@ rule ArrayOpFiringSurface {
 rule WholeVarThenElementOrder {
     -- When a write fires both whole-variable and element traces, whole-
     -- variable traces run first, element traces second.
-    when: Evaluates("set log    -- after: write traces A1 on a, E1 on a(k); set a(k) 1")
+    when: Evaluates("set log {}; proc A {args} {append ::log A1}; proc E {args} {append ::log E1}; trace add variable a write A; trace add variable a(k) write E; set a(k) 1; set log")
     ensures: completion.code = ok
     ensures: completion.value = "A1E1"
     -- rtcl: FIXED 2026-11-04（整组先元素组）
@@ -138,7 +141,7 @@ rule UpvarLinkedAccessFiresTraces {
     -- Reads/writes/unsets through an upvar link fire the target's
     -- traces with the ALIAS name as name1 (upvar 1 g y; set y 5 fires
     -- {y {} write} on g's trace).
-    when: Evaluates("set log    -- after: trace on g write w; proc p {} {upvar 1 g y; set y 5}; p")
+    when: Evaluates("set log {}; proc w {args} {lappend ::log [lindex $args 0]}; trace add variable g write w; proc p {} {upvar 1 g y; set y 5}; p; set log")
     ensures: completion.code = ok
     ensures: completion.value = "y"
     -- rtcl: FIXED 2026-11-05（aliased 槽分支 trace 时回落名路径）
@@ -172,7 +175,7 @@ rule CommandTracesFireOnRenameAndDelete {
     -- {oldName newName op} — {::old ::new rename} on rename (trace
     -- moves with the command) and {::old {} delete} on delete. Redefining
     -- a proc silently drops its traces.
-    when: Evaluates("set got    -- after: trace on cp delete; rename cp {}")
+    when: Evaluates("proc cp {} {}; set got {}; proc cb {args} {set ::got $args}; trace add command cp delete cb; rename cp {}; set got")
     ensures: completion.code = ok
     ensures: completion.value = "::cp {} delete"
 }
@@ -183,7 +186,7 @@ rule ExecTracesCoverAllCommands {
     -- enter/leave fire for EVERY command invocation (builtins, apply,
     -- namespace eval bodies), not just procs; enterstep/leavestep do
     -- not fire at top level (both sides agree there).
-    when: Evaluates("set got    -- after: trace on `set` enter; set x 1")
+    when: Evaluates("set got {}; proc cb {args} {set ::got $args}; trace add execution set enter cb; set x 1; trace remove execution set enter cb; set got")
     ensures: completion.code = ok
     ensures: completion.value = "{set x 1} enter"
     -- rtcl: FIXED 2026-11-05 for dispatched builtins
@@ -194,7 +197,7 @@ rule ExecTracesCoverAllCommands {
 rule ExecLeaveArgsAndReturnCompletion {
     -- leave receives {cmdLine code result op} (op last); a body ending
     -- in `return v` still reports code 0 with result v.
-    when: Evaluates("set got    -- after: proc foo {} {set a 1; return $a}; leave trace; foo")
+    when: Evaluates("set got {}; proc cb {args} {set ::got $args}; proc foo {} {set a 1; return $a}; trace add execution foo leave cb; foo; set got")
     ensures: completion.code = ok
     ensures: completion.value = "foo 0 1 leave"
     -- rtcl: FIXED 2026-11-05（deferred return 解码后进 leave）[D-39]
@@ -204,8 +207,9 @@ rule ExecTraceFiringOrder {
     -- enter/enterstep fire NEWEST-first; leave/leavestep fire in
     -- registration order (oldest first) — the opposite of variable
     -- traces' uniform latest-first (2026-11-05 file-mode matrix).
-    when: Evaluates("set got    -- after: two leave records A B; foo")
+    when: Evaluates("set got {}; proc a {args} {lappend ::got A}; proc b {args} {lappend ::got B}; proc foo {} {}; trace add execution foo leave a; trace add execution foo leave b; foo; set got")
     ensures: completion.code = ok
+    ensures: completion.value = "A B"
     -- oracle: A's args appear before B's
     -- (enter/enterstep reversed: B before A)
 }
@@ -213,7 +217,7 @@ rule ExecTraceFiringOrder {
 rule ExecTraceRecordRemovedMidfireStaysSilent {
     -- A record removed by an earlier callback during the same firing
     -- does not fire (trace-34.1 identity rule, all ops — trace-34.2/34.3).
-    when: Evaluates("catch {foo} m    -- with bar (older leave record) removing soom (newer)")
+    when: Evaluates("set got {}; proc foo {} {}; proc soom {args} {lappend ::got SOOM}; proc bar {args} {trace remove execution foo leave soom}; trace add execution foo leave bar; trace add execution foo leave soom; catch {foo}; set got")
     ensures: completion.code = ok
     ensures: completion.value = ""
 }
@@ -231,8 +235,9 @@ rule ExecEnterstepCoversStackRange {
     -- enterstep/leavestep fire for every traced proc on the call stack
     -- (dynamic range): when traced foo calls bar, foo's enterstep also
     -- reports commands inside bar.
-    when: Evaluates("set got    -- after: enterstep trace on foo; foo calls bar; bar runs {set q 1}")
+    when: Evaluates("set got {}; proc cb {args} {lappend ::got $args}; proc foo {} {bar}; proc bar {} {set q 1}; trace add execution foo enterstep cb; foo; set got")
     ensures: completion.code = ok
+    ensures: completion.value = "{bar enterstep} {{set q 1} enterstep}"
     -- oracle includes: bar enterstep {set q 1} enterstep
     -- rtcl: FIXED 2026-11-05（ExecStepCtx.steps 收全栈）[D-39]
 }

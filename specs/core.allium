@@ -1,0 +1,649 @@
+-- allium: 3
+-- core.allium
+-- Behaviour spec: core command/value semantics — set/unset/append/incr,
+-- proc, apply, eval, rename, and for/foreach/while/if with nested
+-- break/continue. Complements variables.allium (scope/upvar/namespaces),
+-- control-flow.allium (loop result values and completion codes) and
+-- error-deep.allium (catch/try/return options).
+-- Oracle: tclsh 9.1.0 (core-9-1-0).
+-- Measured with .refer/tcl910/inst/bin/tclsh9.1 on 2026-11-28.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── set: read/write forms, arity, element vs array ────────────────
+
+rule CoreSetReturnsAssignedValue {
+    -- set with a value stores it and completes with that same value.
+    when: Evaluates("set x 5")
+    ensures: completion.code = ok
+    ensures: completion.value = "5"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule CoreSetReadsExistingValue {
+    -- set with only a variable name is a read; no assignment happens.
+    when: Evaluates("set x 5; set x")
+    ensures: completion.code = ok
+    ensures: completion.value = "5"
+}
+
+rule CoreSetMissingReadErrors {
+    -- Reading an unset variable is an error naming the variable; it is
+    -- never silently the empty string.
+    when: Evaluates("set nope")
+    ensures: completion.code = error
+    ensures: completion.value = "can't read \"nope\": no such variable"
+}
+
+rule CoreSetArityErrors {
+    -- set takes exactly one variable name and at most one value.
+    when: Evaluates("set a b c")
+    ensures: completion.code = error
+    ensures: completion.value = "wrong # args: should be \"set varName ?newValue?\""
+    -- also: bare `set` reports the same message
+}
+
+rule CoreSetElementVersusWholeArray {
+    -- An indexed name addresses one element and reads back normally; the
+    -- array base name itself cannot be read as a scalar.
+    when: Evaluates("set a(x) 1; list [set a(x)] [catch {set a} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 {can't read \"a\": variable is array}"
+}
+
+-- ── unset: arity, multiple names, missing names, partial effect ───
+
+rule CoreUnsetRemovesAndReturnsEmpty {
+    -- A successful unset removes the variable and produces the empty
+    -- string as its result.
+    when: Evaluates("set x 1; set r [unset x]; list [string length $r] [info exists x]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0"
+}
+
+rule CoreUnsetMultipleNames {
+    -- unset accepts any number of names and removes each one.
+    when: Evaluates("set a 1; set b 2; unset a b; list [info exists a] [info exists b]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0"
+}
+
+rule CoreUnsetMissingNameErrors {
+    -- Without -nocomplain a missing name is an error, naming that name.
+    when: Evaluates("unset nope")
+    ensures: completion.code = error
+    ensures: completion.value = "can't unset \"nope\": no such variable"
+}
+
+rule CoreUnsetNocomplainSkipsMissing {
+    -- -nocomplain turns a missing name into a silent success.
+    when: Evaluates("unset -nocomplain nope")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+}
+
+rule CoreUnsetPartialEffectBeforeError {
+    -- Names are removed left to right: a later missing name does not undo
+    -- the earlier removals.
+    when: Evaluates("set a 1; catch {unset a b} m; list [info exists a] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 {can't unset \"b\": no such variable}"
+}
+
+rule CoreUnsetNoArgsIsNoop {
+    -- unset has no lower bound on the name list; zero names is a legal
+    -- empty operation (unlike set/incr/append).
+    when: Evaluates("unset")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+    -- also: unset -nocomplain => ""
+}
+
+-- ── append: concatenation, creation, empty values ─────────────────
+
+rule CoreAppendConcatenatesAndReturns {
+    -- append joins all value arguments in order and returns the new value.
+    when: Evaluates("append s a b c")
+    ensures: completion.code = ok
+    ensures: completion.value = "abc"
+}
+
+rule CoreAppendCreatesVariable {
+    -- Appending to an absent variable creates it with the appended text.
+    when: Evaluates("append s a; list [info exists s] $s")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 a"
+}
+
+rule CoreAppendNoValuesReadsExisting {
+    -- With no values append is a read of the existing variable.
+    when: Evaluates("set s abc; append s")
+    ensures: completion.code = ok
+    ensures: completion.value = "abc"
+}
+
+rule CoreAppendNoValuesMissingErrors {
+    -- With no values and no existing variable append fails as a read.
+    when: Evaluates("append s")
+    ensures: completion.code = error
+    ensures: completion.value = "can't read \"s\": no such variable"
+}
+
+rule CoreAppendEmptyValueCreates {
+    -- An explicit empty value still counts as a write, so it creates the
+    -- variable as the empty string.
+    when: Evaluates("append s {}; list [info exists s] $s")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {}"
+}
+
+rule CoreAppendElement {
+    -- An indexed target appends to a single array element.
+    when: Evaluates("append a(x) b c; list $a(x) [array size a]")
+    ensures: completion.code = ok
+    ensures: completion.value = "bc 1"
+}
+
+rule CoreAppendArityErrors {
+    when: Evaluates("append")
+    ensures: completion.code = error
+    ensures: completion.value = "wrong # args: should be \"append varName ?value ...?\""
+}
+
+-- ── incr: default, negative, zero, non-integer, element ───────────
+
+rule CoreIncrDefaultsToOne {
+    -- incr with no increment adds 1, treating a missing variable as 0.
+    when: Evaluates("incr c")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}
+
+rule CoreIncrNegativeDecrements {
+    -- A negative increment subtracts; the result is returned.
+    when: Evaluates("set n 5; incr n -3")
+    ensures: completion.code = ok
+    ensures: completion.value = "2"
+}
+
+rule CoreIncrZeroOnMissingCreates {
+    -- An explicit zero increment still creates the variable, at 0.
+    when: Evaluates("list [incr x 0] [info exists x]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 1"
+}
+
+rule CoreIncrNonIntegerValueErrors {
+    -- A non-integer current value is rejected, naming the value.
+    when: Evaluates("set n abc; incr n")
+    ensures: completion.code = error
+    ensures: completion.value = "expected integer but got \"abc\""
+}
+
+rule CoreIncrNonIntegerIncrementErrors {
+    -- A non-integer increment is rejected the same way.
+    when: Evaluates("set n 1; incr n 1.5")
+    ensures: completion.code = error
+    ensures: completion.value = "expected integer but got \"1.5\""
+}
+
+rule CoreIncrElement {
+    -- incr works on a single array element and leaves the array intact.
+    when: Evaluates("set a(y) 1; incr a(y); set a(y)")
+    ensures: completion.code = ok
+    ensures: completion.value = "2"
+}
+
+rule CoreIncrAcceptsSurroundingWhitespace {
+    -- Integer parsing tolerates leading/trailing whitespace.
+    when: Evaluates("set n \" 5\"; incr n")
+    ensures: completion.code = ok
+    ensures: completion.value = "6"
+}
+
+rule CoreIncrArityErrors {
+    when: Evaluates("incr a b c")
+    ensures: completion.code = error
+    ensures: completion.value = "wrong # args: should be \"incr varName ?increment?\""
+}
+
+-- ── proc: result, arity, wrong-#-args shapes, redefinition ────────
+--
+-- Already pinned elsewhere (not repeated here):
+--   variables.ProcMissingArgumentErrors / ProcExtraArgumentErrors
+--     (code=error only), ProcDefaultParameterFillsMissing,
+--     ProcArgsCollectsRemainderAsList.
+-- This section adds the exact message shapes and proc redefinition.
+
+rule ProcReturnsEmptyResult {
+    -- The proc command itself produces the empty string.
+    when: Evaluates("proc f {} {}")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+}
+
+rule ProcArityErrors {
+    when: Evaluates("proc f {}")
+    ensures: completion.code = error
+    ensures: completion.value = "wrong # args: should be \"proc name args body\""
+}
+
+rule ProcWrongArgsRequiredParams {
+    -- Too few actuals names every required parameter.
+    when: Evaluates("proc f {a b} {}; f 1")
+    ensures: completion.code = error
+    ensures: completion.value = "wrong # args: should be \"f a b\""
+}
+
+rule ProcWrongArgsDefaultsShowOptional {
+    -- Defaulted parameters render as ?name? in the usage message.
+    when: Evaluates("proc f {a {b 9}} {}; f")
+    ensures: completion.code = error
+    ensures: completion.value = "wrong # args: should be \"f a ?b?\""
+}
+
+rule ProcWrongArgsArgsShowsVarargs {
+    -- A trailing args parameter renders as ?arg ...?; it never makes the
+    -- preceding required parameters optional.
+    when: Evaluates("proc f {a args} {}; f")
+    ensures: completion.code = error
+    ensures: completion.value = "wrong # args: should be \"f a ?arg ...?\""
+}
+
+rule ProcRedefinitionReplacesBody {
+    -- Redefining a proc silently replaces the old command.
+    when: Evaluates("proc f {} {return one}; proc f {} {return two}; f")
+    ensures: completion.code = ok
+    ensures: completion.value = "two"
+}
+
+rule ProcRedefinitionReplacesSignature {
+    -- Redefinition also replaces the argument signature; calls are checked
+    -- against the new one only.
+    when: Evaluates("proc f {a} {return A}; proc f {b c} {return B}; list [f x y] [catch {f x} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "B 1 {wrong # args: should be \"f b c\"}"
+}
+
+-- ── apply: lambda form, namespace, argument shapes, errors ────────
+
+rule ApplyCallsLambda {
+    -- apply takes {args body ?namespace?} plus the actual arguments.
+    when: Evaluates("apply {{x y} {expr {$x+$y}}} 3 4")
+    ensures: completion.code = ok
+    ensures: completion.value = "7"
+}
+
+rule ApplyDefaultParameter {
+    -- Lambda parameter defaults behave exactly like proc defaults.
+    when: Evaluates("apply {{a {b 9}} {list $a $b}} 1")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 9"
+}
+
+rule ApplyArgsVariadic {
+    -- A trailing args parameter collects the remaining actuals as a list.
+    when: Evaluates("apply {{a args} {list $a $args}} 1 2 3")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {2 3}"
+}
+
+rule ApplyLambdaNamespace {
+    -- The optional third lambda element selects the execution namespace:
+    -- [namespace current] reports it and `variable` links into it.
+    when: Evaluates("namespace eval n {variable v 7}; apply {{} {variable v; list [namespace current] $v} ::n}")
+    ensures: completion.code = ok
+    ensures: completion.value = "::n 7"
+}
+
+rule ApplyWrongArgsNamed {
+    -- Lambda arity errors use the literal command word "apply" and the
+    -- lambda's parameter names, not the lambda text.
+    when: Evaluates("apply {{a b} {}} 1")
+    ensures: completion.code = error
+    ensures: completion.value = "wrong # args: should be \"apply lambdaExpr a b\""
+}
+
+rule ApplyZeroParamExtraArg {
+    -- A zero-parameter lambda rejects any actual with a usage message that
+    -- has no parameter list at all.
+    when: Evaluates("apply {{} {}} 1")
+    ensures: completion.code = error
+    ensures: completion.value = "wrong # args: should be \"apply lambdaExpr\""
+}
+
+rule ApplyArityErrors {
+    when: Evaluates("apply")
+    ensures: completion.code = error
+    ensures: completion.value = "wrong # args: should be \"apply lambdaExpr ?arg ...?\""
+}
+
+rule ApplyNonLambdaErrors {
+    when: Evaluates("apply x")
+    ensures: completion.code = error
+    ensures: completion.value = "can't interpret \"x\" as a lambda expression"
+}
+
+rule ApplyUnknownNamespaceErrors {
+    -- The lambda namespace must already exist; apply does not create it.
+    when: Evaluates("apply {{} {} ::nope}")
+    ensures: completion.code = error
+    ensures: completion.value = "namespace \"::nope\" not found"
+}
+
+rule ApplyExtraLambdaElementErrors {
+    -- A lambda list must have exactly two or three elements.
+    when: Evaluates("apply {{} {} ::n extra}")
+    ensures: completion.code = error
+    ensures: completion.value = "can't interpret \"{} {} ::n extra\" as a lambda expression"
+}
+
+-- ── eval: concatenation, empty script, propagation ────────────────
+
+rule EvalConcatenatesArguments {
+    -- eval concatenates its arguments with single spaces and evaluates the
+    -- result as a script; no list quoting is applied.
+    when: Evaluates("eval list a b")
+    ensures: completion.code = ok
+    ensures: completion.value = "a b"
+}
+
+rule EvalConcatenationReparses {
+    -- Because the pieces are re-parsed, an expression can be split across
+    -- arguments.
+    when: Evaluates("eval {expr} {1 +} {2}")
+    ensures: completion.code = ok
+    ensures: completion.value = "3"
+}
+
+rule EvalEmptyScriptIsEmpty {
+    when: Evaluates("eval {}")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+}
+
+rule EvalNoArgsErrors {
+    -- Unlike unset, eval requires at least one script argument.
+    when: Evaluates("eval")
+    ensures: completion.code = error
+    ensures: completion.value = "wrong # args: should be \"eval arg ?arg ...?\""
+}
+
+rule EvalPropagatesError {
+    -- An error in the evaluated script propagates unchanged.
+    when: Evaluates("eval {error boom}")
+    ensures: completion.code = error
+    ensures: completion.value = "boom"
+}
+
+rule EvalPropagatesReturnCode {
+    -- A return completion from the evaluated script is not converted by
+    -- eval itself; it propagates to the caller.
+    when: Evaluates("eval {return hi}")
+    ensures: completion.code = return
+    ensures: completion.value = "hi"
+}
+
+rule EvalPropagatesBreakCode {
+    -- Likewise break escapes eval untouched, carrying an empty value.
+    when: Evaluates("eval {break}")
+    ensures: completion.code = break
+    ensures: completion.value = ""
+}
+
+-- ── rename: deletion, cross-namespace, targets, effects ───────────
+--
+-- oo.allium owns object rename/destroy interaction; trace.allium owns
+-- command-delete traces. This section pins the command itself.
+
+rule RenameMovesProcKeepingBody {
+    -- rename moves the command; the old name disappears and the new name
+    -- runs the same body.
+    when: Evaluates("proc f {} {return hi}; rename f g; list [g] [info commands f]")
+    ensures: completion.code = ok
+    ensures: completion.value = "hi {}"
+}
+
+rule RenameEmptyTargetDeletes {
+    -- An empty target name deletes the command outright.
+    when: Evaluates("proc f {} {return hi}; rename f {}; info commands f")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+}
+
+rule RenameNonProcBuiltin {
+    -- rename applies to native commands too; the renamed command keeps
+    -- working and still reports cmdtype native.
+    when: Evaluates("rename set myset; myset x 5; list $x [info cmdtype myset]")
+    ensures: completion.code = ok
+    ensures: completion.value = "5 native"
+}
+
+rule RenameMissingSourceErrors {
+    when: Evaluates("rename nope g")
+    ensures: completion.code = error
+    ensures: completion.value = "can't rename \"nope\": command doesn't exist"
+}
+
+rule RenameToExistingErrors {
+    -- Overwriting an existing command is refused; even the source's own
+    -- name counts as existing.
+    when: Evaluates("proc f {} {}; proc g {} {}; rename f g")
+    ensures: completion.code = error
+    ensures: completion.value = "can't rename to \"g\": command already exists"
+    -- also: rename f f => can't rename to "f": command already exists
+}
+
+rule RenameCrossNamespace {
+    -- A qualified target moves the command into that namespace; addressing
+    -- it requires the qualified name from outside.
+    when: Evaluates("namespace eval n {}; proc f {} {return X}; rename f ::n::g; list [::n::g] [info commands ::n::g]")
+    ensures: completion.code = ok
+    ensures: completion.value = "X ::n::g"
+}
+
+rule RenameCreatesTargetNamespace {
+    -- Oracle surprise: renaming into a missing namespace creates that
+    -- namespace rather than failing.
+    when: Evaluates("proc f {} {}; rename f nope::g; list [info commands nope::g] [namespace exists nope]")
+    ensures: completion.code = ok
+    ensures: completion.value = "::nope::g 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RenameFromQualifiedName {
+    -- A fully qualified source name is accepted.
+    when: Evaluates("proc ::f {} {return X}; rename ::f g; g")
+    ensures: completion.code = ok
+    ensures: completion.value = "X"
+}
+
+rule RenameToRootQualifiedName {
+    -- A root-qualified target lands in :: and is reachable by bare name.
+    when: Evaluates("proc f {} {return X}; rename f ::g; list [g] [info commands ::g]")
+    ensures: completion.code = ok
+    ensures: completion.value = "X ::g"
+}
+
+rule RenameToLiteralRootName {
+    -- Oracle surprise: "::" as the target is a literal command name, not
+    -- an error and not the root namespace; the command is callable as ::.
+    when: Evaluates("proc f {} {return X}; rename f ::; list [info commands ::] [::]")
+    ensures: completion.code = ok
+    ensures: completion.value = ":: X"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RenameUpdatesWrongArgsName {
+    -- After a rename, arity diagnostics use the new command name.
+    when: Evaluates("proc f {a} {return $a}; rename f g; catch {g} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"g a\""
+}
+
+rule RenameArityErrors {
+    when: Evaluates("rename a b c")
+    ensures: completion.code = error
+    ensures: completion.value = "wrong # args: should be \"rename oldName newName\""
+}
+
+-- ── loops and conditionals ────────────────────────────────────────
+--
+-- control-flow.allium already pins that while/for/foreach complete with
+-- the empty string, and the top-level break/continue codes. This section
+-- adds iteration, varList shapes, arity and nesting.
+
+rule CoreForIteratesStartTestNextBody {
+    -- for runs init, then test/body/next repeatedly while test is true.
+    when: Evaluates("set out {}; for {set i 0} {$i < 3} {incr i} {lappend out $i}; set out")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 1 2"
+}
+
+rule CoreForContinueRunsNextScript {
+    -- continue abandons the body but still runs the next script, so the
+    -- loop cannot get stuck on the skipped iteration.
+    when: Evaluates("set out {}; for {set i 0} {$i < 3} {incr i} {if {$i == 1} continue; lappend out $i}; set out")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 2"
+}
+
+rule CoreForBreakStopsLoop {
+    -- break ends the whole for loop immediately.
+    when: Evaluates("set out {}; for {set i 0} {$i < 5} {incr i} {if {$i == 2} break; lappend out $i}; set out")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 1"
+}
+
+rule CoreForArityErrors {
+    when: Evaluates("for {set i 0}")
+    ensures: completion.code = error
+    ensures: completion.value = "wrong # args: should be \"for start test next command\""
+}
+
+rule CoreForNonBooleanTestErrors {
+    -- A non-boolean test value (after expression evaluation) is an error.
+    when: Evaluates("catch {for {} {\"abc\"} {} {}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "expected boolean value but got \"abc\""
+}
+
+rule CoreForeachMultipleVarsPerList {
+    -- A varList with several names consumes that many elements per
+    -- iteration.
+    when: Evaluates("set out {}; foreach {a b} {1 2 3 4} {lappend out $a$b}; set out")
+    ensures: completion.code = ok
+    ensures: completion.value = "12 34"
+}
+
+rule CoreForeachUnevenFillsEmpty {
+    -- A short final group binds the missing names to the empty string.
+    when: Evaluates("set out {}; foreach {a b} {1 2 3} {lappend out $a-$b}; set out")
+    ensures: completion.code = ok
+    ensures: completion.value = "1-2 3-"
+}
+
+rule CoreForeachMultipleListsUneven {
+    -- With several list arguments iteration continues to the longest; the
+    -- shorter list contributes empty values.
+    when: Evaluates("set out {}; foreach a {1 2} b {x} {lappend out $a$b}; set out")
+    ensures: completion.code = ok
+    ensures: completion.value = "1x 2"
+}
+
+rule CoreForeachMultipleMultiNameVarlists {
+    -- Several varList/list pairs each bind their own names per iteration;
+    -- shorter lists contribute empty names to the last group.
+    when: Evaluates("set out {}; foreach {a b} {1 2 3 4} {c d} {x y} {lappend out $a$b$c$d}; set out")
+    ensures: completion.code = ok
+    ensures: completion.value = "12xy 34"
+}
+
+rule CoreForeachArityErrors {
+    when: Evaluates("foreach x {}")
+    ensures: completion.code = error
+    ensures: completion.value = "wrong # args: should be \"foreach varList list ?varList list ...? command\""
+}
+
+rule CoreWhileRechecksTest {
+    -- while evaluates the test before every iteration, not once.
+    when: Evaluates("set i 0; while {$i < 3} {incr i}; set i")
+    ensures: completion.code = ok
+    ensures: completion.value = "3"
+}
+
+rule CoreWhileNonBooleanTestErrors {
+    when: Evaluates("catch {while {\"abc\"} {}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "expected boolean value but got \"abc\""
+}
+
+rule CoreWhileArityErrors {
+    when: Evaluates("while")
+    ensures: completion.code = error
+    ensures: completion.value = "wrong # args: should be \"while test command\""
+}
+
+rule CoreIfElseifElseBranch {
+    -- if evaluates tests in order and runs only the first true arm.
+    when: Evaluates("if {0} {set r yes} elseif {1} {set r no} else {set r x}")
+    ensures: completion.code = ok
+    ensures: completion.value = "no"
+}
+
+rule CoreIfReturnsBodyValue {
+    -- if completes with the value of the chosen body.
+    when: Evaluates("if {1} {expr 2+3}")
+    ensures: completion.code = ok
+    ensures: completion.value = "5"
+}
+
+rule CoreIfFalseWithoutElseIsEmpty {
+    -- With no true arm and no else, if completes ok with "".
+    when: Evaluates("if {0} {expr 2+3}")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+}
+
+rule CoreIfNonBooleanTestErrors {
+    when: Evaluates("catch {if {\"abc\"} {}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "expected boolean value but got \"abc\""
+}
+
+rule CoreIfArityNoExpression {
+    when: Evaluates("if")
+    ensures: completion.code = error
+    ensures: completion.value = "wrong # args: no expression after \"if\" argument"
+}
+
+rule CoreIfArityNoScript {
+    when: Evaluates("if {1}")
+    ensures: completion.code = error
+    ensures: completion.value = "wrong # args: no script following \"1\" argument"
+}
+
+rule CoreIfThenKeyword {
+    -- The optional `then` keyword is accepted before a body.
+    when: Evaluates("if {1} then {set r T}")
+    ensures: completion.code = ok
+    ensures: completion.value = "T"
+}
+
+rule CoreNestedBreakExitsOnlyInner {
+    -- break in an inner loop ends only that loop; the outer loop continues.
+    when: Evaluates("set out {}; for {set i 0} {$i<3} {incr i} {for {set j 0} {$j<3} {incr j} {if {$j==1} continue; if {$i==2} break; lappend out $i$j}}; set out")
+    ensures: completion.code = ok
+    ensures: completion.value = "00 02 10 12"
+}
+
+rule CoreNestedContinueSkipsOnlyInner {
+    -- continue in an inner loop skips only the inner iteration.
+    when: Evaluates("set out {}; foreach a {1 2} {foreach b {x y} {if {$b eq \"y\"} continue; lappend out $a$b}}; set out")
+    ensures: completion.code = ok
+    ensures: completion.value = "1x 2x"
+}

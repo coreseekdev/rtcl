@@ -215,19 +215,31 @@ fn test_logical_returns_boolean_not_operand() {
 
 #[test]
 fn test_glued_eq_ne_in_operators() {
-    // tclsh: only eq/ne/in glue to a preceding number (3eq2 -> 0).
+    // tclsh 9.1: eq/ne/in/ni/lt/le/gt/ge glue to a preceding number
+    // (ParseLexeme letter-op set; 9.0 added the string comparators).
     let mut interp = Interp::new();
     assert_eq!(eval_expr(&mut interp, "3eq2").unwrap().as_str(), "0");
     assert_eq!(eval_expr(&mut interp, "3ne2").unwrap().as_str(), "1");
     assert_eq!(eval_expr(&mut interp, "3in2").unwrap().as_str(), "0");
     assert_eq!(eval_expr(&mut interp, "3eq2.0").unwrap().as_str(), "0");
+    assert_eq!(eval_expr(&mut interp, "3ni2").unwrap().as_str(), "1");
+    assert_eq!(eval_expr(&mut interp, "3lt2").unwrap().as_str(), "0");
+    assert_eq!(eval_expr(&mut interp, "3gt2").unwrap().as_str(), "1");
+    assert_eq!(eval_expr(&mut interp, "3le2").unwrap().as_str(), "0");
+    assert_eq!(eval_expr(&mut interp, "3ge2").unwrap().as_str(), "1");
+    assert_eq!(eval_expr(&mut interp, "1.5lt2").unwrap().as_str(), "1");
+    assert_eq!(eval_expr(&mut interp, "0x10lt2").unwrap().as_str(), "1");
 }
 
 #[test]
 fn test_invalid_bareword_after_digits() {
-    // tclsh: digit-led alnum runs that aren't numbers are errors.
+    // tclsh 9.1: digit-led alnum runs that aren't numbers or glued word
+    // comparators are errors. The uppercase spelling `3EQ2` and the
+    // letter-following `5ltinf` cover the bareword-join path (`and`/`or`
+    // are not expr operators, `3and2` joins; `lt` followed by a letter
+    // does not lex as an operator).
     let mut interp = Interp::new();
-    for e in ["3x2", "3e", "5mod3", "3and2", "3lt2", "3gt2"] {
+    for e in ["3x2", "3e", "5mod3", "3and2", "3EQ2", "5ltinf"] {
         let err = eval_expr(&mut interp, e).unwrap_err().to_string();
         assert!(
             err.contains(&format!("invalid bareword \"{}\"", e)),

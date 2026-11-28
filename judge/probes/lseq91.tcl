@@ -54,3 +54,18 @@ catch {lseq 0 1e20} m; puts "$m :: $errorCode"
 # series are consumed by list commands as lists
 puts [lseq -5 0]
 puts [join [lseq 0 to 0.6 by 0.2] ,]
+
+# ── 2026-11-28 T1 余项批增钉（tclsh9.1 逐字节冻结）──────────────────
+# 惰性 SeriesRep 验收面：lindex/llength/lrange/foreach/lmap/lsearch/
+# lsort 在巨序列上索引不物化（SERIES_EAGER_MAX=4096 以下走 eager 双路）。
+# 端点 bignum → ARITH IOVERFLOW；NaN/Inf 域分诊：start NaN → domain
+# （len 循环首测即败落 post-check），end NaN → estimate-length 文案
+# （Tcl_PrintDouble 小写 "nan"），step NaN/Inf → domain（0*Inf=NaN），
+# Inf 端点 → max length exceeded。
+# 注：count 为 double（lseq 1e20）的报文随 tclsh 字面量 rep 的编译双路
+# 而异——直接编译形 const-fold 成 double rep 报 IOVERFLOW，catch/自包含
+# 形是 string rep 报 expected integer。本探针统一 catch 形钉 string-rep
+# 路径，与 judge 自包含语料风格一致（直接编译形记为已知偏差）。
+foreach c {{lindex [lseq 0x7fffffff] 0x80000000} {lindex [lseq 0x7fffffff] end-1} {lindex [lseq 0 1e20] 0} {catch {lseq 0 0x8000000000000000} m; set m} {catch {lseq 0x8000000000000000 10} m; set m} {catch {lseq 0 10 0x8000000000000000} m; set m} {catch {lseq 5 count 0x8000000000000000} m; set m} {catch {lseq 5 count 1e20} m; set m} {catch {lseq 5 count 2.5} m; set m} {catch {lseq 0 10 nan} m; set m} {catch {lseq NaN 5} m; set m} {catch {lseq 0 nan} m; set m} {catch {lseq nan nan} m; set m} {catch {lseq 0 inf} m; set m} {catch {lseq 0 10 inf} m; set m} {lindex [lseq 10 0x7fffffffffffffff] 5} {lsearch [lseq 0 1000000] 42} {lrange [lseq 0x7fffffff] 100 102} {lmap x [lseq 1 5] {expr {$x * 2}}} {foreach x [lseq 1 5] {incr t $x}; set t} {string length [lseq 0 9]} {join [lseq 0 4] ,}} {
+    if {[catch $c m]} { puts "$c => ERR: $m" } else { puts "$c => '[string range $m 0 40]' len=[llength $m]" }
+}

@@ -75,7 +75,7 @@ rule UpvarLinksToCallerFrame {
 rule UplevelBeyondStackIsError {
     -- uplevel with a level above the current call stack is an error,
     -- never a silent evaluation in the current scope.
-    when: Evaluates("uplevel 1 {set q 9}    -- at top level")
+    when: Evaluates("uplevel 1 {set q 9}")
     ensures: completion.code = error
     -- oracle message: bad level "1"
 }
@@ -127,7 +127,7 @@ rule ArrayUnsetWholeRemovesVariable {
 
 rule NamespaceEvalQualifiesVariables {
     -- set inside `namespace eval foo` writes ::foo::x, not ::x.
-    when: Evaluates("set ::foo::x    -- after: namespace eval foo {set x 1}")
+    when: Evaluates("namespace eval foo {set x 1}; set ::foo::x")
     ensures: completion.code = ok
     ensures: completion.value = "1"
 }
@@ -135,13 +135,13 @@ rule NamespaceEvalQualifiesVariables {
 rule ProcExecutesInDefinitionNamespace {
     -- A proc defined inside `namespace eval foo` observes
     -- [namespace current] = ::foo when called, regardless of caller.
-    when: Evaluates("foo::p    -- after: namespace eval foo {proc p {} {namespace current}}")
+    when: Evaluates("namespace eval foo {proc p {} {namespace current}}; foo::p")
     ensures: completion.code = ok
     ensures: completion.value = "::foo"
 }
 
 rule NamespaceVariableCommandLinksNamespaceVar {
-    when: Evaluates("set ::foo::v    -- after: namespace eval foo {variable v 7}")
+    when: Evaluates("namespace eval foo {variable v 7}; set ::foo::v")
     ensures: completion.code = ok
     ensures: completion.value = "7"
 }
@@ -154,24 +154,24 @@ rule ProcSetCreatesFrameLocalNotNsVar {
     -- proc 体是严格局部帧：ns 内定义的 proc 调用时 set 建**帧局部**，
     -- 定义 ns 的变量表不出现该名（proc 的 ns 只影响命令解析与
     -- variable 链目标）。
-    when: Evaluates("info exists d::x    -- after: namespace eval d {proc p {} {set x 1}}; p")
+    when: Evaluates("namespace eval d {proc p {} {set x 1}}; d::p; info exists d::x")
     ensures: completion.code = ok
     ensures: completion.value = "0"
-    -- probe: namespace eval d { proc p {} {set x 1} }; p; puts [info exists d::x]
+    -- probe: namespace eval d { proc p {} {set x 1} }; d::p; puts [info exists d::x]
 }
 
 rule ProcVariableDeclAccumulatesAcrossCalls {
-    -- proc 内 variable 声明链到**定义 ns** 的变量表；initializer 只在
-    -- 创建时生效（变量已存在则保留现值）——跨调用累积。
-    when: Evaluates("set ::d::x    -- after: namespace eval d {proc p {} {variable x 5; incr x}}; p; p")
+    -- proc 内 variable 声明链到**定义 ns** 的变量表；不带初值的声明保留
+    -- 现值（带初值的 variable 每次都会赋值，见 oracle 9.1）——跨调用累积。
+    when: Evaluates("namespace eval d {variable x 5; proc p {} {variable x; incr x}}; d::p; d::p; set ::d::x")
     ensures: completion.code = ok
     ensures: completion.value = "7"
-    -- probe: namespace eval d { proc p {} {variable x 5; incr x} }; p; p; puts [set ::d::x]
+    -- probe: namespace eval d { variable x 5; proc p {} {variable x; incr x} }; d::p; d::p; puts [set ::d::x]
 }
 
 rule ProcCalledFromNsBodyStillStrictLocal {
     -- 调用点在 ns eval 体内也不改变 proc 的严格局部性。
-    when: Evaluates("info exists d::z    -- after: proc p {} {set z 9}; namespace eval d {p}")
+    when: Evaluates("proc p {} {set z 9}; namespace eval d {p}; info exists d::z")
     ensures: completion.code = ok
     ensures: completion.value = "0"
     -- probe: proc p {} {set z 9}; namespace eval d {p}; puts [info exists d::z]
@@ -179,16 +179,16 @@ rule ProcCalledFromNsBodyStillStrictLocal {
 
 rule ProcGlobalTargetsRootNamespace {
     -- global 恒链**根 ns**，与 proc 的定义 ns 无关。
-    when: Evaluates("set g    -- after: namespace eval d {proc p {} {global g; set g 42}}; p")
+    when: Evaluates("namespace eval d {proc p {} {global g; set g 42}}; d::p; set g")
     ensures: completion.code = ok
     ensures: completion.value = "42"
-    -- probe: namespace eval d { proc p {} {global g; set g 42} }; p; puts $g
+    -- probe: namespace eval d { proc p {} {global g; set g 42} }; d::p; puts $g
 }
 
 rule UpvarThroughNsEvalFrame {
     -- ns eval 体是帧：upvar 1 从体链到**调用 namespace eval 的帧**
     -- （顶层的 g 是全局 g）。
-    when: Evaluates("set g    -- after: set g 0; namespace eval d {upvar 1 g l; set l 5}")
+    when: Evaluates("set g 0; namespace eval d {upvar 1 g l; set l 5}; set g")
     ensures: completion.code = ok
     ensures: completion.value = "5"
     -- probe: set g 0; namespace eval d {upvar 1 g l; set l 5}; puts $g
@@ -196,7 +196,7 @@ rule UpvarThroughNsEvalFrame {
 
 rule UpvarElementQualifiedTarget {
     -- upvar 0 链元素目标（限定名绕过 proc 帧局部解析）。
-    when: Evaluates("set a(e)    -- after: set a(e) 1; proc p {} {upvar 0 ::a(e) x; set x 7}; p")
+    when: Evaluates("set a(e) 1; proc p {} {upvar 0 ::a(e) x; set x 7}; p; set a(e)")
     ensures: completion.code = ok
     ensures: completion.value = "7"
     -- probe: set a(e) 1; proc p {} {upvar 0 ::a(e) x; set x 7}; p; puts $a(e)
@@ -206,7 +206,7 @@ rule UpvarToDeletedNsVariable {
     -- ns delete 后对已销毁 ns 变量建 upvar 链：建链时刻目标的父 ns
     -- 必须存在，否则报 can't access（var-1.15 族深水）。oracle 实证
     -- 2026-11-03；rtcl 原静默建帧局部（Frame 臂字面名）已修。
-    when: Evaluates("catch {mk} m; set m    -- after: namespace eval d {variable v 5}; proc mk {} {upvar 0 ::d::v l; set l 9}; namespace delete d")
+    when: Evaluates("namespace eval d {variable v 5}; proc mk {} {upvar 0 ::d::v l; set l 9}; namespace delete d; catch {mk} m; set m")
     ensures: completion.code = ok
     ensures: completion.value = "can't access \"::d::v\": parent namespace doesn't exist"
     -- probe: namespace eval d {variable v 5}; proc mk {} {upvar 0 ::d::v l; set l 9}; namespace delete d; catch {mk} m; puts $m
@@ -216,7 +216,7 @@ rule VariableLinkIsPerEvalBodyFrame {
     -- variable 声明是**体帧瞬态**：内层 ns eval 体无链接；其裸名 set
     -- 落内层命名空间自身（::o::i::s），既不回退全局，也不写外层链接
     -- （::o::s 保持 9，全局 s 保持 1）。
-    when: Evaluates("list $::o::s $s [set ::o::i::s]    -- after: set s 1; namespace eval o {variable s 9; namespace eval i {set s 2}}")
+    when: Evaluates("set s 1; namespace eval o {variable s 9; namespace eval i {set s 2}}; list $::o::s $s [set ::o::i::s]")
     ensures: completion.code = ok
     ensures: completion.value = "9 1 2"
     -- probe 2026-11-27 tclsh9.1: ...; puts [list $::o::s $s [set ::o::i::s]] => 9 1 2
@@ -225,14 +225,14 @@ rule VariableLinkIsPerEvalBodyFrame {
 
 rule NsBodySetHitsDeclaredLink {
     -- 同帧内声明后的裸名 set 落链接目标（ns 变量），全局不动。
-    when: Evaluates("list $::o::s $s    -- after: set s 1; namespace eval o {variable s 9; set s 8}")
+    when: Evaluates("set s 1; namespace eval o {variable s 9; set s 8}; list $::o::s $s")
     ensures: completion.code = ok
     ensures: completion.value = "8 1"
     -- probe: set s 1; namespace eval o {variable s 9; set s 8}; puts [list $::o::s $s]
 }
 
 rule NsDeleteDestroysVariables {
-    when: Evaluates("info exists d::x    -- after: namespace eval d {set x 5}; namespace delete d")
+    when: Evaluates("namespace eval d {set x 5}; namespace delete d; info exists d::x")
     ensures: completion.code = ok
     ensures: completion.value = "0"
     -- probe: namespace eval d {set x 5}; namespace delete d; puts [info exists d::x]
@@ -244,7 +244,7 @@ rule SelfDeleteBodyKeepsRunning {
     -- ns 变量表不复活——限定查询恒不可见，裸名 keep-alive 链接除外
     --）。oracle 实证 2026-11-03：info exists d::y = 0。rtcl 修复 =
     -- 限定名死父 ns 守卫 + ns_eval 退出清扫（D-2 FIXED）。
-    when: Evaluates("info exists d::y    -- after: namespace eval d {namespace delete [namespace current]; set y 3}")
+    when: Evaluates("namespace eval d {namespace delete [namespace current]; set y 3}; info exists d::y")
     ensures: completion.code = ok
     ensures: completion.value = "0"
     -- probe: namespace eval d {namespace delete [namespace current]; set y 3}; puts [info exists d::y]
@@ -254,7 +254,7 @@ rule WhichVariableDoesNotFallBackToGlobal {
     -- 9.1: namespace which -variable reports only a variable visible in the
     -- current namespace (or a variable link in scope). A same-named global
     -- is NOT visible from a namespace body, so the answer is empty.
-    when: Evaluates("namespace eval d {namespace which -variable g}    -- after: set g 1")
+    when: Evaluates("set g 1; namespace eval d {namespace which -variable g}")
     ensures: completion.code = ok
     ensures: completion.value = ""
     -- probe 2026-11-27 tclsh9.1: set g 1; puts [namespace eval d {namespace which -variable g}]
@@ -267,7 +267,7 @@ rule NsBodyIncrCreatesNamespaceVariable {
     -- 9.1: an unqualified incr in a namespace eval body resolves in the
     -- current namespace, creating ::d::w (0 -> 1); the global w is left
     -- untouched. The preceding set d2 also lands in ::d::d2.
-    when: Evaluates("list $w $::d::w $::d::d2    -- after: set w 1; namespace eval d {set d2 [incr w]}")
+    when: Evaluates("set w 1; namespace eval d {set d2 [incr w]}; list $w $::d::w $::d::d2")
     ensures: completion.code = ok
     ensures: completion.value = "1 1 1"
     -- probe 2026-11-27 tclsh9.1: set w 1; namespace eval d {set d2 [incr w]}; puts [list $w $::d::w $::d::d2]
@@ -279,7 +279,7 @@ rule NsBodyIncrDoesNotTouchGlobal {
     -- A global linked write (proc global) and a later namespace-body incr
     -- are separate variables: the body incr creates ::d::k while the global
     -- keeps the value written through the link.
-    when: Evaluates("list $k $::d::k    -- after: set k 1; proc bump {} {global k; incr k}; bump; namespace eval d {incr k}")
+    when: Evaluates("set k 1; proc bump {} {global k; incr k}; bump; namespace eval d {incr k}; list $k $::d::k")
     ensures: completion.code = ok
     ensures: completion.value = "2 1"
     -- probe 2026-11-27 tclsh9.1: ...; puts [list $k $::d::k] => 2 1
@@ -290,7 +290,7 @@ rule NsBodyArrayElementStaysInNamespace {
     -- An element write in a namespace eval body creates the element in the
     -- namespace's own array (::d::a(y)); it does not create the element in a
     -- same-named global array.
-    when: Evaluates("list [array names ::a] [array names ::d::a]    -- after: set a(x) 1; namespace eval d {set a(y) 2}")
+    when: Evaluates("set a(x) 1; namespace eval d {set a(y) 2}; list [array names ::a] [array names ::d::a]")
     ensures: completion.code = ok
     ensures: completion.value = "x y"
     -- probe 2026-11-27 tclsh9.1: ...; puts [list [array names a] [array names ::d::a]]

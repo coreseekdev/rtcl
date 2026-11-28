@@ -1,0 +1,361 @@
+-- allium: 3
+-- tcl-util.allium
+-- Behaviour spec: stable ::tcl::* utility commands outside the core
+-- ensembles — tcl::prefix (all/longest/match), parray, the unknown
+-- handler contract, and the stable tcl::unsupported introspection
+-- commands (representation, corotype, grapheme).
+-- Oracle: tclsh 9.1.0 (core-9-1-0).
+--
+-- Scope: observable completions of these commands in a fresh interpreter.
+-- Excludes: the ::tcl command-set inventory, build-info, pkgconfig,
+-- timerate and zipfs root (interp.allium); package unknown / auto_load /
+-- load / unload (package.allium); the public history ensemble
+-- (utility.allium, which tcl::history aliases); assemble/disassemble/
+-- getbytecode bytecode text, which is compiler-build specific
+-- (interp.allium pins the assemble instruction menu).
+-- Docs: doc/prefix.n, doc/unknown.n. Probes re-run against tclsh 9.1.0
+-- on 2026-11-28.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── tcl::prefix ──────────────────────────────────────────────────
+
+rule TclUtilPrefixSubcommandMenu {
+    -- The subcommand menu is closed and alphabetical; a bad name is a
+    -- lookup error naming all three subcommands.
+    when: Evaluates("catch {tcl::prefix gorp} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown or ambiguous subcommand \"gorp\": must be all, longest, or match"
+    -- probe: 2026-11-28 tclsh9.1; doc/prefix.n
+}
+
+rule TclUtilPrefixRequiresArgs {
+    when: Evaluates("catch {tcl::prefix} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"tcl::prefix subcommand ?arg ...?\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule TclUtilPrefixAllMatching {
+    -- all returns every table element starting with the string, in table
+    -- order; matching is literal (not glob).
+    when: Evaluates("tcl::prefix all {a ab abc b} ab")
+    ensures: completion.code = ok
+    ensures: completion.value = "ab abc"
+    -- probe: 2026-11-28 tclsh9.1; doc/prefix.n "all"
+}
+
+rule TclUtilPrefixAllEmptyPrefix {
+    -- The empty prefix matches every element, preserving table order.
+    when: Evaluates("tcl::prefix all {a ab abc b} {}")
+    ensures: completion.code = ok
+    ensures: completion.value = "a ab abc b"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule TclUtilPrefixLongestCommon {
+    -- longest returns the longest common prefix of the matching elements;
+    -- with a single match that is the whole element.
+    when: Evaluates("list [tcl::prefix longest {abc abd} ab] [tcl::prefix longest {abc} ab] [tcl::prefix longest {abcdef abb xyz} abc]")
+    ensures: completion.code = ok
+    ensures: completion.value = "ab abc abcdef"
+    -- probe: 2026-11-28 tclsh9.1; doc/prefix.n "longest"
+}
+
+rule TclUtilPrefixMatchUniqueAndExact {
+    -- match accepts an exact element or an unambiguous prefix of one;
+    -- -exact narrows it to exact equality only.
+    when: Evaluates("list [tcl::prefix match {abcdef abb xyz} abc] [tcl::prefix match {abcdef abb xyz} abcdef] [tcl::prefix match -exact {a b} a]")
+    ensures: completion.code = ok
+    ensures: completion.value = "abcdef abcdef a"
+    -- probe: 2026-11-28 tclsh9.1; doc/prefix.n "match"
+}
+
+rule TclUtilPrefixMatchAmbiguous {
+    -- A prefix of several elements is an ambiguity error that lists all
+    -- candidates in table order.
+    when: Evaluates("catch {tcl::prefix match {abcdef abb xyz} ab} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "ambiguous option \"ab\": must be abcdef, abb, or xyz"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule TclUtilPrefixMatchNoMatch {
+    -- No candidate is a bad-option error; the default noun is "option".
+    when: Evaluates("catch {tcl::prefix match {a ab} z} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"z\": must be a or ab"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule TclUtilPrefixExactRejectsPrefix {
+    -- With -exact a mere prefix is treated as no match, not ambiguity.
+    when: Evaluates("catch {tcl::prefix match -exact {abc} ab} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"ab\": must be abc"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule TclUtilPrefixMessageOverridesNoun {
+    -- -message replaces the "option" noun in both the ambiguity and the
+    -- no-match error, while keeping the candidate list.
+    when: Evaluates("list [catch {tcl::prefix match -message switch {apa ada bepa} a} m1] $m1 [catch {tcl::prefix match -message switch {apa ada bepa} z} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {ambiguous switch \"a\": must be apa, ada, or bepa} 1 {bad switch \"z\": must be apa, ada, or bepa}"
+    -- probe: 2026-11-28 tclsh9.1; doc/prefix.n "-message"
+}
+
+rule TclUtilPrefixErrorOptionEmptySuppresses {
+    -- An empty -error option list suppresses the error: a miss yields the
+    -- empty string with ok completion, while a hit still returns it.
+    when: Evaluates("list [tcl::prefix match -error {} {a b} z] [tcl::prefix match -error {} {a b} a]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} a"
+    -- probe: 2026-11-28 tclsh9.1; doc/prefix.n "-error"
+}
+
+rule TclUtilPrefixBadOptionMenu {
+    when: Evaluates("catch {tcl::prefix match -nonsense {a} b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"-nonsense\": must be -error, -exact, or -message"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule TclUtilPrefixSubcommandArity {
+    -- Each subcommand has its own fixed arity message; an option missing
+    -- its value falls through to match's own wrong-#-args error.
+    when: Evaluates("list [catch {tcl::prefix match -message} m1] $m1 [catch {tcl::prefix all {a}} m2] $m2 [catch {tcl::prefix longest} m3] $m3")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {wrong # args: should be \"tcl::prefix match ?options? table string\"} 1 {wrong # args: should be \"tcl::prefix all table string\"} 1 {wrong # args: should be \"tcl::prefix longest table string\"}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── parray ───────────────────────────────────────────────────────
+-- parray is a hidden native command in 9.1: it is invocable but absent
+-- from `info commands`. Its success path writes a sorted `A(key) = value`
+-- listing straight to stdout (not through the puts command), so only its
+-- quiet success and error faces are pinned; rename-puts capture does not
+-- intercept it. Probe: 2026-11-28 tclsh9.1.
+
+rule TclUtilParrayRejectsNonArray {
+    -- A scalar or absent variable is an error, quoting the name.
+    when: Evaluates("catch {parray NoSuchArray} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "\"NoSuchArray\" isn't an array"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule TclUtilParrayArity {
+    -- It takes exactly a variable name and an optional pattern.
+    when: Evaluates("list [catch {parray} m1] $m1 [catch {parray A b c} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {wrong # args: should be \"parray a ?pattern?\"} 1 {wrong # args: should be \"parray a ?pattern?\"}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule TclUtilParrayQuietSuccess {
+    -- When the pattern selects no element (or the array is empty) nothing
+    -- is written, and the command's own result is the empty string; the
+    -- array is left untouched.
+    when: Evaluates("array set A {b 2 a 1}; array set E {}; list [parray A zzz*] [parray E] [array size A] [array size E]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {} 2 0"
+    -- probe: 2026-11-28 tclsh9.1 (output shape not pinned: parray bypasses
+    -- puts, see the section note)
+}
+
+rule TclUtilParrayHiddenFromInventory {
+    -- Despite being callable, parray is hidden from command inventories;
+    -- this is the native-command registry's hidden flag, not an alias.
+    when: Evaluates("list [llength [info commands parray]] [catch {parray NoSuchArray} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 1 {\"NoSuchArray\" isn't an array}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── unknown handler ──────────────────────────────────────────────
+-- doc/unknown.n: an unknown command invokes the namespace handler with
+-- the fully-substituted words, and the handler's completion becomes the
+-- original command's completion.
+
+rule UnkDefaultIsProc {
+    -- The default handler is a Tcl procedure named unknown.
+    when: Evaluates("list [info cmdtype unknown] [expr {[lsearch -exact [info procs] unknown] >= 0}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "proc 1"
+    -- probe: 2026-11-28 tclsh9.1; doc/unknown.n
+}
+
+rule UnkReceivesSubstitutedWords {
+    -- The handler receives command name plus arguments as separate words,
+    -- after substitution and with list structure preserved.
+    when: Evaluates("proc unknown args {list [llength $args] $args}; foo {a b} c")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 {foo {a b} c}"
+    -- probe: 2026-11-28 tclsh9.1; doc/unknown.n
+}
+
+rule UnkRunsAtCallerLevel {
+    -- The handler runs one level below the calling frame and sees the
+    -- fully-qualified name in info level 0; at top level that is level 1,
+    -- inside a proc it is level 2.
+    when: Evaluates("proc p {} {foo}; proc unknown args {list [info level] [info level 0]}; list [p] [foo a]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{2 {::unknown foo}} {1 {::unknown foo a}}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule UnkResultBecomesCommandResult {
+    -- Whatever the handler returns is the original command's ok result.
+    when: Evaluates("proc unknown args {return \"R:$args\"}; list [foo 1] [foo]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{R:foo 1} R:foo"
+    -- probe: 2026-11-28 tclsh9.1; doc/unknown.n "result"
+}
+
+rule UnkErrorPropagatesCode {
+    -- An error return from the handler keeps both its message and its
+    -- custom -errorcode, exactly as if the original command raised it.
+    when: Evaluates("proc unknown args {return -code error -errorcode {MY CODE} boom}; list [catch {zzz} m] $m $::errorCode")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 boom {MY CODE}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule UnkBreakAndContinuePropagate {
+    -- Non-error completion codes pass through unchanged: break is code 3
+    -- and continue is code 4, carrying the handler's payload.
+    when: Evaluates("proc unknown args {return -code break BRK}; set b [list [catch {zzz} m] $m]; proc unknown args {return -code continue CONT}; list $b [catch {yyy} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "{3 BRK} 4 CONT"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule UnkReplacementAfterRename {
+    -- Renaming the handler away and defining a new proc unknown installs
+    -- it as the live dispatch target for subsequent unknown commands.
+    when: Evaluates("rename unknown {}; proc unknown args {return \"U[llength $args]\"}; foo a b")
+    ensures: completion.code = ok
+    ensures: completion.value = "U3"
+    -- probe: 2026-11-28 tclsh9.1; doc/unknown.n EXAMPLE
+}
+
+rule UnkRemovalDisablesDispatch {
+    -- With no unknown command at all, dispatch fails immediately with the
+    -- TCL LOOKUP COMMAND error code instead of attempting auto-loading.
+    when: Evaluates("rename unknown {}; catch {nosuchcmd a} m; list $m $::errorCode")
+    ensures: completion.code = ok
+    ensures: completion.value = "{invalid command name \"nosuchcmd\"} {TCL LOOKUP COMMAND nosuchcmd}"
+    -- probe: 2026-11-28 tclsh9.1; doc/unknown.n "no such command"
+}
+
+rule UnkDefaultAutoloads {
+    -- The default handler calls auto_load, then re-executes the original
+    -- command once the autoload has defined it.
+    when: Evaluates("set auto_index(foo) {proc foo {x} {return F$x}}; foo 9")
+    ensures: completion.code = ok
+    ensures: completion.value = "F9"
+    -- probe: 2026-11-28 tclsh9.1; doc/unknown.n
+}
+
+rule UnkDefaultErrorShape {
+    -- When nothing resolves the name, the default handler's final error
+    -- is the standard invalid-command message with a lookup errorCode.
+    when: Evaluates("catch {nosuchcmd a} m; list $m $::errorCode")
+    ensures: completion.code = ok
+    ensures: completion.value = "{invalid command name \"nosuchcmd\"} {TCL LOOKUP COMMAND nosuchcmd}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule UnkRecursionGuard {
+    -- The default handler refuses to re-enter itself for the same name
+    -- while an autoload for that name is pending.
+    when: Evaluates("set auto_index(foo) {foo}; catch {foo} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "self-referential recursion in \"unknown\" for command \"foo\""
+    -- probe: 2026-11-28 tclsh9.1; doc/unknown.n body (UnknownPending)
+}
+
+-- ── tcl::unsupported (stable introspection faces) ────────────────
+-- The namespace itself is not an ensemble command: only its fully named
+-- subcommands exist. Assemble/disassemble/getbytecode are covered (or
+-- deliberately left unpinned) in interp.allium because their output is
+-- compiler-build specific.
+
+rule TclUtilUnsupportedIsNotEnsemble {
+    when: Evaluates("catch {tcl::unsupported} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "invalid command name \"tcl::unsupported\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule TclUtilUnsupportedRepresentationString {
+    -- representation describes the object in a stable prose shape: type,
+    -- refcount, pointer and string representation; the pointer itself is
+    -- of course not pinned.
+    when: Evaluates("string match {value is a pure string with a refcount of *, object pointer at *, string representation \"42\"} [tcl::unsupported::representation 42]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule TclUtilUnsupportedRepresentationInternal {
+    -- A dict created by dict create has an internal representation and no
+    -- string representation until shimmering.
+    when: Evaluates("string match {value is a dict with a refcount of *, object pointer at *, internal representation *, no string representation} [tcl::unsupported::representation [dict create a 1]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule TclUtilUnsupportedCorotype {
+    -- corotype reports how a live coroutine last suspended (yield here)
+    -- and rejects non-coroutine names.
+    when: Evaluates("coroutine co apply {{} {yield}}; list [tcl::unsupported::corotype co] [catch {tcl::unsupported::corotype nosuch} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "yield 1 {can only get coroutine type of a coroutine}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule TclUtilUnsupportedGraphemeMenu {
+    when: Evaluates("catch {tcl::unsupported::grapheme gorp} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown or ambiguous subcommand \"gorp\": must be index, length, next, offset, prev, range, reverse, or split"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule TclUtilUnsupportedGraphemeClusters {
+    -- Grapheme operations count extended clusters, not code points:
+    -- e + combining acute + x is two clusters, its first index is the
+    -- two-code-point cluster, and reversal keeps the cluster intact.
+    when: Evaluates("set s \"e[format %c 0x301]x\"; list [tcl::unsupported::grapheme length $s] [llength [tcl::unsupported::grapheme split $s]] [string length [tcl::unsupported::grapheme index $s 0]] [string length [tcl::unsupported::grapheme reverse $s]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "2 2 2 3"
+    -- probe: 2026-11-28 tclsh9.1 (the combining mark is built with
+    -- format %c to keep the probe free of encoding ambiguity)
+}
+
+rule TclUtilUnsupportedGraphemeIndexRangeOffset {
+    -- ASCII index/range are character slices and offset maps a character
+    -- index to its byte offset.
+    when: Evaluates("list [tcl::unsupported::grapheme index \"abc\" 1] [tcl::unsupported::grapheme range \"abcd\" 1 2] [tcl::unsupported::grapheme offset \"abc\" 2]")
+    ensures: completion.code = ok
+    ensures: completion.value = "b bc 2"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── other stable ::tcl::* utility ────────────────────────────────
+
+rule TclUtilInitAutoPathShape {
+    -- tcl::InitAutoPath returns the two zipfs library roots followed by
+    -- one installation-specific directory; only its shape and the first
+    -- two elements are pinned.
+    when: Evaluates("list [llength [tcl::InitAutoPath]] [lindex [tcl::InitAutoPath] 0] [lindex [tcl::InitAutoPath] 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 //zipfs:/lib/tcl/tcl_library //zipfs:/lib/tcl"
+    -- probe: 2026-11-28 tclsh9.1
+}

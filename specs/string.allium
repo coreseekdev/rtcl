@@ -3,12 +3,10 @@
 -- Behaviour spec: Tcl string commands. Oracle: tclsh 9.1.0 (core-9-1-0).
 -- T1/T2/T3 rules re-anchored 2026-11-27.
 --
--- Indices in Tcl strings are character-based, never byte offsets.  For
--- the BMP (all of tclsh 8.6's practical surface) tclsh counts UCS-2
--- code units and rtcl counts Unicode code points — these agree except
--- for astral-plane characters, where tclsh 8.6 counts a surrogate pair
--- as 2 and rtcl as 1 (deliberate 8.7/9-style policy, DIVERGENCES.md
--- D-27; string length "a𐀀c" => 4 in tclsh, 3 in rtcl).
+-- Indices in Tcl strings are character (code point) based, never byte
+-- offsets.  tclsh 9.1 counts astral-plane characters as one code point
+-- (`string length "a\U00010000c"` = 3); an explicit surrogate pair is
+-- two characters (= 4).  This supersedes the 8.6 UCS-2 note (D-27).
 
 use "./interp.allium" as interp
 
@@ -51,7 +49,8 @@ rule StringIsBooleanAcceptsAbbreviations {
     when: Evaluates("string is boolean tru")
     ensures: completion.code = ok
     ensures: completion.value = "1"
-    -- also: string is boolean 2 => 1 (any nonzero number is true)
+    -- 9.1 booleans are 0/1 and true/false words only: `string is
+    -- boolean 2` => 0, `0x10` => 0 (8.6 accepted any nonzero number).
 }
 
 rule StringIsIntegerAcceptsWhitespaceAndHex {

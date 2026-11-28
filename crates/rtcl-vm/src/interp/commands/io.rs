@@ -1567,7 +1567,10 @@ fn libc_enoent() -> i32 {
 #[derive(Clone, Copy)]
 pub(crate) enum AccessCheck { Read, Write, Exec }
 
-#[cfg(feature = "file")]
+// any(file, io)：NativeFs（host.rs，any(file, io) 编译）的 readable/
+// writable/executable 探测走这里——wasm Core Profile（io 无 file）
+// 组合同样需要（2026-11-28 D6 双轨拆分时实证的潜伏 cfg 断裂）。
+#[cfg(any(feature = "file", feature = "io"))]
 pub(crate) fn fs_access(path: &str, check: AccessCheck) -> bool {
     let p = std::path::Path::new(path);
     if !p.exists() { return false; }

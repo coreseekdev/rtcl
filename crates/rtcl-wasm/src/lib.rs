@@ -53,22 +53,30 @@ impl RtclHandle {
         // 重入哨兵在导出层拒绝 JIT 窗口内的 JS 重入）。
         #[cfg(feature = "jit")]
         rtcl_jit::proc_exec::install();
-        handle
-            .interp
-            .load_ui()
-            .map_err(|e| JsValue::from_str(&format!("ui.tcl failed to load: {e}")))?;
-        handle
-            .interp
-            .load_http()
-            .map_err(|e| JsValue::from_str(&format!("http.tcl failed to load: {e}")))?;
-        handle
-            .interp
-            .load_log()
-            .map_err(|e| JsValue::from_str(&format!("log.tcl failed to load: {e}")))?;
-        handle
-            .interp
-            .load_rules()
-            .map_err(|e| JsValue::from_str(&format!("rules.tcl failed to load: {e}")))?;
+        // ui/http/log/rules 词表层是 std 轨（网页 dispatcher 全量面）的
+        // 加载面：三者都依赖 json（http.tcl 桥 opts、log.tcl 解码、
+        // ui.tcl 序列化）与 open——Core Profile（core feature，json/file
+        // 关）构造即失败，故 core 轨只带 stdlib 预置层（Interp::new 的
+        // stdlib.tcl）。宿主仍可经 interp() 显式 load_*（自行权衡面）。
+        #[cfg(feature = "std-track")]
+        {
+            handle
+                .interp
+                .load_ui()
+                .map_err(|e| JsValue::from_str(&format!("ui.tcl failed to load: {e}")))?;
+            handle
+                .interp
+                .load_http()
+                .map_err(|e| JsValue::from_str(&format!("http.tcl failed to load: {e}")))?;
+            handle
+                .interp
+                .load_log()
+                .map_err(|e| JsValue::from_str(&format!("log.tcl failed to load: {e}")))?;
+            handle
+                .interp
+                .load_rules()
+                .map_err(|e| JsValue::from_str(&format!("rules.tcl failed to load: {e}")))?;
+        }
         Ok(handle)
     }
 

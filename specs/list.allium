@@ -27,8 +27,9 @@ rule MalformedListIsAnError {
     -- Commands that parse a list reject malformed list strings
     -- (unbalanced braces/quotes); they never silently treat them as
     -- empty or partially parsed lists.
-    when: Evaluates("llength \"{\"")
-    ensures: completion.code = error
+    when: Evaluates("catch {llength [format %c 123]} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unmatched open brace in list"
     -- oracle message: unmatched open brace in list
     -- applies to: llength, lindex, lrange, lsort, lsearch, lappend,
     --   foreach, lmap, join, string is list, expr in/ni operands

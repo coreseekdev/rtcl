@@ -51,9 +51,12 @@ rule ReadWriteFileInterleavesAtOnePosition {
 }
 
 rule SeekOnNonseekableChannelMessage {
-    when: Evaluates("catch {seek stdin 0} m; set m")
+    when: Evaluates("lassign [chan pipe] r w; set c [catch {seek $r 0} e]; close $r; close $w; list $c [regsub {on \"[^\"]*\"} $e {on CH}]")
     ensures: completion.code = ok
-    -- oracle: error during seek on "stdin": invalid seek
+    ensures: completion.value = "1 {error during seek on CH: illegal seek}"
+    -- oracle: error during seek on "fileN": illegal seek (pipe channel);
+    -- stdin reports "invalid seek" but stdin doubles as the audit's script
+    -- source, so the pipe channel is pinned instead.
     -- rtcl: ... : stdin is not seekable  [D-35]
 }
 

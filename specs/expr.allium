@@ -199,8 +199,9 @@ rule ExprDoubleQuotedWordsSubstitute {
 
 rule ExprMalformedListOperandErrors {
     -- in / ni parse the right operand as a list; a malformed list errors.
-    when: Evaluates("expr {\"a\" in \"{\"}")
-    ensures: completion.code = error
+    when: Evaluates("set b [format %c 123]; catch {expr {\"a\" in $b}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unmatched open brace in list"
     -- oracle: unmatched open brace in list
 }
 

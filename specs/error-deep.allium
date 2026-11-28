@@ -119,9 +119,11 @@ rule ReturnErrorcodeDoesNotPolluteGlobalErrorCode {
 rule ExitIsNotCatchable {
     -- exit terminates the process immediately; catch cannot intercept it
     -- and nothing after it runs.
-    when: Evaluates("catch {exit 3} m; puts after")
-    ensures: completion.code = error
-    -- oracle: prints nothing, process exit code 3
+    when: Evaluates("set ch [file tempfile f]; puts $ch {catch {exit 3} m; puts after}; close $ch; catch {exec [info nameofexecutable] $f} m o; list [lrange [dict get $o -errorcode] 0 0] [lindex [dict get $o -errorcode] end] [string length $m]")
+    ensures: completion.code = ok
+    ensures: completion.value = "CHILDSTATUS 3 31"
+    -- oracle: child prints nothing, process exit code 3, exec reports
+    -- "child process exited abnormally" (31 bytes)
     -- rtcl: prints "after", exit code 0 (exit is catchable)  [D-7 FIXED 2026-11-03]
 }
 

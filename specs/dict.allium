@@ -90,9 +90,10 @@ rule DictIncrNonIntegerErrors {
 rule DictLappendBadListErrors {
     -- dict lappend on a value that is not a valid list is an error and
     -- leaves the dict unchanged.
-    when: Evaluates("set v \"x{ y\"; set d [dict create k $v]; catch {dict lappend d k z} m; list $m $d")
+    when: Evaluates("set v [format %c 123]; set d [dict create k $v]; catch {dict lappend d k z} m; list $m $d")
     ensures: completion.code = ok
-    -- oracle: unmatched open brace in list | k "x{ y"
+    ensures: completion.value = "{unmatched open brace in list} {k \\{}"
+    -- oracle: unmatched open brace in list | k "\{"
     -- rtcl: silently resets to {k z}  [D-13 FIXED 2026-11-03]
 }
 

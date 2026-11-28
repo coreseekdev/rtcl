@@ -62,9 +62,10 @@ rule StringIsIntegerAcceptsWhitespaceAndHex {
 }
 
 rule StringIsListRejectsMalformed {
-    when: Evaluates("string is list \"{\"")
+    when: Evaluates("string is list [format %c 123]")
     ensures: completion.code = ok
     ensures: completion.value = "0"
+    -- probe 2026-11-28 tclsh9.1
 }
 
 rule StringTrimRemovesCharSetFromBothEnds {

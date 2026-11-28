@@ -1,0 +1,326 @@
+-- allium: 3
+-- info.allium
+-- Behaviour spec: the `info` introspection ensemble — procedure metadata
+-- (args/body/default), command and variable inventories, level/frame,
+-- completion/existence checks, runtime identity, coroutine and stack
+-- introspection, and the math-function inventory.
+-- Oracle: tclsh 9.1.0 (core-9-1-0).
+--
+-- Scope: the `info` surface except `info class` / `info object` (oo.allium),
+-- `info constant` / `info consts` (variables.allium) and `info loaded`
+-- (interp.allium).
+-- Probes: 2026-11-28 tclsh9.1; docs doc/info.n, doc/mathfunc.n.
+-- cmdtype type names: TIP 426.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── subcommand dispatch ──────────────────────────────────────────
+
+rule InfoRequiresSubcommand {
+    -- `info` with no argument is a wrong-#-args error, not an empty result.
+    when: Evaluates("info")
+    ensures: completion.code = error
+    ensures: completion.value = "wrong # args: should be \"info subcommand ?arg ...?\""
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule InfoSubcommandMenu {
+    -- An unknown subcommand reports the full menu in alphabetical order;
+    -- the menu is the authoritative list of info subcommands in 9.1.
+    when: Evaluates("catch {info gorp} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown or ambiguous subcommand \"gorp\": must be args, body, class, cmdcount, cmdtype, commands, complete, constant, consts, coroutine, default, errorstack, exists, frame, functions, globals, hostname, level, library, loaded, locals, nameofexecutable, object, patchlevel, procs, script, sharedlibextension, tclversion, or vars"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+-- ── procedure metadata: args / body / default ────────────────────
+
+rule InfoArgsAndBody {
+    -- info args yields the formal parameter names only (defaults and the
+    -- args marker included as names); info body yields the body text
+    -- verbatim, including its surrounding whitespace.
+    when: Evaluates("proc q {x} { return [expr {$x+1}] }; list [info args q] [string trim [info body q]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "x {return [expr {$x+1}]}"
+    -- probe 2026-11-28 tclsh9.1 (body is " return [expr {$x+1}] ")
+}
+
+rule InfoDefaultReportsAndBinds {
+    -- info default returns 1 and binds the default when the parameter has
+    -- one; with no default it returns 0 but still binds the variable, to
+    -- the empty string.
+    when: Evaluates("proc d {a {b hello} args} {}; list [info default d b v] $v [info default d a w] [info exists w] [info default d args z] [info exists z]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 hello 0 1 0 1"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule InfoDefaultAndArgsRejectNonProcedures {
+    -- A missing parameter names the procedure; a non-procedure command
+    -- (including info args itself on a native command) errors the same way.
+    when: Evaluates("proc d {a} {}; list [catch {info default d zz v} m1] $m1 [catch {info default set x v} m2] $m2 [catch {info args set} m3] $m3")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {procedure \"d\" doesn't have an argument \"zz\"} 1 {\"set\" isn't a procedure} 1 {\"set\" isn't a procedure}"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+-- ── command inventories: procs / commands ────────────────────────
+
+rule InfoProcsListsAndFilters {
+    -- info procs lists only Tcl procedures (not native commands), honours
+    -- a glob pattern, and qualifies names when the pattern does.
+    when: Evaluates("proc alpha {} {}; proc beta {} {}; namespace eval ns {proc nsp {} {}}; list [expr {[lsearch -exact [info procs] alpha]>=0}] [expr {[lsearch -exact [info procs] beta]>=0}] [info procs alp*] [info procs zzz*] [info procs ::ns::*] [namespace eval ns {info procs nsp}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 alpha {} ::ns::nsp nsp"
+    -- probe 2026-11-28 tclsh9.1 (auto_* startup procs exist, not pinned)
+}
+
+rule InfoCommandsListsAndFilters {
+    -- info commands covers native commands as well as procs, accepts a
+    -- pattern, and can enumerate a namespace's commands by qualified glob.
+    when: Evaluates("list [expr {[lsearch -exact [info commands] set]>=0}] [expr {[lsearch -exact [info commands] nosuchzz]>=0}] [info commands set] [llength [info commands ::tcl::mathfunc::*]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 set 58"
+    -- probe 2026-11-28 tclsh9.1 (58 mathfunc commands in 9.1.0)
+}
+
+-- ── variable inventories: globals / vars / locals ────────────────
+
+rule InfoGlobalsVarsLocalsScopes {
+    -- At the top level info vars and info globals see the same set, and
+    -- info locals is empty. Inside a proc, info locals and info vars both
+    -- see parameters and locals but not globals.
+    when: Evaluates("set gv 1; proc scope {a} {set lv 2; list [lsort [info locals]] [expr {[lsearch -exact [info vars] a]>=0}] [expr {[lsearch -exact [info vars] lv]>=0}] [expr {[lsearch -exact [info vars] gv]>=0}]}; list [scope X] [expr {[lsort [info vars]] eq [lsort [info globals]]}] [info locals] [expr {[lsearch -exact [info globals] gv]>=0}] [expr {[lsearch -exact [info globals] tcl_version]>=0}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{{a lv} 1 1 0} 1 {} 1 1"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule InfoGlobalsInitialSet {
+    -- A fresh interpreter has the runtime globals but does not predefine
+    -- errorCode/errorInfo (they appear only after an error).
+    when: Evaluates("list [expr {[lsearch -exact [info globals] tcl_version]>=0}] [expr {[lsearch -exact [info globals] tcl_patchLevel]>=0}] [expr {[lsearch -exact [info globals] argv0]>=0}] [expr {[lsearch -exact [info globals] errorCode]>=0}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 0"
+    -- probe 2026-11-28 tclsh9.1 (T5/ec2: errorCode not preset)
+}
+
+rule InfoLocalsExcludesLinkedGlobals {
+    -- A variable linked with `global` is visible to info vars but is not
+    -- a local, so info locals omits it.
+    when: Evaluates("set gv 1; proc p {} {global gv; set lv 2; list [lsort [info locals]] [expr {[lsearch -exact [info vars] gv]>=0}] [expr {[lsearch -exact [info vars] lv]>=0}]}; p")
+    ensures: completion.code = ok
+    ensures: completion.value = "lv 1 1"
+    -- probe 2026-11-28 tclsh9.1; doc/info.n "not local"
+}
+
+-- ── call stack: level / frame ────────────────────────────────────
+
+rule InfoLevelCountsProcDepth {
+    -- info level is 0 at top level and 1 inside a proc; info level 0 is
+    -- the current invocation with all substitutions applied (a list).
+    when: Evaluates("proc lp {a b} {list [info level] [info level 0]}; list [lp X Y] [info level]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{1 {lp X Y}} 0"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule InfoLevelZeroAndRelativeForms {
+    -- At depth 2, level 0 is the current invocation, level 1 the caller,
+    -- and a negative level counts up from the current one (-1 == 1 here).
+    when: Evaluates("proc outer {} {inner}; proc inner {} {list [info level 0] [info level 1] [info level -1]}; outer")
+    ensures: completion.code = ok
+    ensures: completion.value = "inner outer outer"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule InfoLevelOutOfRangeErrors {
+    -- A level above the stack or above the top-level frame is a bad level;
+    -- at top level even level 0 does not exist.
+    when: Evaluates("proc lv {} {catch {info level 5} m; list [info level] $m}; list [lv] [catch {info level 0} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "{1 {bad level \"5\"}} 1 {bad level \"0\"}"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule InfoFrameIsDictShapedAndBeyondLevel {
+    -- info frame numbers every evaluation frame (it exceeds info level
+    -- inside a proc); info frame 0 is a dict with type/line/cmd/level keys.
+    when: Evaluates("proc fp {} {list [expr {[info frame] > [info level]}] [dict get [info frame 0] level]}; list [fp] [lsort [dict keys [info frame 0]]] [catch {info frame 99} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "{1 0} {cmd level line type} 1 {bad level \"99\"}"
+    -- probe 2026-11-28 tclsh9.1 (absolute frame count depends on the
+    -- evaluation context, e.g. stdin vs sourced file, so only the
+    -- relative claim and the dict shape are pinned)
+}
+
+-- ── existence / completion predicates ────────────────────────────
+
+rule InfoExistsSeesVisibleVariables {
+    -- info exists resolves the variable as the script would: a proc
+    -- cannot see a global without `global`, arrays and elements are
+    -- separate tests.
+    when: Evaluates("set g 1; array set A {k v}; proc pe {} {set l 1; list [info exists g] [info exists l]}; list [pe] [info exists g] [info exists nope] [info exists A] [info exists A(k)] [info exists A(zz)]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{0 1} 1 0 1 1 0"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule InfoExistsAfterArrayUnset {
+    -- Unsetting an array clears both the array variable and its element
+    -- from info exists.
+    when: Evaluates("set A(x) 1; unset A; list [info exists A] [info exists A(x)]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule InfoCompleteDetectsOpenConstructs {
+    -- info complete is false for an unclosed brace, quote or bracket and
+    -- true for a parseable script, a trailing semicolon, a comment-only
+    -- script, the empty script, and a complete multi-line script.
+    when: Evaluates("set ob [format %c 123]; set oq [format %c 34]; set os [format %c 91]; proc t {s} {info complete $s}; list [t {set a 1}] [t \"set a $ob\"] [t \"set a $oq\"] [t \"x $os foo\"] [t {set a 1;}] [t {# hi}] [t {}] [t \"set a 1\\nset b 2\"]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 0 0 1 1 1 1"
+    -- probe 2026-11-28 tclsh9.1 (the three metacharacters are built with
+    -- format %c to keep the probe free of escaping ambiguity)
+}
+
+-- ── evaluation counters and command kinds ────────────────────────
+
+rule InfoCmdcountAdvances {
+    -- info cmdcount is a monotonically increasing integer over the
+    -- interpreter's lifetime, not a per-script count.
+    when: Evaluates("set c [info cmdcount]; set x 1; list [expr {[info cmdcount] > $c}] [string is integer -strict $c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+    -- probe 2026-11-28 tclsh9.1 (absolute startup count is build-specific)
+}
+
+rule InfoCmdtypeClassifiesCommands {
+    -- info cmdtype names the creation route: native, proc, or alias.
+    -- divmod/fpclassify/frexp/modf/remquo are native *commands* in 9.1,
+    -- not math functions (they are absent from info functions and cannot
+    -- be called as expr functions; cf. doc/mathfunc.n SEE ALSO).
+    when: Evaluates("proc pp {} {}; interp alias {} myalias {} set; list [info cmdtype set] [info cmdtype pp] [info cmdtype myalias] [info cmdtype divmod] [expr {[lsearch -exact [info commands] divmod]>=0}] [catch {info cmdtype nosuchzz} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "native proc alias native 1 1 {unknown command \"nosuchzz\"}"
+    -- probe 2026-11-28 tclsh9.1; TIP 426 for the type names
+}
+
+-- ── script / build identity ──────────────────────────────────────
+
+rule InfoScriptNamesSourcedFile {
+    -- Inside a sourced file info script is that file's path and the file
+    -- exists; at the top level of stdin it is empty.
+    when: Evaluates("set f [file join /tmp infoprobe[pid].tcl]; set ch [open $f w]; puts $ch {set ::_is [list [info script] [file exists [info script]]]}; close $ch; source $f; file delete $f; list [expr {[lindex $::_is 0] eq $f}] [lindex $::_is 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+    -- probe 2026-11-28 tclsh9.1 (temp file under /tmp, removed by the probe)
+}
+
+rule InfoScriptEmptyAtTopLevel {
+    -- A script evaluated from stdin has no script file, so info script is
+    -- the empty string.
+    when: Evaluates("info script")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+    -- probe 2026-11-28 tclsh9.1 (tclsh reading the script from stdin)
+}
+
+rule InfoLibraryPointsAtTclLibrary {
+    -- info library returns tcl_library; this 9.1.0 build ships it inside
+    -- the zipfs volume.
+    when: Evaluates("list [info library] [file tail [info library]] [file exists [info library]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "//zipfs:/lib/tcl/tcl_library tcl_library 1"
+    -- probe 2026-11-28 tclsh9.1 (zipfs build; doc/info.n)
+}
+
+rule InfoNameofexecutableIsRunnable {
+    -- info nameofexecutable is an executable file whose basename is the
+    -- tclsh program (the absolute path itself is installation-specific).
+    when: Evaluates("list [file executable [info nameofexecutable]] [string match {tclsh*} [file tail [info nameofexecutable]]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule InfoPatchlevelAndTclversion {
+    -- patchlevel is the three-part version; tclversion is its major.minor.
+    when: Evaluates("list [info patchlevel] [info tclversion]")
+    ensures: completion.code = ok
+    ensures: completion.value = "9.1.0 9.1"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule InfoSharedlibextensionIsPlatformValue {
+    -- The shared-library suffix is the platform's, ".so" on this oracle.
+    when: Evaluates("info sharedlibextension")
+    ensures: completion.code = ok
+    ensures: completion.value = ".so"
+    -- probe 2026-11-28 tclsh9.1 (Linux build)
+}
+
+rule InfoHostnameIsNonEmptyAndTrimmed {
+    -- The host name is non-empty and carries no leading/trailing space;
+    -- its actual value is environment-specific and not pinned.
+    when: Evaluates("expr {[string length [info hostname]] > 0 && [string trim [info hostname]] eq [info hostname]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+-- ── coroutine / error stack introspection ────────────────────────
+
+rule InfoCoroutineNamesCurrentCoroutine {
+    -- info coroutine is empty outside a coroutine and the coroutine's
+    -- command name (fully qualified) inside it.
+    when: Evaluates("list [info coroutine] [coroutine co eval {info coroutine}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} ::co"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule InfoErrorstackInnerForSimpleError {
+    -- After an error the stack holds the INNER operation that raised it;
+    -- for a bare `error boom` that is returnImm with its message.
+    when: Evaluates("catch {error boom} m; info errorstack")
+    ensures: completion.code = ok
+    ensures: completion.value = "INNER {returnImm boom {}}"
+    -- probe 2026-11-28 tclsh9.1; doc/info.n errorstack tokens
+}
+
+rule InfoErrorstackRecordsCallTrail {
+    -- Nested proc calls add CALL entries naming each caller, outermost
+    -- last, while INNER describes the raising operation.
+    when: Evaluates("proc lvl2 {} {error deep}; proc lvl1 {} {lvl2}; catch {lvl1} m; info errorstack")
+    ensures: completion.code = ok
+    ensures: completion.value = "INNER {returnImm deep {}} CALL lvl2 CALL lvl1"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+-- ── math-function inventory ──────────────────────────────────────
+
+rule InfoFunctionsInventory {
+    -- info functions lists the 58 math functions of 9.1.0, including the
+    -- 9.0 signal predicates (signbit, isnormal, ...) and excluding
+    -- divmod/fpclassify, which are commands.
+    when: Evaluates("list [llength [info functions]] [expr {[lsearch -exact [info functions] sin]>=0}] [expr {[lsearch -exact [info functions] signbit]>=0}] [expr {[lsearch -exact [info functions] fpclassify]>=0}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "58 1 1 0"
+    -- probe 2026-11-28 tclsh9.1; doc/info.n, doc/mathfunc.n
+}
+
+rule InfoFunctionsPatternAndUserDefinitions {
+    -- The optional pattern filters like string match, and a proc named
+    -- ::tcl::mathfunc::NAME joins the inventory and is callable from expr.
+    when: Evaluates("proc ::tcl::mathfunc::triple {x} {expr {3*$x}}; list [expr {[lsearch -exact [info functions s*] sin]>=0}] [expr {[lsearch -exact [info functions s*] abs]>=0}] [expr {[lsearch -exact [info functions] triple]>=0}] [expr {triple(4)}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 1 12"
+    -- probe 2026-11-28 tclsh9.1
+}

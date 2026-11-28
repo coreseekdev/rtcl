@@ -180,17 +180,18 @@ doc/*.n 章节）。
   oracle）不得因本任务变红（规格-only 理论上不可能，变红即说明误改了
   代码，立即回滚核对）。需要验证探针时直接跑
   `.refer/tcl910/inst/bin/tclsh9.1`（不构建 rtcl）。
-- **OOM / 2G 纪律**（2026-11-28 用户口径：触及 2G 上限即 bug，不当作
-  环境噪声放过）：
-  - 运行时实测：`judge/run.sh` 95/95，峰值 RSS **264MB**；
-    `rtcl-vm --lib` 898 项，峰值 **58MB**（2G scope 内）。任何运行
-    触顶都按 bug 修（先定位分配点，再修或按值语义惰性化），不降门槛。
-  - 构建侧：`cargo test --workspace` **默认并行**在 2G 内会被终止
-    （rustc 并行，非 rtcl 运行时）；门禁顺序固定为
-    `cargo test --workspace --no-run`（构建不设 2G 上限）→
-    `systemd-run --user --scope -p MemoryMax=2G cargo test --workspace`。
-    `-j2` 冷构建可在 2G 内完成，但 `memory.peak` 贴顶（靠 page cache
-    回收），不作为保证值。
+- **OOM 纪律**（2026-11-28 用户口径：运行时触及 2G 即 bug；cargo/rustc
+  构建放宽到 4G）：
+  - 运行时（rtcl 二进制、测试执行、judge）：固定 `MemoryMax=2G`。
+    实测 `judge/run.sh` 95/95 峰值 **264MB**；`rtcl-vm --lib` 898 项
+    峰值 **58MB**。任何运行触顶都按 bug 修（先定位分配点，再修或按
+    值语义惰性化），不降门槛。
+  - 构建（cargo/rustc）：允许 `MemoryMax=4G`，但**默认并行仍不够**：
+    2026-11-28 实测 `cargo test --workspace --no-run` 在 4G 内 17.5s
+    即 OOM（多个 rustc 并发）；加 **`-j2`** 后同一冷构建在 4G 内完成
+    （`memory.peak` 贴顶含 page cache）。门禁顺序固定为：
+    `systemd-run ... -p MemoryMax=4G cargo test --workspace --no-run -j2`
+    → `systemd-run ... -p MemoryMax=2G cargo test --workspace`。
   - 本任务原则上仍零构建；若必须构建，按 Agent.md 核对二进制时间戳。
 
 ## 5. 执行步骤（建议顺序）
@@ -428,10 +429,11 @@ doc/*.n 章节）。
     | list | 1/25 | `lset` 越界文案（`index "5" out of range`） |
     | control-flow | 1/16 | `case` 仍存在（9.1 已删除） |
 
-36. 内存门禁实测（用户口径：触及 2G 上限即 bug）：judge 95/95
-    峰值 **264MB**；`rtcl-vm --lib` 898 项峰值 **58MB**；运行时无
-    触顶。冷构建默认并行会触顶（rustc），门禁改为先 `--no-run`
-    再 2G 下跑测试（§4）。`-j2` 冷构建可完成但 peak 贴顶，不作保证。
+36. 内存门禁实测（用户口径：运行时触及 2G 即 bug；rustc 构建放宽
+    到 4G）：judge 95/95 峰值 **264MB**；`rtcl-vm --lib` 898 项
+    峰值 **58MB**；运行时无触顶。冷构建默认并行在 4G 内仍 OOM
+    （17.5s，多个 rustc 并发）；`-j2` 冷构建在 4G 内完成。门禁固定
+    为 4G `--no-run -j2` → 2G 跑测试（§4）。
 
 ## 8. 交接记录
 
@@ -527,9 +529,9 @@ doc/*.n 章节）。
 - 差分：新增 `specs/scripts/audit-rtcl.py`，oracle↔rtcl 逐条对比
   （743 比较 / 504 同 / 239 异 / 1 skip）；差异按簇记入 §7.35，
   属迁移面或实现缺口，本轮只登记不修码。
-- 门禁（均在同一 2G scope）：`cargo test -p rtcl-vm --lib` 898 passed；
-  `cargo test --workspace` 全绿（64 个 test-result 块全部 ok）；
-  `judge/run.sh` 95/95。运行时峰值：judge 264MB、vm lib 58MB。
+- 门禁（构建 4G `-j2`，测试/judge 2G）：`cargo test -p rtcl-vm --lib`
+  898 passed；`cargo test --workspace` 全绿（64 个 test-result 块全部
+  ok）；`judge/run.sh` 95/95。运行时峰值：judge 264MB、vm lib 58MB。
 - 分支：`perf/wave2`，工作树干净；合并提交 `merge spec/*`、
   `merge audit/*` 与 `docs(specs)` 复核提交。
 
@@ -577,9 +579,9 @@ doc/*.n 章节）。
   只登记不修码。
 - 代码缺口：无（本轮规格-only）。OO bootstrap / property /
   classvariable 已对齐（§10）；judge 95/95。
-- 内存门禁（用户口径：触及 2G 上限即 bug）：judge 峰值 264MB、
-  `rtcl-vm --lib` 898 项峰值 58MB；冷构建默认并行会触顶，门禁顺序
-  固定为 `--no-run` 后再在 2G 下跑测试（§4）。
+- 内存门禁（用户口径：运行时触及 2G 即 bug；rustc 构建放宽到 4G）：
+  judge 峰值 264MB、`rtcl-vm --lib` 898 项峰值 58MB；冷构建默认并行
+  在 4G 内仍 OOM，门禁固定为 4G `--no-run -j2` → 2G 跑测试（§4）。
 
 
 ## 10. 代码对齐（2026-11-27）

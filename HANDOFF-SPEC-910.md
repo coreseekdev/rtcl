@@ -180,8 +180,18 @@ doc/*.n 章节）。
   oracle）不得因本任务变红（规格-only 理论上不可能，变红即说明误改了
   代码，立即回滚核对）。需要验证探针时直接跑
   `.refer/tcl910/inst/bin/tclsh9.1`（不构建 rtcl）。
-- **OOM 纪律**：本任务原则上零构建；若必须构建（不该发生），按
-  Agent.md `ulimit -v 3400000` + 核对二进制时间戳。
+- **OOM / 2G 纪律**（2026-11-28 用户口径：触及 2G 上限即 bug，不当作
+  环境噪声放过）：
+  - 运行时实测：`judge/run.sh` 95/95，峰值 RSS **264MB**；
+    `rtcl-vm --lib` 898 项，峰值 **58MB**（2G scope 内）。任何运行
+    触顶都按 bug 修（先定位分配点，再修或按值语义惰性化），不降门槛。
+  - 构建侧：`cargo test --workspace` **默认并行**在 2G 内会被终止
+    （rustc 并行，非 rtcl 运行时）；门禁顺序固定为
+    `cargo test --workspace --no-run`（构建不设 2G 上限）→
+    `systemd-run --user --scope -p MemoryMax=2G cargo test --workspace`。
+    `-j2` 冷构建可在 2G 内完成，但 `memory.peak` 贴顶（靠 page cache
+    回收），不作为保证值。
+  - 本任务原则上仍零构建；若必须构建，按 Agent.md 核对二进制时间戳。
 
 ## 5. 执行步骤（建议顺序）
 
@@ -357,6 +367,72 @@ doc/*.n 章节）。
       同时钉四组（return 顶层/proc、break、continue），
       `CatchReturnCodeErrorViaProcIsError` 改为 `1 boom 1 0`。
 
+### 2026-11-28（规格扩面轮：9 份新规格 + 全量自审 + 差分门禁）
+
+29. 新增 9 份 9.1 行为规格（全部 `Oracle: tclsh 9.1.0 (core-9-1-0)`，
+    规则均自包含、可直接审计）：
+    `info`(30)、`package`(50)、`utility`(35)、`coroutine`(66)、
+    `event`(42)、`channel`(28)、`binary`(37)、`clock`(39)、`file`(38)。
+    语料 15→**24 份**，规则 390→**755 条**。所有 oracle 值于
+    2026-11-28 用 `.refer/tcl910/inst/bin/tclsh9.1` 实测。
+30. 自审扩面：`specs/scripts/audit-91.py` 从 302→**744 条可执行
+    `when`，skipped 77→0，mismatch 0**。原 77 条 `-- after:`/多行
+    伪代码全部内联为单行自包含脚本（control-flow/error-deep/expr/
+    io/list 17、oo 19、trace 16、variables 19、收尾 6）。
+31. 归属与去重：`info coroutine` 唯一规则归 `coroutine.allium`
+    （`info` 的子命令菜单仍列 coroutine）；全库 rule 名无重复；
+    新增规格不重复既有规则（package files msgcat、timer in、
+    binary 浮点位型、clock 本地时区等均只保留在原规格）。
+32. 9.1 实测更正：`binary` 的 `t/n/m` 是 **native 字节序**（x86-64：
+    `t→0100`、`n→01000000`、`m→0100000000000000`），不是 network
+    大端；`matching.allium` 的 `BinaryNetworkFieldsAreBigEndian` 已
+    改为 `BinaryNativeEndianFields` 并钉实测字节。
+33. doc 与 oracle 冲突（按实测钉，注释已标日期）：
+    - `tailcall` 9.1 允许在 `catch`/`uplevel` 内使用并做帧替换
+      （doc/tailcall.n 仍是 8.6 限制文本）；协程内也可用。
+    - `coroutine` 重名静默替换已有命令；`yield` 恢复拒绝多参数，
+      `yieldto` 恢复接受参数列表；`coroinject/coroprobe` 见 TIP 383。
+    - `history` 默认 event `-1` 在非交互 9.1 下读 `history(0)` 报错；
+      `zlib gzip -header` 不返回 `time 0`/`os 255`；`tclLog` 返回 `0`；
+      `package forget` 无参是 no-op。
+    - `info functions` 不含 `fpclassify/divmod/frexp/modf/remquo`
+      （它们是 native 全局命令，不是 mathfunc）。
+    - `binary format c {2 5}` 报 `expected integer but got a list`
+      （不是带值的引号形式）。
+34. 新增差分门禁 `specs/scripts/audit-rtcl.py`（2G 内运行）：
+    对 744 条可执行规则逐条跑 tclsh9.1 与 rtcl，比较 catch 码+结果。
+    终态 **compared=743, same=504, diff=239, skipped=1**（skipped 是
+    `ExitIsNotCatchable`：rtcl 侧子进程路径不可解析）。差异是
+    rtcl 迁移面/实现缺口，按用户口径只登记、不修码。
+35. 差异簇（每份 `差异/规则`）：
+
+    | 规格 | 差异 | 主要簇 |
+    |---|---:|---|
+    | package | 35/50 | package/auto_load 面基本未实现 |
+    | coroutine | 33/66 | yieldto/coroinject/coroprobe、info coroutine 未实现 |
+    | utility | 27/35 | history/zlib 未实现，pid/tclLog 报错文案 |
+    | event | 23/42 | vwait 9.1 选项、timer/timerate 未实现 |
+    | clock | 21/39 | clock 子命令/格式/时区面不全 |
+    | io | 20/39 | encoding profile、exec 编码、socket 选项 |
+    | file | 16/38 | link/readlink/stat/volumes/tempdir/attributes |
+    | channel | 12/28 | socket server/accept、chan create/postevent |
+    | info | 12/30 | patchlevel 8.6.17、部分子命令与错误栈缺失 |
+    | interp | 11/17 | buildinfo/zipfs/assemble 9.x 指令 |
+    | binary | 8/37 | scan `u`/`C`、encode/decode 严格性、报错文案 |
+    | matching | 5/39 | scan 32 位截断/饱和、`%j` 等 64 位修饰、weekdays |
+    | oo | 4/50 | `classmethod`、`private variable`、objdefine variable |
+    | variables | 3/46 | `namespace which -variable` 回退、`info vars` 混全局、uplevel 帧 |
+    | string | 3/19 | `string is dict` 缺失、Unicode 18 digit、歧义类文案 |
+    | error-deep | 2/13 | `try ... trap` 选项匹配后返回码、子进程 exit 码 |
+    | trace | 2/21 | `trace variable` 遗留形式仍被接受 |
+    | list | 1/25 | `lset` 越界文案（`index "5" out of range`） |
+    | control-flow | 1/16 | `case` 仍存在（9.1 已删除） |
+
+36. 内存门禁实测（用户口径：触及 2G 上限即 bug）：judge 95/95
+    峰值 **264MB**；`rtcl-vm --lib` 898 项峰值 **58MB**；运行时无
+    触顶。冷构建默认并行会触顶（rustc），门禁改为先 `--no-run`
+    再 2G 下跑测试（§4）。`-j2` 冷构建可完成但 peak 贴顶，不作保证。
+
 ## 8. 交接记录
 
 ### 2026-11-27（交出）
@@ -443,39 +519,53 @@ doc/*.n 章节）。
   `judge/probes/{oo_objcount91,oo_features91,pbr6_float_bits}.tcl` +
   `specs/scripts/audit-91.py`（§4 授权新增探针/审计脚本，只加不改）。
 
-## 9. 全量复核（2026-11-27）
+## 9. 全量复核（2026-11-28）
 
-15 份规格：12 份行为规格全部 `Oracle: tclsh 9.1.0 (core-9-1-0)`；
-`memory-lifecycle.allium` 为实现资源契约（Oracle n/a），规则总数 390。
+24 份规格：23 份行为规格全部 `Oracle: tclsh 9.1.0 (core-9-1-0)`；
+`memory-lifecycle.allium` 为实现资源契约（Oracle n/a），规则总数 **755**。
 
 | 规格 | 规则 | 覆盖 | 状态 |
 |---|---:|---|---|
-| control-flow | 16 | T4 case/subst | 9.1 锚定 |
-| switch | 13 | T4 exact/glob/regexp/integer/matchvar | 9.1 锚定 |
+| binary | 37 | T7 format/scan 全 specifier + encode/decode | 9.1 锚定 |
+| channel | 28 | chan 子命令/socket/fcopy/reflected/transform | 9.1 锚定 |
+| clock | 39 | 9.1 clock 全子命令/格式/时区/scan/add | 9.1 锚定 |
+| control-flow | 16 | T4 case/subst（case 已移除） | 9.1 锚定 |
+| coroutine | 66 | coroutine/yield/yieldto/coroinject/coroprobe/tailcall | 9.1 锚定 |
 | dict | 22 | T4 getdef/getwithdefault | 9.1 锚定 |
-| error-deep | 13 | A6 + catch return 语义复核 | 9.1 锚定 |
+| error-deep | 13 | A6 + catch/return/try 语义复核 | 9.1 锚定 |
+| event | 42 | after/update/vwait/timer/timerate | 9.1 锚定 |
 | expr | 36 | A1/A2 + T1 | 9.1 锚定 |
+| file | 38 | file 全 34 子命令 | 9.1 锚定 |
+| info | 30 | info 内省面（class/object/constant/loaded/coroutine 除外） | 9.1 锚定 |
 | interp | 17 | T4 timer/process/内省/工具 + T7 assemble | 9.1 锚定 |
 | io | 39 | B1 + T3 + T4 file/exec/socket | 9.1 锚定 |
 | list | 25 | T2 + T4 lpop/lremove/ledit/lseq/lfilter/stride | 9.1 锚定 |
-| matching | 39 | T1 format/scan + T4 regsub + T7 regex/binary | 9.1 锚定 |
+| matching | 39 | T1 format/scan + T4 regsub + T7 regex/binary native | 9.1 锚定 |
 | memory-lifecycle | 8 | 资源契约（值/通道/帧/OO/缓存/JIT） | Oracle n/a |
 | oo | 52 | T6 全量可测面（Obj20 基准 + Obj11-19 bootstrap） | 9.1 锚定 |
+| package | 50 | package/auto_load/load/unload | 9.1 锚定 |
 | regex-spencer | 23 | T7 ARE 语义（23 条全量复跑） | 9.1 锚定 |
-| string | 19 | T1/T2/T3 | 9.1 锚定 |
+| string | 19 | T1/T2/T3 + string is 9.1 类 | 9.1 锚定 |
+| switch | 13 | T4 exact/glob/regexp/integer/matchvar | 9.1 锚定 |
 | trace | 22 | A5 + 现代 trace 面 | 9.1 锚定 |
+| utility | 35 | history/zlib/pid/tclLog/time | 9.1 锚定 |
 | variables | 46 | A3/A4 + T5 + T4 array/const | 9.1 锚定 |
 
 复核结论：
 
 - 所有 `when` 的 oracle 结果以 tclsh 9.1.0 实测为准；`doc` 与实测
-  冲突时按实测（如 `invokeStk1`、`chan configure -inputmode`）。
-- 自审 `specs/scripts/audit-91.py`：292 条可执行 `when`，0 mismatch；
-  77 条依赖 `-- after:` 前态/多行的规则保持伪代码形态。
-- 已修：io/variables/matching/oo/interp/memory 的头部锚与覆盖范围；
-  expr/error-deep/matching 的 8.6-only 注释；io 的 D-30→D-29 引用。
-- 代码缺口：无。OO bootstrap / property / classvariable 已对齐（§10）；
-  judge 95/95（含 lseq 惰性 series 修复）。
+  冲突时按实测（如 `invokeStk1`、`chan configure -inputmode`、
+  `binary` 的 `t/n/m` native 字节序、tailcall 在 catch/uplevel 内可用）。
+- 自审 `specs/scripts/audit-91.py`：**744 条可执行 `when` 全部执行，
+  0 skipped，0 mismatch**（扩面过程见 §7.29-§7.30）。
+- 差分门禁 `specs/scripts/audit-rtcl.py`：oracle↔rtcl 逐条对比
+  （743 比较 / 504 同 / 239 异 / 1 skip），差异按簇登记（§7.34-§7.35），
+  只登记不修码。
+- 代码缺口：无（本轮规格-only）。OO bootstrap / property /
+  classvariable 已对齐（§10）；judge 95/95。
+- 内存门禁（用户口径：触及 2G 上限即 bug）：judge 峰值 264MB、
+  `rtcl-vm --lib` 898 项峰值 58MB；冷构建默认并行会触顶，门禁顺序
+  固定为 `--no-run` 后再在 2G 下跑测试（§4）。
 
 
 ## 10. 代码对齐（2026-11-27）

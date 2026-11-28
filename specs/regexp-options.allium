@@ -1,0 +1,584 @@
+-- allium: 3
+-- regexp-options.allium
+-- Behaviour spec: the option and result surface of regexp and regsub that
+-- matching.allium (ARE operators, -command basics) and regex-spencer.allium
+-- (Spencer operator semantics) do not pin — -about, -all, -inline, -indices,
+-- -start, -nocase/-expanded/-line/-linestop/-lineanchor, --, option
+-- combinations, capture-variable assignment, replacement escapes, result
+-- forms and error menus.
+-- Oracle: tclsh 9.1.0 (core-9-1-0).
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── regexp: -about ────────────────────────────────────────────────
+-- -about returns a two-element list: the capturing-subexpression count,
+-- then a list of engine property names. It never matches, and unlike the
+-- matching modes it ignores any trailing string/variable arguments.
+
+rule ReOptAboutReportsSubexpressionCount {
+    -- Nested groups all count; a literal pattern has zero subexpressions.
+    when: Evaluates("list [regexp -about {abc}] [regexp -about {(a)(b)}] [regexp -about {((a)(b))}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{0 {}} {2 {}} {3 {}}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptAboutReportsPropertyNames {
+    -- The second field carries REG_* tokens describing engine properties
+    -- (a locale-dependent class, a non-portable bracket range).
+    when: Evaluates("list [regexp -about {[[:alpha:]]+}] [regexp -about {[a-z]}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{0 REG_ULOCALE} {0 REG_UUNPORT}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptAboutConsumesOnlyPattern {
+    -- Extra arguments are ignored: -about needs the pattern and stops there.
+    when: Evaluates("list [regexp -about {a}] [regexp -about {(a)} ignored string m g]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{0 {}} {1 {}}"
+    -- probe: 2026-11-28 tclsh9.1 (the documented synopsis still shows string)
+}
+
+rule ReOptAboutRejectsInline {
+    -- -about and -inline cannot be combined; the diagnostic speaks of match
+    -- variables even though -about was the first option.
+    when: Evaluates("catch {regexp -about -inline {a}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "regexp match variables not allowed when using -inline"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── regexp: -all / -inline / -indices ────────────────────────────
+
+rule ReOptAllCountsMatches {
+    -- Without -all the result is a boolean; -all turns it into a count and
+    -- an unmatched search is zero either way.
+    when: Evaluates("list [regexp -all {\\d} a1b2c3] [regexp {\\d} a1b2c3] [regexp -all {z} abc]")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 1 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptAllBindsLastMatch {
+    -- With match variables, -all leaves only the final match in them while
+    -- still returning the total count.
+    when: Evaluates("set n [regexp -all {(\\d)} a1b2c3 m g]; list $n $m $g")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 3 3"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptAllIndicesBindsLastIndices {
+    -- -indices composes with -all: the count is returned and variables hold
+    -- the last match's absolute ranges.
+    when: Evaluates("set n [regexp -all -indices {(\\d)} a1b2c3 m g]; list $n $m $g")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 {5 5} {5 5}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptAllInlineIsFlat {
+    -- -all -inline concatenates whole match plus groups for every match into
+    -- one flat list (two matches with two groups => six elements).
+    when: Evaluates("regexp -all -inline {(\\w)(\\d)} \"a1 b2\"")
+    ensures: completion.code = ok
+    ensures: completion.value = "a1 a 1 b2 b 2"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptAllInlineIndicesFlat {
+    -- -inline -indices -all emits one {start end} pair per match.
+    when: Evaluates("regexp -all -inline -indices {\\d} a1b2")
+    ensures: completion.code = ok
+    ensures: completion.value = "{1 1} {3 3}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptAllEmptyMatchCounts {
+    -- A pattern that can match empty matches twice in "ab" (before each
+    -- character); -inline emits one empty element per match.
+    when: Evaluates("list [regexp -all {x*} ab] [regexp -all -inline {x*} ab]")
+    ensures: completion.code = ok
+    ensures: completion.value = "2 {{} {}}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptInlineReturnsWholeAndGroups {
+    -- -inline returns the same data the variables would receive, as a list.
+    when: Evaluates("regexp -inline {(a)(b)} zabz")
+    ensures: completion.code = ok
+    ensures: completion.value = "ab a b"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptInlineIndicesAreRanges {
+    -- -inline -indices replaces each element with its {first last} range.
+    when: Evaluates("regexp -inline -indices {(a)(b)} zabz")
+    ensures: completion.code = ok
+    ensures: completion.value = "{1 2} {1 1} {2 2}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptInlineNoMatchIsEmpty {
+    -- No match yields the empty list in both inline forms.
+    when: Evaluates("list [regexp -inline {z} abc] [regexp -all -inline {z} abc]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptInlineForbidsMatchVariables {
+    when: Evaluates("catch {regexp -inline {a} a m} m2; set m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "regexp match variables not allowed when using -inline"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptIndicesUseAbsoluteOffsets {
+    -- -start 2 searches from index 2, but -indices still reports absolute
+    -- positions in the original string.
+    when: Evaluates("regexp -indices -start 2 {c} abcd m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "2 2"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── regexp: capture-variable assignment ──────────────────────────
+
+rule ReOptVariablesWholeAndGroups {
+    -- matchVar gets the whole match, then one variable per group, left to
+    -- right.
+    when: Evaluates("regexp {(a)(b)} zabz m g1 g2; list $m $g1 $g2")
+    ensures: completion.code = ok
+    ensures: completion.value = "ab a b"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptVariablesUnchangedOnNoMatch {
+    -- A failed match leaves all match variables untouched.
+    when: Evaluates("set m PRE; set n [regexp {z} abc m]; list $n $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 PRE"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptExtraVariablesBecomeEmpty {
+    -- Surplus variable names are set to the empty string (or {-1 -1} under
+    -- -indices) rather than raising an error.
+    when: Evaluates("regexp {a} a m g1 g2; regexp -indices {a} a mi gi; list $m $g1 $g2 $mi $gi")
+    ensures: completion.code = ok
+    ensures: completion.value = "a {} {} {0 0} {-1 -1}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptUnmatchedOptionalVariableEmpty {
+    -- An optional group that did not participate is empty / {-1 -1}.
+    when: Evaluates("regexp {(a)?(b)} b m g1 g2; regexp -indices {(a)?(b)} b mi gi1 gi2; list $m $g1 $g2 $mi $gi1 $gi2")
+    ensures: completion.code = ok
+    ensures: completion.value = "b {} b {0 0} {-1 -1} {0 0}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptTooFewVariablesIgnoreGroups {
+    -- Supplying fewer variables than groups silently ignores the extras.
+    when: Evaluates("regexp {(a)(b)} ab m; list $m [info exists g2x]")
+    ensures: completion.code = ok
+    ensures: completion.value = "ab 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── regexp: -start ───────────────────────────────────────────────
+
+rule ReOptStartPositiveSkipsPrefix {
+    -- Matching begins at or after the offset, so a match wholly before it is
+    -- invisible.
+    when: Evaluates("list [regexp -start 1 {b} abc] [regexp -start 2 {b} abc]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptStartNegativeClampsToZero {
+    -- A negative -start is not counted from the end; it clamps to index 0
+    -- (unlike string index -1).
+    when: Evaluates("list [regexp -start -2 {a} abc] [regexp -start -1 {a} abc]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptStartBeyondEndFindsNothing {
+    -- The offset is constrained to the string bounds; at or past the end
+    -- nothing matches.
+    when: Evaluates("list [regexp -start 3 {.} abc] [regexp -start 99 {.} abc]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptStartWithAllCountsRemainder {
+    -- -start composes with -all: only matches from the offset onward are
+    -- counted and inlined.
+    when: Evaluates("list [regexp -all -start 1 {.} abc] [regexp -all -inline -start 1 {.} abc]")
+    ensures: completion.code = ok
+    ensures: completion.value = "2 {b c}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptStartWithAllIndicesAbsolute {
+    -- -start with -all -indices reports the last absolute range.
+    when: Evaluates("set n [regexp -all -indices -start 1 {.} abc m]; list $n $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "2 {2 2}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptStartEndIndexIsLengthRelative {
+    -- Oracle/deviation from doc/regexp.n ("same manner as string index"):
+    -- in -start, end resolves to the string LENGTH, one past string index
+    -- end. On "banana" end-1 => 5 and end-4 => 2, hence matches at 5 and 3.
+    when: Evaluates("list [regexp -indices -start end-1 {a} banana m] $m [regexp -indices -start end-4 {a} banana m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {5 5} 1 {3 3}"
+    -- probe: 2026-11-28 tclsh9.1 (string range banana end-4 end is index 1)
+}
+
+-- ── regexp: -- and errors ────────────────────────────────────────
+
+rule ReOptDashDashEndsOptions {
+    -- Without -- a leading-dash pattern is parsed as an option and rejected;
+    -- with -- it is a literal pattern.
+    when: Evaluates("list [catch {regexp {-x} a-x} e] [string match {bad option*} $e] [regexp [string repeat - 2] {-x} a-x]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1"
+    -- probe: 2026-11-28 tclsh9.1 (menu order below is the oracle's)
+}
+
+rule ReOptBadOptionMenu {
+    when: Evaluates("catch {regexp -foo {a} a} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"-foo\": must be -all, -about, -indices, -inline, -expanded, -line, -linestop, -lineanchor, -nocase, -start, or --"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptWrongArgCount {
+    when: Evaluates("catch {regexp} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"regexp ?-option ...? exp string ?matchVar? ?subMatchVar ...?\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptBadStartIndex {
+    when: Evaluates("catch {regexp -start x {a} a} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad index \"x\": must be integer?[+-]integer? or end?[+-]integer?"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── regexp: -nocase / newline options ───────────────────────────
+
+rule ReOptNocaseAllInlinePreservesCase {
+    -- Case folding affects matching only; -inline still returns the original
+    -- spelling of the match and groups.
+    when: Evaluates("regexp -all -inline -nocase {(a)} xAxA")
+    ensures: completion.code = ok
+    ensures: completion.value = "A A A A"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptLineCombinesStopAndAnchor {
+    -- -line is exactly -linestop plus -lineanchor: dot stops at newline and
+    -- ^/$ bind to line edges.
+    when: Evaluates("list [regexp {a.b} \"a\\nb\"] [regexp -line {a.b} \"a\\nb\"] [regexp -line {^b} \"a\\nb\"] [regexp -line {a$} \"a\\nb\"]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 1 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptLinestopStopsDotAndBracket {
+    -- -linestop alone stops . (and [^...]) at newline but leaves ^/$ as
+    -- whole-string anchors.
+    when: Evaluates("list [regexp {a.b} \"a\\nb\"] [regexp -linestop {a.b} \"a\\nb\"] [regexp -linestop {.} \"a\\nb\"] [regexp -linestop {^b} \"a\\nb\"]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 1 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ReOptLineanchorKeepsDotNewlineSensitive {
+    -- -lineanchor alone makes ^/$ line-relative but . still matches newline.
+    when: Evaluates("list [regexp -lineanchor {^b} \"a\\nb\"] [regexp -lineanchor {a.b} \"a\\nb\"] [regexp -lineanchor {a$} \"a\\nb\"]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── regsub: result forms, -all, -command ────────────────────────
+
+rule RsOptResultAndVariableForms {
+    -- Without varName the rewritten string is returned; with varName the
+    -- count is returned and the string lands in the variable.
+    when: Evaluates("list [regsub {a} abc X] [set n [regsub {a} abc X v]] $v")
+    ensures: completion.code = ok
+    ensures: completion.value = "Xbc 1 Xbc"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptNoMatchKeepsStringAndCountsZero {
+    -- No match: the string is copied unchanged and the count is zero.
+    when: Evaluates("list [regsub {z} abc X] [set n [regsub {z} abc X w]] $w")
+    ensures: completion.code = ok
+    ensures: completion.value = "abc 0 abc"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptAllReplacesEveryMatch {
+    when: Evaluates("list [regsub -all {a} banana X] [set n [regsub -all {a} banana X v]] $v")
+    ensures: completion.code = ok
+    ensures: completion.value = "bXnXnX 3 bXnXnX"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptAllNoMatchVariableForm {
+    when: Evaluates("set v PRE; set n [regsub -all {z} abc X v]; list $n $v")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 abc"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptCommandAllVariableForm {
+    -- -command's count/result form behaves like the template form; the
+    -- callback basics themselves are pinned in matching.allium.
+    when: Evaluates("set n [regsub -all -command {a} banana {string toupper} v]; list $n $v")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 bAnAnA"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── regsub: replacement escapes ─────────────────────────────────
+
+rule RsOptAmpersandIsWholeMatch {
+    when: Evaluates("list [regsub {a+} baa {X&Y}] [regsub -all {a+} \"baa caa\" {<&>}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "bXaaY {b<aa> c<aa>}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptBackslashZeroIsWholeMatch {
+    when: Evaluates("list [regsub {a+} baa {X\\0Y}] [regsub -all {a+} \"baa caa\" {<\\0>}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "bXaaY {b<aa> c<aa>}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptGroupReferencesInReplacement {
+    when: Evaluates("list [regsub {(a)(b)} zabz {[\\2\\1]}] [regsub -all {(a)(n)} banana {\\2\\1}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{z[ba]z} bnanaa"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptUnmatchedGroupIsEmpty {
+    -- A group that did not participate expands to the empty string.
+    when: Evaluates("regsub {(a)?(b)} b {<\\1|\\2>}")
+    ensures: completion.code = ok
+    ensures: completion.value = "<|b>"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptAllUnmatchedGroupIsEmpty {
+    when: Evaluates("regsub -all {(a)?(b)} \"b b\" {<\\1|\\2>}")
+    ensures: completion.code = ok
+    ensures: completion.value = "<|b> <|b>"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptMissingGroupIsEmpty {
+    -- \9 with no ninth group is empty, not an error.
+    when: Evaluates("list [regsub {a} a {\\9}] [regsub {(a)} a {\\9}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptTenIsGroupOnePlusZero {
+    -- Replacement digits are single: \10 is group 1 followed by literal "0",
+    -- never group 10.
+    when: Evaluates("list [regsub {(a)} a {\\10}] [regsub {(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)} abcdefghij {\\10}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "a0 a0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptDoubleBackslashIsLiteral {
+    -- \\ in the template produces one literal backslash.
+    when: Evaluates("regsub {a} a {X\\\\Y}")
+    ensures: completion.code = ok
+    ensures: completion.value = "X\\Y"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptAmpersandCanBeEscaped {
+    -- \& suppresses the whole-match meaning and emits a literal ampersand.
+    when: Evaluates("regsub {a} a {X\\&Y}")
+    ensures: completion.code = ok
+    ensures: completion.value = "X&Y"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptUnknownEscapeIsLiteral {
+    -- An unrecognised backslash escape is copied through with its backslash.
+    when: Evaluates("regsub {a} a {\\q}")
+    ensures: completion.code = ok
+    ensures: completion.value = "\\q"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptTrailingBackslashIsLiteral {
+    -- A template ending in a single backslash keeps it; it is not an error
+    -- and it does not escape anything.
+    when: Evaluates("regsub {a} a \"X\\\\\"")
+    ensures: completion.code = ok
+    ensures: completion.value = "X\\"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptAllTrailingBackslashPerMatch {
+    when: Evaluates("regsub -all {a} \"aa\" \"X\\\\\"")
+    ensures: completion.code = ok
+    ensures: completion.value = "X\\X\\"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptEmptyReplacementDeletes {
+    when: Evaluates("list [regsub {a} abc {}] [regsub -all {a} banana {}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "bc bnn"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptEmptyPatternMatchesEverywhere {
+    -- The empty pattern matches before every character; -all also inserts
+    -- after the final character.
+    when: Evaluates("list [regsub {} abc -] [regsub -all {} abc -]")
+    ensures: completion.code = ok
+    ensures: completion.value = "-abc -a-b-c"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── regsub: -nocase / -start / newline / -expanded ──────────────
+
+rule RsOptNocaseKeepsOriginalCase {
+    -- Folding applies to matching; the copied text and & / \n expansions
+    -- keep the original spelling.
+    when: Evaluates("list [regsub -nocase {a} BANANA X] [regsub -nocase {(a)} bAnAna {<\\1>}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "BXNANA b<A>nAna"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptAllNocaseReplacesEveryMatch {
+    when: Evaluates("regsub -all -nocase {a} BANANA X")
+    ensures: completion.code = ok
+    ensures: completion.value = "BXNXNX"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptStartPositiveOffsetsSearch {
+    -- Replacing starts at the offset; a match at or after it is used.
+    when: Evaluates("list [regsub -start 2 {a} banana X] [regsub -start 4 {a} banana X] [regsub -start 6 {a} banana X]")
+    ensures: completion.code = ok
+    ensures: completion.value = "banXna bananX banana"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptStartNegativeClampsToZero {
+    -- Like regexp, a negative -start clamps to 0 rather than counting from
+    -- the end.
+    when: Evaluates("list [regsub -start -2 {a} banana X] [regsub -start -99 {a} banana X]")
+    ensures: completion.code = ok
+    ensures: completion.value = "bXnana bXnana"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptStartBeyondEndNoSubstitution {
+    when: Evaluates("set v PRE; set n [regsub -start 99 {a} abc X v]; list $n $v")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 abc"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptStartWithAllCountsRemainder {
+    when: Evaluates("list [regsub -all -start 3 {a} banana X] [set n [regsub -all -start 3 {a} banana X v]] $v")
+    ensures: completion.code = ok
+    ensures: completion.value = "banXnX 2 banXnX"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptStartEndIndexIsLengthRelative {
+    -- regsub shares regexp's end quirk: end resolves to the length, so
+    -- end-2 => 4 and end-5 => 1.
+    when: Evaluates("list [regsub -start end-2 {a} banana X] [regsub -start end-5 {a} banana X]")
+    ensures: completion.code = ok
+    ensures: completion.value = "bananX bXnana"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptLineEnablesAnchorAndStop {
+    -- -line stops . at newline and makes ^ line-relative; without it neither
+    -- holds.
+    when: Evaluates("list [string length [regsub {a.b} \"a\\nb\" X]] [string length [regsub -line {a.b} \"a\\nb\" X]] [string match {*X} [regsub -line {^b} \"a\\nb\" X]] [string match {*X} [regsub {^b} \"a\\nb\" X]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 3 1 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptLinestopStopsDotOnly {
+    when: Evaluates("list [string length [regsub {a.b} \"a\\nb\" X]] [string length [regsub -linestop {a.b} \"a\\nb\" X]] [string match {*X} [regsub -linestop {^b} \"a\\nb\" X]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 3 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptLineanchorAnchorsOnly {
+    when: Evaluates("list [string match {*X} [regsub -lineanchor {^b} \"a\\nb\" X]] [string length [regsub -lineanchor {a.b} \"a\\nb\" X]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptExpandedIgnoresWhitespace {
+    -- Expanded syntax strips pattern whitespace; the same pattern under the
+    -- default syntax is a literal that does not match "ab".
+    when: Evaluates("list [regsub -expanded {a b} ab X] [regsub {a b} ab X]")
+    ensures: completion.code = ok
+    ensures: completion.value = "X ab"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── regsub: -- and errors ───────────────────────────────────────
+
+rule RsOptDashDashEndsOptions {
+    when: Evaluates("list [regsub [string repeat - 2] {-x} a-x Y] [catch {regsub {-x} a-x Y} e] [string match {bad option*} $e]")
+    ensures: completion.code = ok
+    ensures: completion.value = "aY 1 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptBadOptionMenu {
+    when: Evaluates("catch {regsub -bogus {o} foo up x} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"-bogus\": must be -all, -command, -expanded, -line, -linestop, -lineanchor, -nocase, -start, or --"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule RsOptWrongArgCount {
+    when: Evaluates("catch {regsub a b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"regsub ?-option ...? exp string subSpec ?varName?\""
+    -- probe: 2026-11-28 tclsh9.1
+}

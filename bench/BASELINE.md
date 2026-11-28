@@ -3152,3 +3152,29 @@ sweep 12 既有、workspace **cargo exit 0**（rtcl-vm 871/0）、wasm32 ✓、
 - 环境注记：/tmp tmpfs 99% 时 IO 测试假红 29 项（与本批无关），
   TMPDIR 指向 worktree 内重跑 exit 0 全绿；Agent.md 假新鲜陷阱一次
   实证（touch 强制重建后核对）。
+
+## D6 Core Profile 双轨（task/d6-coreprofile @ 502d559/a5c9efb，2026-11-28，子代理施工）
+
+- **36 扩展裁定**：core-in 9（lambda/curry/function/ref 族/alias——纯
+  内存语义零 OS 面）；std-only 27（新 rtcl-vm feature `ext` 关，含
+  9.1 已除名的 case；stdlib.tcl 拆 stdlib_ext.tcl 随 ext 关）。
+- **双轨构建**：build.sh 无参=std 默认轨不变；--core=core 轨产物
+  rtcl_wasm_bg_core.wasm（opt-s，CORE_PROFILE=release 可切）；JS 胶
+  水两轨同面。core 冒烟 test-core.js **123/123**（核心面 + 关闭面 37
+  命令探针钉 invalid command + 探后实例存活）。
+- **体积（raw/opt/gzip，wasm-opt -Oz 后）**：std 默认（release）raw
+  3,184,775 / opt 2,425,311 / gzip 909,345；size 轨参照 opt-s
+  1,968,049；**core（opt-s）1,827,335 / gzip 723,261**。
+- **红线如实结论：core ≤1.5MB 未达（缺口 −327KB）**——D6 关闭清单净
+  省 −140,714B；缺口构成 = 标准面 CommandFunc fn 指针表结构性 retain
+  （MODULARIZATION §1 定调不可死剥离）+ 基座自 11-19 增长 +292KB
+  （E2 lseq/惰性索引面）。设计时点「关清单即达标」的算术已失效——
+  **重锚红线或产品层裁定更深关闭清单，属用户决策项**。盲砍标准面
+  （event/interp/binary/lseq）与"替代标准 Tcl"冲突，不做。
+- 门禁（合并树）：judge 95/95、crash-gate 128/128、probes 398/76、
+  sweep 12 既有、rtcl-vm 898×2 特性、workspace exit 0、五特性+core
+  组合 check ✓、native 零变化（wasm 特性未进 native）。
+- 登记（未修）：`(std,dynmod)` 组合（io 也关）三处 cfg 腐（event.rs
+  pump_chan_copies/mod.rs copy_jobs/host.rs NativeFs——MODULARIZATION
+  §5 注记过时），本轨 io 保留不受影响；fs_access cfg 门 file→any(
+  file,io) 顺手修（io 无 file 组合此前从未编译过）。

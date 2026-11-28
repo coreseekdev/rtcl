@@ -187,42 +187,34 @@ pub(crate) struct CachedCmd {
 #[derive(Debug, Clone)]
 pub(crate) struct CallFrame {
     /// 帧变量表（D1 步骤 2，specs/ARCH-DESIGN-20261126.md D1）：名键面
-    /// 的权威存储——`locals` 平表 + `array_locals` 位集（数组基位）的
-    /// 三合一，形状 = 步骤 1 的 [`vararena::VarTable`]（TableId::Frame
-    /// (帧栈下标) 身份）。读路径经 `vars.rs` 的 frame_local_* 咽喉
-    /// （debug 双读对拍下平表镜像）；写双写（vt 权威 + 镜像同步）。
-    /// 生命周期随帧：池化归还/尾调重绑/trace 清场走
-    /// [`CallFrame::reset_var_state`]（表清空 + 代数递增——池化复用
-    /// 不冲突）；协程排水随帧整体进出 record（表随帧，无需对拍桥）。
-    /// 插入序向量与 `locals_order` 日志同语义（debug 下逐列对拍——
-    /// T3 直列的迁移期并存）。
+    /// 的权威存储（`locals` 平表 + `array_locals` 位集 + `elem_counts`
+    /// 计数三合一——镜像步骤 5 退役），形状 = 步骤 1 的
+    /// [`vararena::VarTable`]（TableId::Frame(帧栈下标) 身份）。读路径
+    /// 经 `vars.rs` 的 frame_local_* 咽喉。生命周期随帧：池化归还/
+    /// 尾调重绑/trace 清场走 [`CallFrame::reset_var_state`]（表清空 +
+    /// 代数递增——池化复用不冲突）；协程排水随帧整体进出 record（表
+    /// 随帧）。插入序向量与 `locals_order` 日志同语义（日志为 T3 直
+    /// 列的 release 重放源——步骤 5 记账保留）。
     pub vt: vararena::VarTable,
-    /// D1 步骤 2 起：`vt` 的平表镜像（debug 对拍域——release 不维护、
-    /// 无人读；迁移期保留至步骤 5 删除）。权威读写在 `vt`。
-    pub locals: VarMap<Value>,
     /// Tcl hash-order log for this frame's var table (`info locals` /
-    /// `info vars` in proc scope replay it; reset with `locals` on
+    /// `info vars` in proc scope replay it; reset with the table on
     /// frame recycle so every call rebuilds it from param order).
-    /// 双域结构（release 特性 T3 直列仍读它重放）——`vt` 插入序的对
-    /// 拍在 debug 下并跑（顺序语义红线）。
+    /// release 特性——T3 直列仍读它重放（链接条目只入日志
+    /// frame_log_link 不入 vt；vt 插入序与日志序的等价由步骤 2-4 迁
+    /// 移期对拍逐字节验证，重放源保留见 BASELINE 记账）。
     pub locals_order: Vec<String>,
-    /// Names in `locals` that are arrays (scalar/array distinction).
-    /// D1 步骤 2 起：数组基标记的 debug 镜像（权威 = `vt` 的 ARRAY 位
-    /// + 数组基快索引）；帧元素计数（`elem_counts`）保持 release 权威
-    /// ——步骤 3 随数组元素表并入。
-    pub array_locals: VarSet,
-    /// Live element counts of this frame's arrays, keyed by the array's
-    /// base name (`array size`/`exists` read it instead of scanning every
-    /// local key).  Maintained at the element write/remove sites in
-    /// `vars.rs`; cleared with `array_locals` wherever a frame's maps are
-    /// emptied (pool return, tail-call rebind).
-    pub elem_counts: VarMap<usize>,
     /// `const`-marked variable names in this frame (tclsh 9.1's
     /// VAR_CONSTANT flag, TIP 508-era).  `None` while the frame declares
     /// no constants — the write guards in `vars.rs` probe this first so
-    /// const-free frames pay one branch.  Cleared with `array_locals`
-    /// wherever a frame's maps are emptied.
+    /// const-free frames pay one branch.  Cleared in
+    /// [`CallFrame::reset_var_state`].
     pub consts: Option<Vec<String>>,
+    /// 帧内链接登记表（别名名 → 目标）。D1 步骤 5 决策：**保留**，不
+    /// 收编 Var.link——链接名可无 vt 条目（link-only，T3 直列经
+    /// locals_order 日志 + in_table 过滤列举）；三链接形含 Dead（惰性
+    /// 目标探测即语义）；Frame 链接的跨帧句柄在池化重置下不稳定
+    /// （代数守卫换不来 Dead 判定）。全部热径已有 is_empty 单分支守
+    /// 卫，收编无可得收益、语义风险在字节级红线面。
     pub upvars: UpvarMap,
     /// Namespace the running proc was defined in (tclsh: `namespace current`
     /// inside the proc resolves here).  Variable *reads* do NOT fall back to
@@ -304,19 +296,11 @@ pub(crate) struct CallFrame {
 
 impl CallFrame {
     /// 帧名键面清空（D1 步骤 2）：`vt` 整表重置（代数逐槽递增——池化
-    /// 复用旧句柄全灭）+ 插入日志清空（双域）+ 元素计数清空（帧域
-    /// elem_counts 保持既有权威）+ 平表/位集镜像同步（debug 对拍域
-    /// ——release 镜像此后无人读，读全走 vt）。帧池归还、尾调重绑、
-    /// trace 清场三处共用。
+    /// 复用旧句柄全灭）+ 插入日志清空。帧池归还、尾调重绑、trace 清
+    /// 场三处共用。
     pub(crate) fn reset_var_state(&mut self) {
         self.vt.reset();
         self.locals_order.clear();
-        self.elem_counts.clear();
-        #[cfg(debug_assertions)]
-        {
-            self.locals.clear();
-            self.array_locals.clear();
-        }
     }
 
     /// 刷新帧表的表身份（推栈点——池化帧可换帧栈深度复用；协程 resume
@@ -478,8 +462,9 @@ pub(crate) struct ArraySearchList {
 
 /// One registered `trace add variable` callback: canonical ops (sorted
 /// array/read/unset/write) plus the script invoked with `name1 name2 op`
-/// appended.
-#[derive(Clone)]
+/// appended.  D1 步骤 4 起数据本体驻 [`vararena::TraceSet`]（挂 Var），
+/// 本类型是记录形状。
+#[derive(Clone, Debug)]
 pub(crate) struct VarTrace {
     pub ops: Vec<String>,
     pub script: String,
@@ -549,31 +534,20 @@ fn default_max_call_depth() -> usize {
 pub struct Interp {
     /// D1 步骤 1（specs/ARCH-DESIGN-20261126.md D1）：全局变量表
     /// arena——`globals` 平表 + `phantom_globals` + `array_globals`
-    /// （连带全局域 `elem_counts`）三合一的权威存储。读写经 vars.rs
-    /// 的 global_* 咽喉（读 arena + debug 双读对拍；写双写）；本批只
-    /// 装配 0 号根表（::，平键域与 `globals` 同域——链接/死链面的键
-    /// 天然兼容），每命名空间一张的拆分随步骤 2/3。
+    /// （连带全局域 `elem_counts`）三合一的权威存储（步骤 1-4 的镜像
+    /// 与 debug 对拍于步骤 5 退役——单一权威）。读写经 vars.rs 的
+    /// global_* 咽喉；每命名空间一张的拆分随步骤 2/3。
     pub(crate) var_arena: vararena::VarArena,
-    /// Variables (global scope).
-    pub(crate) globals: VarMap<Value>,
     /// 顶层 slot 单元执行中（Some = 激活；exec_bytecode 进出管理）。
     pub(crate) top_slots: Option<TopSlots>,
-    /// Names in `globals` that are arrays (scalar/array distinction).
-    pub(crate) array_globals: VarSet,
-    /// True while `array_globals` holds ONLY the startup arrays
-    /// (`env`, `tcl_platform`): the per-op array guards in get_var/
+    /// True while the :: table's ARRAY entries hold ONLY the startup
+    /// arrays (`env`, `tcl_platform`): the per-op array guards in get_var/
     /// set_var/read_var then skip their `contains` probe entirely —
-    /// the startup arrays make the set permanently non-empty, and the
+    /// the startup arrays make the guard permanently hot, and the
     /// probe was ~10% of var-heavy loops (dloop/oo profiles).  Every
     /// mutation site maintains the flag (inserts of any other name
     /// clear it; removals recompute — both are cold paths).
     pub(crate) arrays_env_only: bool,
-    /// Live element counts of the global-scope arrays, keyed by the
-    /// array's base key (`array size`/`array exists` used to filter-scan
-    /// the whole global table per call — 80k elements ≈ ms).  Maintained
-    /// at the element write/remove sites (`vars.rs`) and at the direct
-    /// removal purges (namespace delete, oo destroy).
-    pub(crate) elem_counts: VarMap<usize>,
     /// `array default` values (TIP 508, tclsh 9.1): keyed by the same
     /// stamp key as the array-search state (`G:name` / `F<idx>:name`).
     /// Consulted on element-miss reads (the default is NOT materialized:
@@ -632,11 +606,6 @@ pub struct Interp {
     /// 极少是用户负载的热点；保持它们的调用时编译（既有路径）。用户
     /// 脚本（含 source 的用户库）不受影响——定义即编译照常。
     pub(crate) in_rt_prelude: bool,
-    /// Same log for the global var table (`info vars`/`info globals`
-    /// and global-scope `array names` — element keys `arr(k)` ride the
-    /// same log and are filtered per surface).  Frame tables keep their
-    /// own per-frame log ([`CallFrame::locals_order`]).
-    pub(crate) var_order: Vec<String>,
     /// Namespace creation order (`namespace children` replay).
     pub(crate) ns_order: Vec<String>,
     /// rtcl-superset commands hidden from `info commands`: tclsh 8.6.17
@@ -855,12 +824,16 @@ pub struct Interp {
     /// grew with array-name churn and had no removal path): `array get`
     /// snapshots are conservatively invalidated by any array mutation.
     pub(crate) array_generation: u64,
-    /// Whole-variable traces keyed by the owning scope's stamp key.
-    pub(crate) var_traces: HashMap<String, Vec<VarTrace>>,
-    /// Element-specific traces: stamp key → element name → traces.
-    pub(crate) elem_traces: HashMap<String, HashMap<String, Vec<VarTrace>>>,
-    /// Elements that exist only to carry a trace (traced but never set).
-    pub(crate) trace_phantoms: HashMap<String, std::collections::HashSet<String>>,
+    /// 持有 trace 集（`Var.traces: Option<Box<TraceSet>>` 在席）的宿主
+    /// Var 数——「任意变量 trace 在册」的 O(1) 真源（D1 步骤 4）。快径
+    /// 守卫（ts 单元、scalar_top 读写、incr/lappend/append 元素快径、
+    /// read_var 免火臂、槽 fast path……）据此让路：>0 走全语义链。
+    /// 计数形与旧字符串表的「键 linger」守卫语义逐字同：注册建集 +1；
+    /// `trace remove` 只摘记录（空集**留存**——lingering 键形，基线钉
+    /// 形：摘净后 upvar-8.7 仍拦）；宿主整体消亡（快照 take/unset 摘
+    /// 除/帧清场/ns 清扫）时 −1。方向偏差只可能偏保守（守卫多让路 =
+    /// 走全链 = 语义等价，仅慢）。
+    pub(crate) n_trace_hosts: usize,
     /// Currently-firing trace targets (tclsh's VAR_TRACE_ACTIVE, D-36):
     /// `W\0{stamp}` for whole-variable fires, `E\0{stamp}\0{elem}` for
     /// element fires.  A fire on an active target is skipped, so a
@@ -902,17 +875,14 @@ pub struct Interp {
     /// At the global level tclsh's `upvar`/`variable` link two variables;
     /// rtcl's flat global table models that with this redirect.  A Vec so
     /// `namespace eval` can truncate to its entry mark on exit.
+    /// D1 步骤 5 决策：**保留**（解改名/前置重写层，非 per-Var 态——
+    /// 别名名可无表条目；收编需物化别名 Var 并动列举序红线）。
     pub(crate) flat_aliases: Vec<(String, String)>,
     /// Eval-level aliases whose target was deleted (namespace removal):
     /// reads keep the redirect, writes error.
+    /// D1 步骤 5 决策：**保留**（flat_aliases 的亡目标伴随面——同前
+    /// 理由：前置重写层，非 per-Var 态）。
     pub(crate) dead_flat: Vec<String>,
-    /// Bare names of the :: table that hold no value but are there: a
-    /// trace was put on the variable, or a proc linked to it (`global x`,
-    /// `upvar #0 x y`).  tclsh keeps an undefined Var for each, and a
-    /// write to the bare name from inside a namespace body finds it — the
-    /// write lands on the global (and fires the trace) instead of making
-    /// the namespace's own variable.  See `Interp::global_entry_exists`.
-    pub(crate) phantom_globals: varmap::VarSet,
     /// Flat keys of variables a `variable` command declared at eval level
     /// (tclsh: the ns-eval varFrame holds a reference, so a namespace that
     /// deletes ITSELF leaves the declared variable readable for the rest
@@ -922,6 +892,8 @@ pub struct Interp {
     /// 体帧作用域（var-3.10 与 DIFF-8 的分野——upvar 的 eval 级别名链
     /// 接两个持久 ns 变量、随 flat_aliases 持久；variable 链接随声明
     /// 体帧生灭、不漏入嵌套体）。ns eval 体入口 take 清空、退出恢复。
+    /// D1 步骤 5 决策：**保留**（体作用域瞬态别名——take/恢复的
+    /// 生命周期挂在 ns-eval 体进出，Var.link 无此作用域语义）。
     pub(crate) ns_transient: Vec<(String, String)>,
     /// Namespace variables kept alive past `namespace delete` because a
     /// live variable link still references them; dropped when the
@@ -1237,18 +1209,13 @@ impl Interp {
     pub fn new() -> Self {
         let mut interp = Interp {
             var_arena: vararena::VarArena::new(),
-            globals: VarMap::default(),
-            array_globals: VarSet::default(),
             arrays_env_only: true,
-            elem_counts: VarMap::default(),
             array_defaults: VarMap::default(),
             const_globals: Vec::new(),
             array_searches: HashMap::new(),
             array_stamps: HashMap::new(),
             array_generation: 0,
-            var_traces: HashMap::new(),
-            elem_traces: HashMap::new(),
-            trace_phantoms: HashMap::new(),
+            n_trace_hosts: 0,
             trace_active: std::collections::HashSet::new(),
             cmd_traces: HashMap::new(),
             exec_traces: HashMap::new(),
@@ -1258,7 +1225,6 @@ impl Interp {
             tier1_epoch: 0,
             flat_aliases: Vec::new(),
             dead_flat: Vec::new(),
-            phantom_globals: varmap::VarSet::default(),
             ns_variable_links: Vec::new(),
             ns_transient: Vec::new(),
             ns_eval_keep: Vec::new(),
@@ -1352,7 +1318,6 @@ impl Interp {
             import_aliases: HashMap::new(),
             ns_unknown: HashMap::new(),
             command_order: Vec::new(),
-            var_order: Vec::new(),
             ns_order: vec!["::".to_string()],
             hidden_commands: VarSet::default(),
             coroutines: VarMap::default(),
@@ -1962,19 +1927,6 @@ impl Interp {
     #[allow(dead_code)]
     pub(crate) fn in_proc(&self) -> bool {
         !self.frames.is_empty()
-    }
-
-    /// Reference to variable storage for the current scope (for iteration).
-    /// Does NOT follow upvar links.
-    /// （D1 步骤 2 起无消费者且权威面在 `CallFrame::vt`/arena——保留
-    /// 只读镜像访问，勿新用。）
-    #[allow(dead_code)]
-    pub(crate) fn scope_vars(&self) -> &VarMap<Value> {
-        if let Some(frame) = self.frames.last() {
-            &frame.locals
-        } else {
-            &self.globals
-        }
     }
 
     /// Resolution-cache probe: the memoised winner for invoking `name`

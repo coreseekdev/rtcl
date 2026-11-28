@@ -677,16 +677,6 @@ fn split_key_ns(key: &str) -> (String, String) {
     }
 }
 
-/// The full (leading-`::`) form of a command key, as tclsh's
-/// `Tcl_GetCommandFullName` renders it when the pattern names a namespace.
-fn full_key(key: &str) -> String {
-    if key.starts_with("::") {
-        key.to_string()
-    } else {
-        format!("::{}", key)
-    }
-}
-
 /// Resolve an `info commands` pattern the way tclsh's
 /// `TclGetNamespaceForQualName` does: walk each `::`-terminated qualifier as
 /// a child of the current namespace (absolute patterns start at `::`); the
@@ -2249,7 +2239,7 @@ pub fn cmd_append(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     // errors, same trace firing (none when no traces are registered).
     if let Some((array_name, elem_index)) = crate::interp::util::split_array_ref(var_name) {
         if !crate::interp::util::has_ns_sep(var_name)
-            && interp.var_traces.is_empty()
+            && interp.n_trace_hosts == 0
             && interp.dead_flat.iter().all(|k| k != array_name)
             && interp.flat_aliases.iter().all(|(k, _)| k != array_name)
             && interp.ns_transient.iter().all(|(k, _)| k != array_name)
@@ -2276,19 +2266,6 @@ pub fn cmd_append(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                                     }
                                     in_place.then(|| c.value.clone())
                                 });
-                            #[cfg(debug_assertions)]
-                            if r.is_some() {
-                                if let Some(c) = frame.locals.get_mut(var_name) {
-                                    let mut in_place = true;
-                                    for arg in &args[2..] {
-                                        if !c.append_str_in_place(arg.as_str()) {
-                                            in_place = false;
-                                            break;
-                                        }
-                                    }
-                                    let _ = in_place;
-                                }
-                            }
                             r
                         } else {
                             None
@@ -2300,7 +2277,7 @@ pub fn cmd_append(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     None
                 }
             } else if interp.current_namespace.as_ref() == "::" {
-                // D1 步骤 3：arena 权威子表格（宿主单探测）+ 镜像重放。
+                // D1 步骤 3：arena 权威子表格（宿主单探测）。
                 let r = {
                     match interp.var_arena.root_mut().get_mut(array_name) {
                         Some(host) if host.is_array() => host
@@ -2321,19 +2298,6 @@ pub fn cmd_append(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         _ => None,
                     }
                 };
-                #[cfg(debug_assertions)]
-                if r.is_some() {
-                    if let Some(c) = interp.globals.get_mut(var_name) {
-                        let mut in_place = true;
-                        for arg in &args[2..] {
-                            if !c.append_str_in_place(arg.as_str()) {
-                                in_place = false;
-                                break;
-                            }
-                        }
-                        let _ = in_place;
-                    }
-                }
                 r
             } else {
                 None

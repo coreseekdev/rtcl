@@ -593,6 +593,21 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                 kept.push(base);
                 continue;
             }
+            // D1 步骤 4：valueless 非 ARRAY 条目 = 本步的 trace 注册宿
+            // 主占位（旧形无 Var——基键枚举不见它，不发 unset 火）——
+            // 随下方清扫回收。
+            let trace_host_only = interp
+                .var_arena
+                .root()
+                .get(&base)
+                .is_some_and(|v| !v.has_value() && !v.is_array());
+            if trace_host_only {
+                continue;
+            }
+            // D1 步骤 4：快照先行——TraceSet 随 Var 摘除离场，unset 火
+            // 从快照触发（记录在触发期间对 trace info 不可见——oracle
+            // 钉形）。
+            let (base_stamp, snap) = interp.take_trace_set(&base);
             // D1 步骤 1：基键 + 元素键经 global_remove 双删；数组位/
             // 计数经 global_unmark_array（arrays_env_only 按镜像集重算
             // ——与旧全等式逐字同）。
@@ -609,17 +624,36 @@ fn ns_delete(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             // `namespace which -variable` while its trace runs (tclsh
             // keeps the Var in the table but marked undefined).
             interp.var_nuke_pending.insert(base.clone());
-            let _ = interp.fire_traces(&format!("::{}", base), None, "unset");
+            let _ = interp.fire_trace_snapshot(
+                &base_stamp,
+                &format!("::{}", base),
+                None,
+                "unset",
+                snap.as_deref(),
+                true,
+            );
             interp.var_nuke_pending.remove(&base);
         }
         // Trace registrations and searches living under the tree die with
-        // it.  D1 步骤 3：搜索/戳键 = 宿主 VarRef——宿主名经表反查
+        // it.  D1 步骤 4：记录挂 Var——前缀下残留宿主（keeps 的值条目、
+        // trace 注册占位）的 TraceSet 全数摘除（旧形 = stamp 前缀
+        // retain，keeps 的记录同样离场）；纯占位条目连条目回收（旧形无
+        // Var）。D1 步骤 3：搜索/戳键 = 宿主 VarRef——宿主名经表反查
         // （key_of；全局宿主），宿主已亡的条目一并清（死数组的搜索/
         // 戳不可达——垃圾；可达面与旧 G: 前缀扫描同域）。
-        let stamp_prefix = format!("G:{}", var_prefix);
-        interp.var_traces.retain(|k, _| !k.starts_with(&stamp_prefix));
-        interp.elem_traces.retain(|k, _| !k.starts_with(&stamp_prefix));
-        interp.trace_phantoms.retain(|k, _| !k.starts_with(&stamp_prefix));
+        let sweep: Vec<Rc<str>> = interp.var_arena.root().keys_with_prefix(&var_prefix);
+        for k in sweep {
+            let host_only = interp
+                .var_arena
+                .root()
+                .get(k.as_ref())
+                .is_some_and(|v| !v.has_value() && !v.is_array());
+            let (_, snap) = interp.take_trace_set(k.as_ref());
+            let _ = snap;
+            if host_only {
+                interp.global_forget_phantom(k.as_ref());
+            }
+        }
         let doomed: Vec<crate::interp::vararena::VarRef> = interp
             .array_searches
             .keys()

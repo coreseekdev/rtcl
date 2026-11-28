@@ -132,6 +132,8 @@ fn split_elem(name: &str) -> Option<(&str, &str)> {
 /// Register a variable trace; element traces on never-set elements also
 /// create the phantom element (visible to `info exists` on the array,
 /// invisible to names/get/size) and invalidate array searches.
+/// D1 步骤 4：记录挂 Var（整变量族 = 名字宿主 Var 的 `traces.var`——
+/// 无值占位宿主就地确保；元素族 = 数组基宿主 Var 的 `traces.elem`）。
 fn add_variable(interp: &mut Interp, rest: &[Value]) -> Result<Value> {
     if rest.len() != 3 {
         return Err(Error::wrong_args_with_usage(
@@ -161,23 +163,20 @@ fn add_variable(interp: &mut Interp, rest: &[Value]) -> Result<Value> {
             // Phantom creation: the array starts existing (size 0).
             interp.mark_array(&base_s)?;
         }
-        let key = interp.array_stamp_key(&base_s);
         let elem = elem.to_string();
         let exists = interp.get_var(&name).is_ok();
-        let entry = interp.elem_traces.entry(key.clone()).or_default();
-        entry.entry(elem.clone()).or_default().push(trace);
+        interp.trace_register_elem(&base_s, &elem, trace);
         if !exists {
-            interp.trace_phantoms.entry(key).or_default().insert(elem);
             // Structural change: searches die (set-old-9.10).
             interp.bump_stamp_by_name(&base_s);
         }
     } else {
-        let key = interp.array_stamp_key(&name);
-        interp.var_traces.entry(key).or_default().push(trace);
+        interp.trace_register_var(&name, trace, true);
         // The variable is in its table from now on, value or not (tclsh
         // keeps the Var): a write to the bare name inside a namespace
-        // body lands on it.
-        interp.note_global_entry(&name);
+        // body lands on it.  宿主占位条目由 trace_register_var 就地确保
+        // （bare-:: 与旧 note_global_entry 同形 UNDEFINED 占位；限定名/
+        // ns 体裸名为本步同形扩展——oracle 实测 trace 注册即建 Var）。
     }
     Ok(Value::empty())
 }
@@ -195,26 +194,16 @@ fn remove_variable(interp: &mut Interp, rest: &[Value]) -> Result<Value> {
     let ops = canon_var_ops(parse_ops(interp, &rest[1], VAR_OPS)?);
     let script = rest[2].as_str().to_string();
     if let Some((base, elem)) = split_elem(&name) {
-        let base = base.to_string();
-        let key = interp.array_stamp_key(&base);
-        let elem = elem.to_string();
-        if let Some(map) = interp.elem_traces.get_mut(&key) {
-            if let Some(v) = map.get_mut(&elem) {
-                remove_first_trace(v, &ops, &script);
-                if v.is_empty() {
-                    map.remove(&elem);
-                }
-            }
-        }
+        interp.trace_unregister_elem(base, elem, &ops, &script);
     } else {
-        let key = interp.array_stamp_key(&name);
-        if let Some(v) = interp.var_traces.get_mut(&key) {
-            remove_first_trace(v, &ops, &script);
-        }
+        let removed = interp.trace_unregister_var(&name, &ops, &script);
         // With its last trace gone, a variable that never had a value
-        // leaves the table again.
-        if !interp.var_traces.get(&key).is_some_and(|v| !v.is_empty()) {
-            interp.forget_global_entry(&name);
+        // loses its keep-alive phantom bit again (tclsh: the undefined
+        // Var stays only while traces reference it).  条目本体与（可能
+        // 已空的）trace 集留存——upvar-8.7 的「被追踪」判定按在席记录
+        // 键（lingering 键形，基线钉形）。
+        if removed && interp.trace_set_empty_at(&name) {
+            interp.trace_host_relax(&name);
         }
     }
     Ok(Value::empty())
@@ -232,16 +221,9 @@ fn info_variable(interp: &mut Interp, rest: &[Value]) -> Result<Value> {
     let name = rest[0].as_str();
     let mut out: Vec<Value> = Vec::new();
     let traces = if let Some((base, elem)) = split_elem(name) {
-        let key = interp.array_stamp_key(base);
-        interp
-            .elem_traces
-            .get(&key)
-            .and_then(|m| m.get(elem))
-            .cloned()
-            .unwrap_or_default()
+        interp.trace_info_elem(base, elem)
     } else {
-        let key = interp.array_stamp_key(name);
-        interp.var_traces.get(&key).cloned().unwrap_or_default()
+        interp.trace_info_var(name)
     };
     for t in traces.into_iter().rev() {
         let rendered = t.ops.join(" ");
@@ -759,15 +741,9 @@ fn legacy_trace(interp: &mut Interp, sub: &str, rest: &[Value]) -> Result<Value>
                 Some((b, e)) => (b, Some(e)),
                 None => (name, None),
             };
-            let key = interp.array_stamp_key(base);
             let traces = match elem {
-                Some(e) => interp
-                    .elem_traces
-                    .get(&key)
-                    .and_then(|m| m.get(e))
-                    .cloned()
-                    .unwrap_or_default(),
-                None => interp.var_traces.get(&key).cloned().unwrap_or_default(),
+                Some(e) => interp.trace_info_elem(base, e),
+                None => interp.trace_info_var(base),
             };
             let mut out: Vec<Value> = Vec::new();
             for t in traces {
@@ -829,36 +805,16 @@ fn legacy_trace(interp: &mut Interp, sub: &str, rest: &[Value]) -> Result<Value>
             let script = rest[2].as_str().to_string();
             if sub == "variable" {
                 // D-38②：legacy 同样路由元素形式（trace variable a(k) w cb
-                // 注册的是元素 trace，元素写触发）。
+                // 注册的是元素 trace，元素写触发）。D1 步骤 4：挂 Var。
                 if let Some((base, elem)) = split_elem(&name) {
-                    let key = interp.array_stamp_key(base);
-                    interp
-                        .elem_traces
-                        .entry(key)
-                        .or_default()
-                        .entry(elem.to_string())
-                        .or_default()
-                        .push(VarTrace { ops, script });
+                    interp.trace_register_elem(base, elem, VarTrace { ops, script });
                 } else {
-                    let key = interp.array_stamp_key(&name);
-                    interp
-                        .var_traces
-                        .entry(key)
-                        .or_default()
-                        .push(VarTrace { ops, script });
+                    interp.trace_register_var(&name, VarTrace { ops, script }, false);
                 }
             } else if let Some((base, elem)) = split_elem(&name) {
-                let key = interp.array_stamp_key(base);
-                if let Some(map) = interp.elem_traces.get_mut(&key) {
-                    if let Some(v) = map.get_mut(elem) {
-                        remove_first_trace(v, &ops, &script);
-                        if v.is_empty() {
-                            map.remove(elem);
-                        }
-                    }
-                }
-            } else if let Some(v) = interp.var_traces.get_mut(&interp.array_stamp_key(&name)) {
-                remove_first_trace(v, &ops, &script);
+                interp.trace_unregister_elem(base, elem, &ops, &script);
+            } else {
+                interp.trace_unregister_var(&name, &ops, &script);
             }
             Ok(Value::empty())
         }

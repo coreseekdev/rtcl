@@ -1,0 +1,533 @@
+-- allium: 3
+-- encoding.allium
+-- Behaviour spec: the encoding ensemble (convertfrom, convertto, dirs,
+-- names, profiles, system, user) and the unicode normalization ensemble
+-- (tonfc, tonfd, tonfkc, tonfkd). Covers byte-level conversions for
+-- utf-8/iso8859-1/unicode/ascii, malformed input, profiles and -profile,
+-- byte order and BOMs, listing shapes, normalization forms and the
+-- option/arity error text.
+--
+-- Scope boundary: channel -encoding, fconfigure and all I/O encoding
+-- rules belong to io.allium and are deliberately not repeated here;
+-- io.allium also pins the encoding-name count (95), the profiles menu,
+-- and user=system at startup. This file pins the command surface and
+-- conversion semantics those rules do not cover.
+-- Oracle: tclsh 9.1.0 (core-9-1-0).
+-- Probes: ad-hoc oracle probes, re-run 2026-11-28.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── UTF-8 / iso8859-1 / unicode / ascii conversions ─────────────
+-- Raw bytes are built with [binary format H*] and read back with
+-- [binary encode hex]; characters use [format %c N].
+
+rule EncConvertToUtf8Bytes {
+    -- convertto returns a byte string: "héllo" is six UTF-8 bytes.
+    when: Evaluates("binary encode hex [encoding convertto utf-8 \"héllo\"]")
+    ensures: completion.code = ok
+    ensures: completion.value = "68c3a96c6c6f"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule EncConvertFromUtf8Bytes {
+    -- The inverse direction decodes the same byte string to five chars.
+    when: Evaluates("list [encoding convertfrom utf-8 [binary format H* 68c3a96c6c6f]] [string length [encoding convertfrom utf-8 [binary format H* 68c3a96c6c6f]]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "héllo 5"
+}
+
+rule EncUtf8EncodingWidths {
+    -- UTF-8 uses 2 bytes for U+00E9, 3 for U+20AC and 4 for U+1F600;
+    -- a byte string's string length therefore differs from its char count.
+    when: Evaluates("list [binary encode hex [encoding convertto utf-8 [format %c 0xE9]]] [binary encode hex [encoding convertto utf-8 [format %c 0x20AC]]] [binary encode hex [encoding convertto utf-8 [format %c 0x1F600]]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "c3a9 e282ac f09f9880"
+}
+
+rule EncIso8859OneByteRoundTrip {
+    -- iso8859-1 is single-byte: U+00E9 encodes as one byte and decodes
+    -- back unchanged.
+    when: Evaluates("list [binary encode hex [encoding convertto iso8859-1 \"héllo\"]] [encoding convertfrom iso8859-1 [binary format H* 68e96c6c6f]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "68e96c6c6f héllo"
+}
+
+rule EncIso8859HighByteIdentity {
+    -- Every iso8859-1 byte maps to the code point of the same value,
+    -- including 0xFF.
+    when: Evaluates("list [string length [encoding convertfrom iso8859-1 [binary format H* ff]]] [scan [encoding convertfrom iso8859-1 [binary format H* ff]] %c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 255"
+}
+
+rule EncAsciiIsSevenBit {
+    -- ASCII accepts 0x7F but rejects 0x80 as an invalid byte sequence.
+    when: Evaluates("list [scan [encoding convertfrom ascii [binary format H* 7f]] %c] [catch {encoding convertfrom ascii [binary format H* 80]} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "127 1 {unexpected byte sequence starting at index 0: '\x80'}"
+}
+
+rule EncEncodeRejectsUnmappableCharacter {
+    -- The strict default encode of U+20AC to iso8859-1 names the char
+    -- and its index.
+    when: Evaluates("catch {encoding convertto iso8859-1 [format %c 0x20AC]} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unexpected character at index 0: 'U+0020AC'"
+}
+
+rule EncUtf8RejectsOverlong {
+    -- 0xC0 0x80 is an overlong encoding of NUL and is rejected.
+    when: Evaluates("catch {encoding convertfrom utf-8 [binary format H* c080]} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unexpected byte sequence starting at index 0: '\xC0'"
+}
+
+rule EncUtf8RejectsTruncated {
+    -- A truncated 3-byte sequence is reported at the lead byte.
+    when: Evaluates("catch {encoding convertfrom utf-8 [binary format H* e282]} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unexpected byte sequence starting at index 0: '\xE2'"
+}
+
+rule EncUtf8RejectsSurrogate {
+    -- UTF-8 encoding of a surrogate (0xED 0xA0 0x80) is rejected.
+    when: Evaluates("catch {encoding convertfrom utf-8 [binary format H* eda080]} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unexpected byte sequence starting at index 0: '\xED'"
+}
+
+rule EncUnicodeIsUtf16LittleEndian {
+    -- The "unicode" encoding is UTF-16 in little-endian byte order with
+    -- no BOM, identical to utf-16le.
+    when: Evaluates("list [binary encode hex [encoding convertto unicode \"hé\"]] [expr {[binary encode hex [encoding convertto unicode \"hé\"]] eq [binary encode hex [encoding convertto utf-16le \"hé\"]]}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "6800e900 1"
+}
+
+rule EncUtf16ByteOrder {
+    -- Explicit utf-16be/utf-16le differ by byte order and add no BOM.
+    when: Evaluates("list [binary encode hex [encoding convertto utf-16be hi]] [binary encode hex [encoding convertto utf-16le hi]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "00680069 68006900"
+}
+
+rule EncUtf32ByteOrder {
+    -- Explicit utf-32be/utf-32le are four bytes per char, no BOM.
+    when: Evaluates("list [binary encode hex [encoding convertto utf-32be hi]] [binary encode hex [encoding convertto utf-32le hi]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0000006800000069 6800000069000000"
+}
+
+rule EncUtf16SurrogatePair {
+    -- A non-BMP char becomes a UTF-16 surrogate pair in the target's
+    -- byte order.
+    when: Evaluates("list [binary encode hex [encoding convertto utf-16be [format %c 0x1F600]]] [binary encode hex [encoding convertto utf-16le [format %c 0x1F600]]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "d83dde00 3dd800de"
+}
+
+rule EncUtf32FourBytesPerChar {
+    -- UTF-32 stores U+1F600 as one 4-byte code unit and decodes it back
+    -- to a single char.
+    when: Evaluates("list [binary encode hex [encoding convertto utf-32be [format %c 0x1F600]]] [string length [encoding convertfrom utf-32be [binary format H* 0001f600]]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0001f600 1"
+}
+
+rule EncUcs2RejectsAstral {
+    -- ucs-2 is the BMP-only UTF-16 form; astral chars are unexpected.
+    when: Evaluates("catch {encoding convertto ucs-2 [format %c 0x1F600]} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unexpected character at index 0: 'U+01F600'"
+}
+
+rule EncCesu8SurrogatePairForm {
+    -- cesu-8 encodes the surrogate pair as two 3-byte sequences.
+    when: Evaluates("binary encode hex [encoding convertto cesu-8 [format %c 0x1F600]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "eda0bdedb880"
+}
+
+-- ── byte-order marks ─────────────────────────────────────────────
+
+rule EncUtf8BomIsData {
+    -- convertfrom does not strip a UTF-8 BOM; U+FEFF stays in the result.
+    when: Evaluates("list [string length [encoding convertfrom utf-8 [binary format H* efbbbf6869]]] [scan [encoding convertfrom utf-8 [binary format H* efbbbf6869]] %c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 65279"
+}
+
+rule EncUtf16BomIsData {
+    -- Same for UTF-16: the BOM is a character, not a header to consume.
+    when: Evaluates("list [string length [encoding convertfrom utf-16le [binary format H* fffe68006900]]] [scan [encoding convertfrom utf-16le [binary format H* fffe68006900]] %c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 65279"
+}
+
+rule EncEncodeAddsNoBom {
+    -- Encoding "hi" emits no BOM; the only ff fe comes from encoding the
+    -- U+FEFF character itself.
+    when: Evaluates("list [binary encode hex [encoding convertto utf-16be hi]] [binary encode hex [encoding convertto utf-16le [format %c 0xFEFF]]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "00680069 fffe"
+}
+
+-- ── profiles ─────────────────────────────────────────────────────
+-- profiles is a fixed read-only menu: append/remove names is an arity
+-- error. The three names are pinned once in io.allium; here we pin the
+-- per-profile conversion behaviour and the option surface.
+
+rule EncProfilesReadOnly {
+    -- No add/remove/modify form exists; any argument is wrong # args.
+    when: Evaluates("catch {encoding profiles add x} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"encoding profiles\""
+}
+
+rule EncStrictDecodeRejectsBadByte {
+    -- strict is the default for convertfrom too: a truncated UTF-8
+    -- sequence is an error at the source byte index.
+    when: Evaluates("catch {encoding convertfrom utf-8 [binary format H* 61c3]} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unexpected byte sequence starting at index 1: '\xC3'"
+}
+
+rule EncReplaceDecodesInvalidToReplacement {
+    -- replace substitutes U+FFFD on decode; on encode to a legacy target
+    -- it falls back to the target's '?'.
+    when: Evaluates("list [scan [encoding convertfrom -profile replace ascii [binary format H* 80]] %c] [binary encode hex [encoding convertto -profile replace iso8859-1 [format %c 0x20AC]]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "65533 3f"
+}
+
+rule EncReplaceEncodesInvalidToUtf8Replacement {
+    -- For UTF targets the replacement is the U+FFFD code point (ef bf bd).
+    when: Evaluates("binary encode hex [encoding convertto -profile replace utf-8 [format %c 0xD800]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "efbfbd"
+}
+
+rule EncTcl8DecodeUsesNumericFallback {
+    -- tcl8 maps invalid ascii 0x80 through CP1252 (U+20AC), maps C0 80 to
+    -- NUL, and maps other invalid UTF-8 bytes numerically (C1 -> U+00C1).
+    when: Evaluates("list [scan [encoding convertfrom -profile tcl8 ascii [binary format H* 80]] %c] [scan [encoding convertfrom -profile tcl8 utf-8 [binary format H* c080]] %c] [scan [encoding convertfrom -profile tcl8 utf-8 [binary format H* c181]] %c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "8364 0 193"
+}
+
+rule EncBadProfileNameRejected {
+    -- A bad -profile value lists the three accepted names.
+    when: Evaluates("catch {encoding convertto -profile bogus utf-8 a} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad profile name \"bogus\": must be replace, strict, or tcl8"
+}
+
+rule EncProfileNameAbbreviatesButValueDoesNot {
+    -- Option names accept unique prefixes (-prof); profile values do not
+    -- (repl is rejected).
+    when: Evaluates("list [binary encode hex [encoding convertto -prof replace ascii \"\xE9\"]] [catch {encoding convertto -profile repl utf-8 a} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "3f 1 {bad profile name \"repl\": must be replace, strict, or tcl8}"
+}
+
+-- ── -failindex ───────────────────────────────────────────────────
+
+rule EncFailIndexDecodeDirection {
+    -- On decode the stored index is the source byte offset; the result is
+    -- the prefix converted before it. io.allium pins the encode direction.
+    when: Evaluates("list [encoding convertfrom -failindex i utf-8 [binary format H* 68c3]] $i")
+    ensures: completion.code = ok
+    ensures: completion.value = "h 1"
+}
+
+rule EncFailIndexCleanSetsMinusOne {
+    -- A clean conversion overwrites any previous var value with -1.
+    when: Evaluates("set i 99; encoding convertto -failindex i ascii hi; set i")
+    ensures: completion.code = ok
+    ensures: completion.value = "-1"
+}
+
+rule EncFailIndexWithReplaceNeverFails {
+    -- -failindex only reports strict failures; replace completes and -1
+    -- is stored.
+    when: Evaluates("list [encoding convertto -profile replace -failindex i ascii \"\xE9\"] $i")
+    ensures: completion.code = ok
+    ensures: completion.value = "? -1"
+}
+
+-- ── system / user / defaults ─────────────────────────────────────
+
+rule EncDefaultEncodingIsSystem {
+    -- With no encoding argument, convertto uses the system encoding (here
+    -- switched to iso8859-1 and restored).
+    when: Evaluates("set old [encoding system]; encoding system iso8859-1; set v [binary encode hex [encoding convertto \"é\"]]; encoding system $old; list $v [encoding system]")
+    ensures: completion.code = ok
+    ensures: completion.value = "e9 utf-8"
+}
+
+rule EncSystemSetReturnsEmpty {
+    -- Setting the system encoding returns empty and is readable back.
+    when: Evaluates("set old [encoding system]; set r [encoding system iso8859-1]; set now [encoding system]; encoding system $old; list $r $now [encoding system]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} iso8859-1 utf-8"
+}
+
+rule EncSystemRejectsUnknown {
+    -- system validates the name like any other conversion entry point.
+    when: Evaluates("catch {encoding system bogus} m; list $m $::errorCode")
+    ensures: completion.code = ok
+    ensures: completion.value = "{unknown encoding \"bogus\"} {TCL LOOKUP ENCODING bogus}"
+}
+
+rule EncSystemArity {
+    when: Evaluates("catch {encoding system a b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"encoding system ?encoding?\""
+}
+
+rule EncUserTakesNoArgument {
+    -- user is a zero-argument query; the oracle's message has a space
+    -- before the closing quote ("encoding user ").
+    when: Evaluates("catch {encoding user x} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"encoding user \""
+}
+
+-- ── names / dirs ─────────────────────────────────────────────────
+
+rule EncNamesHasStableCore {
+    -- The core names are present; 9.1 removed binary and identity.
+    -- The total count (95) is pinned in io.allium, not repeated here.
+    when: Evaluates("list [expr {[lsearch -exact [encoding names] utf-8] >= 0}] [expr {[lsearch -exact [encoding names] iso8859-1] >= 0}] [expr {[lsearch -exact [encoding names] unicode] >= 0}] [expr {[lsearch -exact [encoding names] ucs-2] >= 0}] [lsearch -exact [encoding names] binary] [lsearch -exact [encoding names] identity]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 1 -1 -1"
+}
+
+rule EncNameLookupIsCaseSensitive {
+    -- Encoding names match exactly; UTF-8 and the 8.6 alias utf8 fail.
+    when: Evaluates("list [catch {encoding convertto UTF-8 a} m1] $m1 [catch {encoding convertto utf8 a} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {unknown encoding \"UTF-8\"} 1 {unknown encoding \"utf8\"}"
+}
+
+rule EncDirsShape {
+    -- A fresh interpreter searches the zipfs-mounted encoding directory.
+    when: Evaluates("list [llength [encoding dirs]] [string match {//zipfs:*} [lindex [encoding dirs] 0]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+}
+
+rule EncDirsSetRoundTrip {
+    -- dirs with a list replaces the search path, returns it, and can be
+    -- restored.
+    when: Evaluates("set old [encoding dirs]; set r [encoding dirs /tmp]; set d [encoding dirs]; encoding dirs $old; list $r $d [expr {[encoding dirs] eq $old}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "/tmp /tmp 1"
+}
+
+rule EncDirsRejectsInvalidList {
+    -- A malformed directory list is rejected before use.
+    when: Evaluates("catch {encoding dirs [format %c 123]} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "expected directory list but got \"{\""
+}
+
+rule EncDirsControlsFileBackedEncodings {
+    -- .enc files are loaded from dirs: with the path emptied, ascii
+    -- disappears while built-in iso8859-1 still converts; restore after.
+    when: Evaluates("set old [encoding dirs]; encoding dirs {}; set c [catch {encoding convertto ascii a} e]; set i [binary encode hex [encoding convertfrom iso8859-1 \"\xE9\"]]; encoding dirs $old; list $c $e $i")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {unknown encoding \"ascii\"} e9"
+}
+
+rule EncDirsArity {
+    when: Evaluates("catch {encoding dirs a b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"encoding dirs ?dirList?\""
+}
+
+-- ── subcommand resolution / options / arity ─────────────────────
+
+rule EncSubcommandUniquePrefix {
+    -- Subcommands accept unique prefixes: n resolves to names.
+    when: Evaluates("expr {[lsearch -exact [encoding n] ascii] >= 0}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}
+
+rule EncSubcommandAmbiguous {
+    -- conv matches both convertfrom and convertto, so it is ambiguous.
+    when: Evaluates("catch {encoding conv a b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown or ambiguous subcommand \"conv\": must be convertfrom, convertto, dirs, names, profiles, system, or user"
+}
+
+rule EncConvertToArity {
+    when: Evaluates("catch {encoding convertto} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"encoding convertto ?-profile profile? ?-failindex var? encoding data\" or \"encoding convertto data\""
+}
+
+rule EncConvertFromArity {
+    when: Evaluates("catch {encoding convertfrom} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"encoding convertfrom ?-profile profile? ?-failindex var? encoding data\" or \"encoding convertfrom data\""
+}
+
+rule EncOptionParsingWhenThreeArgs {
+    -- With more than two operands the first is parsed as an option, so a
+    -- stray encoding name becomes a bad option.
+    when: Evaluates("catch {encoding convertto utf-8 a b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"utf-8\": must be -profile or -failindex"
+}
+
+rule EncBadOption {
+    when: Evaluates("catch {encoding convertto -x utf-8 a} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"-x\": must be -profile or -failindex"
+}
+
+rule EncTrailingFailindexIsData {
+    -- A lone -failindex is the two-argument data form, not an option.
+    when: Evaluates("encoding convertto -failindex")
+    ensures: completion.code = ok
+    ensures: completion.value = "-failindex"
+}
+
+rule EncUnknownEncodingErrorCode {
+    -- Unknown names raise TCL LOOKUP ENCODING <name>.
+    when: Evaluates("catch {encoding convertto bogus a} m; list $m $::errorCode")
+    ensures: completion.code = ok
+    ensures: completion.value = "{unknown encoding \"bogus\"} {TCL LOOKUP ENCODING bogus}"
+}
+
+rule EncEncodeFailureErrorCode {
+    -- Conversion failures carry TCL ENCODING ILLEGALSEQUENCE and the
+    -- source character index.
+    when: Evaluates("catch {encoding convertto ascii \"h\xE9\"} m; list $m $::errorCode")
+    ensures: completion.code = ok
+    ensures: completion.value = "{unexpected character at index 1: 'U+0000E9'} {TCL ENCODING ILLEGALSEQUENCE 1}"
+}
+
+-- ── unicode normalization ensemble ───────────────────────────────
+
+rule UniNfdDecomposes {
+    -- NFD splits U+00E9 into 'e' plus U+0301, giving length 2.
+    when: Evaluates("list [string length [unicode tonfd \"é\"]] [scan [unicode tonfd \"é\"] %c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "2 101"
+}
+
+rule UniNfkcCompatibilityLigature {
+    -- The fi ligature folds to two ASCII chars under compatibility (K).
+    when: Evaluates("list [expr {[unicode tonfkc [format %c 0xFB01]] eq \"fi\"}] [string length [unicode tonfkc [format %c 0xFB01]]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 2"
+}
+
+rule UniNfkdCompatibilityLigature {
+    when: Evaluates("expr {[unicode tonfkd [format %c 0xFB01]] eq \"fi\"}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}
+
+rule UniNfkdFractionExpands {
+    -- VULGAR FRACTION ONE HALF becomes the three chars 1, U+2044, 2.
+    when: Evaluates("list [string length [unicode tonfkd [format %c 0xBD]]] [scan [unicode tonfkd [format %c 0xBD]] %c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 49"
+}
+
+rule UniNfkcCircledDigit {
+    when: Evaluates("unicode tonfkc [format %c 0x2460]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}
+
+rule UniNfcNfdRoundTrip {
+    -- NFD is canonical: recomposing its output returns the original char.
+    when: Evaluates("expr {[unicode tonfc [unicode tonfd [format %c 0x1E09]]] eq [format %c 0x1E09]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}
+
+rule UniAngstromNormalizes {
+    -- ANGSTROM SIGN has the canonical decomposition U+00C5.
+    when: Evaluates("scan [unicode tonfc [format %c 0x212B]] %c")
+    ensures: completion.code = ok
+    ensures: completion.value = "197"
+}
+
+rule UniHangulComposes {
+    -- Conjoining jamo L+V compose to the precomposed syllable U+AC00.
+    when: Evaluates("list [string length [unicode tonfc \"[format %c 0x1100][format %c 0x1161]\"]] [scan [unicode tonfc \"[format %c 0x1100][format %c 0x1161]\"] %c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 44032"
+}
+
+rule UniCombiningMarkReorder {
+    -- NFC applies canonical ordering: a + acute + cedilla composes a with
+    -- acute (U+00E1) and leaves cedilla (U+0327) second.
+    when: Evaluates("list [scan [unicode tonfc \"a[format %c 0x301][format %c 0x327]\"] %c] [scan [string range [unicode tonfc \"a[format %c 0x301][format %c 0x327]\"] 1 1] %c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "225 807"
+}
+
+rule UniStrictRejectsSurrogate {
+    -- The default strict profile rejects an unpaired surrogate.
+    when: Evaluates("catch {unicode tonfc [format %c 0xD800]} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unexpected character at index 0: 'U+00D800'"
+}
+
+rule UniReplaceSubstitutesSurrogate {
+    -- replace substitutes U+FFFD instead of failing.
+    when: Evaluates("scan [unicode tonfc -profile replace [format %c 0xD800]] %c")
+    ensures: completion.code = ok
+    ensures: completion.value = "65533"
+}
+
+rule UniProfileTcl8Rejected {
+    -- Normalization accepts only strict and replace, not tcl8.
+    when: Evaluates("catch {unicode tonfc -profile tcl8 a} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "Invalid value \"tcl8\" supplied for option \"-profile\". Must be \"strict\" or \"replace\"."
+}
+
+rule UniUnknownSubcommand {
+    when: Evaluates("catch {unicode foo a} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown or ambiguous subcommand \"foo\": must be tonfc, tonfd, tonfkc, or tonfkd"
+}
+
+rule UniAmbiguousSubcommand {
+    -- tonf prefixes all four normalization names.
+    when: Evaluates("catch {unicode tonf a} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown or ambiguous subcommand \"tonf\": must be tonfc, tonfd, tonfkc, or tonfkd"
+}
+
+rule UniArity {
+    when: Evaluates("catch {unicode tonfc} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"unicode tonfc ?-profile PROFILE? STRING\""
+}
+
+rule UniNonOptionDashString {
+    -- Only -profile is an option; any other dash word is the input string.
+    when: Evaluates("unicode tonfc -x")
+    ensures: completion.code = ok
+    ensures: completion.value = "-x"
+}
+
+rule UniProfileOptionAbbreviates {
+    -- -prof is a unique prefix of -profile.
+    when: Evaluates("expr {[unicode tonfc -prof replace \"e[format %c 0x301]\"] eq \"é\"}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}

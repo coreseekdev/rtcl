@@ -195,13 +195,28 @@ impl Interp {
             // (oo.rs builds both from one `memoised_proc_def`), so
             // `degrade_frame_link_at` may trust the index with only a
             // debug_assert on the name.  Changing what this gate accepts
-            // changes that invariant.
-            let slot_mode = match &def.compiled {
+            // changes that invariant.  (D3 F3: the recompile preserves the
+            // locals table byte-for-byte — it is params-seeded — so the
+            // prelink slot indices stay valid against a recompiled unit.)
+            //
+            // D3 F3：有效编译单元解析——epoch 失配的缓存体重编译（同一
+            // 源文本 + 当前遮蔽面，epoch 戳对齐当前 tier1_epoch）而不是
+            // 落树。`None` = 无编译体 / fallback / trace·关断在席 /
+            // 重编译拒绝（理论不达）——全部落树 = 旧行为。重编译 memo
+            // 见 [`Interp::stale_recompiles`]（每世代一次，非每调用）。
+            let effective: Option<Rc<rtcl_parser::ByteCode>> = match &def.compiled {
+                Some(code) if !code.fallback && super::vm_exec::bytecode_applicable(self) => {
+                    if code.epoch == self.tier1_epoch {
+                        Some(Rc::clone(code))
+                    } else {
+                        super::vm_exec::recompile_stale_body(self, code, &def.params, &def.body)
+                    }
+                }
+                _ => None,
+            };
+            let slot_mode = match &effective {
                 Some(code)
-                    if !code.fallback
-                        && code.epoch == self.tier1_epoch
-                        && super::vm_exec::bytecode_applicable(self)
-                        && current_statics.is_empty()
+                    if current_statics.is_empty()
                         && !code.locals().is_empty()
                         && code.params_aligned == Some(def.params.len()) =>
                 {
@@ -238,6 +253,10 @@ impl Interp {
                         frame.link_keys.clear();
                     }
                     frame.slot_table = None;
+                    // frame.compiled 只服务 compiled-locals 语义面（info
+                    // locals 名单/排序），与执行引擎无关——保持「有非
+                    // fallback 编译体就在席」的旧口径（trace 下树走查的
+                    // 帧同样要看到 compiled-locals 排序）。
                     frame.compiled = match &def.compiled {
                         Some(code) if !code.fallback => Some(Rc::clone(code)),
                         _ => None,
@@ -483,14 +502,13 @@ impl Interp {
             // op-by-op here — same errors, same frames, no per-call
             // re-parse.  Everything else (non-parsing bodies, trace-
             // observed frames, `RTCL_NO_BYTECODE`, non-whitelisted ops,
-            // a Tier1 command shadowed since compilation) stays on the
-            // tree-walk.
-            let mut result = match &def.compiled {
-                Some(code)
-                    if !code.fallback
-                        && code.epoch == self.tier1_epoch
-                        && super::vm_exec::bytecode_applicable(self) =>
-                {
+            // a recompile the same-text re-parse refused) stays on the
+            // tree-walk.  D3 F3: a Tier1 command shadowed since
+            // compilation no longer pins here — the stale unit was
+            // recompiled at the `effective` resolution above and runs
+            // bytecode with the live binding surface.
+            let mut result = match &effective {
+                Some(code) => {
                     // M2 seam: the process-level JIT hook (if installed)
                     // gets first shot at this body; None keeps the
                     // bytecode executor.  All downstream decoding (ret /
@@ -516,6 +534,9 @@ impl Interp {
                     if def.compiled.is_some() {
                         self.next_eval_lexical = true;
                     }
+                    // 树遍历回落点（诊断写点）：编译体在席但门未过
+                    // （F3 后仅 trace/手动关断/fallback/重编译拒绝）。
+                    crate::interp::dbgtrace::event("tf_proc", "");
                     self.eval(&def.body)
                 }
             };
@@ -1342,13 +1363,21 @@ impl Interp {
 
         // slot-locals 门 + 种子（call_proc 同款——params 对齐 + 无
         // statics；OO prelink 槽的 LOAD-BEARING 不变量同源）。池不变式：
-        // 槽向量已空，无需 clear。
-        let slot_mode = match &def.compiled {
+        // 槽向量已空，无需 clear。D3 F3：有效编译单元解析（epoch 失配
+        // 重编译，见 call_proc 同名注）——JIT 直调入口与 call_proc 同构。
+        let effective: Option<Rc<rtcl_parser::ByteCode>> = match &def.compiled {
+            Some(code) if !code.fallback && super::vm_exec::bytecode_applicable(self) => {
+                if code.epoch == self.tier1_epoch {
+                    Some(Rc::clone(code))
+                } else {
+                    super::vm_exec::recompile_stale_body(self, code, &def.params, &def.body)
+                }
+            }
+            _ => None,
+        };
+        let slot_mode = match &effective {
             Some(code)
-                if !code.fallback
-                    && code.epoch == self.tier1_epoch
-                    && super::vm_exec::bytecode_applicable(self)
-                    && !code.locals().is_empty()
+                if !code.locals().is_empty()
                     && code.params_aligned == Some(def.params.len()) =>
             {
                 let table = Rc::clone(code);
@@ -1465,13 +1494,10 @@ impl Interp {
             }
         }
 
-        // 体执行（Site A 钩子优先；gate 与 call_proc 一致）。
-        let result = match &def.compiled {
-            Some(code)
-                if !code.fallback
-                    && code.epoch == self.tier1_epoch
-                    && super::vm_exec::bytecode_applicable(self) =>
-            {
+        // 体执行（Site A 钩子优先；gate 与 call_proc 一致——D3 F3 同款
+        // effective 解析：epoch 失配已在上面重编译）。
+        let result = match &effective {
+            Some(code) => {
                 match super::vm_exec::proc_body_executor(self, code) {
                     Some(r) => r,
                     None => super::vm_exec::exec_bytecode(self, code),

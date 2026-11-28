@@ -40,6 +40,33 @@ fn parse_cache_max_script() -> usize {
 }
 
 impl Interp {
+    /// eval 单元编译的唯一形状决策（首次编译与 D3 F3 失配重编译、F5
+    /// 按请求编译共用）。顶层 slot 形 = 最外层 eval（深度 1）且顶层无
+    /// foreach/lmap（C1）；M3 遮蔽感知折叠——当前被遮蔽的折叠名分派
+    /// 活绑定（产物与树遍历逐字节同语义，judge/sweep 双门钉）；epoch
+    /// 戳 = 当前 tier1_epoch。F3 前 eval 单元恒 epoch 0：任何一次 Tier1
+    /// 遮蔽 bump 后整个 eval 字节码快路径被消费门永久拒绝（每单元落
+    /// 树）；盖章后新单元与重编译产物即刻过门。
+    fn compile_eval_unit(
+        interp: &Interp,
+        source: &Rc<str>,
+        commands: &[Command],
+    ) -> rtcl_parser::ByteCode {
+        let shadows = interp.shadowed_tier1_folds();
+        let has_foreach = commands.iter().any(|c| {
+            c.words.first().map(|w| {
+                matches!(w, rtcl_parser::Word::Literal(n) if n == "foreach" || n == "lmap")
+            }) == Some(true)
+        });
+        let mut code = if interp.eval_depth == 1 && !has_foreach {
+            Compiler::compile_unit_toplevel_skipping(Rc::clone(source), commands, &shadows)
+        } else {
+            Compiler::compile_unit_skipping(Rc::clone(source), commands, &shadows)
+        };
+        code.epoch = interp.tier1_epoch;
+        code
+    }
+
     pub fn eval(&mut self, script: &str) -> Result<Value> {
         self.eval_depth += 1;
         let r = self.eval_impl(script);
@@ -217,31 +244,15 @@ impl Interp {
                     // with non-whitelisted ops carry `fallback` and are
                     // cached anyway (the check is per call — a Tier1 shadow
                     // bump must keep taking effect on cached code).
-                                        // 顶层 slot 编译（C1）：仅最外层 eval（深度 0）——
-                    // 嵌套体 eval（dict update/with、eval 命令）的变量
-                    // 链接语义依赖非 slot 编译。
-                    // foreach/lmap 排除：内联 foreach 的 bind 写帧槽，
-                    // 顶层无帧背衬（C2 tslots 落地前 defer）。
-                    // 顶层 slot 编译（C1）：仅最外层 eval（深度 0）——
-                    // 嵌套体 eval（dict update/with、eval 命令）的变量
-                    // 链接语义依赖非 slot 编译。foreach/lmap/catch 保持
-                    // 顶层分派语义（compile_unit_toplevel）。
-                    // foreach/lmap 排除：其分派语义面（bind 写帧/体作
-                    // 用域）在顶层 slot 单元未覆盖 → 非 slot 编译（classic
-                    // 或解释器路径，正确性优先）。
-                    let has_foreach = rc.commands.iter().any(|c| {
-                        c.words.first().map(|w| {
-                            matches!(w, rtcl_parser::Word::Literal(n) if n == "foreach" || n == "lmap")
-                        }) == Some(true)
-                    });
-                    let code = if self.eval_depth == 1 && !has_foreach {
-                        Rc::new(Compiler::compile_unit_toplevel(
-                            Rc::clone(&rc.source),
-                            &rc.commands,
-                        ))
-                    } else {
-                        Rc::new(Compiler::compile_unit(Rc::clone(&rc.source), &rc.commands))
-                    };
+                    //
+                    // 顶层 slot 形（C1）：仅最外层 eval（深度 1）——嵌套体
+                    // eval（dict update/with、eval 命令）的变量链接语义依
+                    // 赖非 slot 编译。foreach/lmap/catch 保持顶层分派语义
+                    // （其分派语义面——bind 写帧/体作用域——在顶层 slot 单
+                    // 元未覆盖 → 非 slot 编译，正确性优先）。形状决策与 M3
+                    // 遮蔽面、epoch 戳统一收在 [`Self::compile_eval_unit`]
+                    // （F3 失配重编译 / F5 按请求编译共用同一入口）。
+                    let code = Rc::new(Self::compile_eval_unit(self, &rc.source, &rc.commands));
                     let byte_cost = code.estimated_heap_size();
                     if self.bytecode_cache_bytes + byte_cost
                         > BYTECODE_CACHE_BYTE_BUDGET
@@ -258,25 +269,48 @@ impl Interp {
             }
         };
         // Bytecode fast path — the same gate as proc bodies (Site A).
+        // D3 F3：epoch 失配的缓存单元重编译（同一 parse 单元 + 同一形状
+        // 决策 + 当前遮蔽面，epoch 戳对齐），换入 bytecode_cache 取代失效
+        // 条目——不再落树。重编译是每单元每世代一次（换入后后续 eval 走
+        // 缓存）；fallback / trace / 手动关断照旧落树。
         if script.len() <= parse_cache_max_script {
-            if let Some(code) = self.bytecode_cache.get(script) {
-                if !code.fallback
-                    && code.epoch == self.tier1_epoch
-                    && super::vm_exec::bytecode_applicable(self)
-                {
-                    let code = Rc::clone(code);
-                    // exec_bytecode clears the lexical flag for the unit's
-                    // DynCalls and restores this unit's context itself
-                    // (and re-establishes the proc-context signal per its
-                    // own locals_mode).
-                    let r = super::vm_exec::exec_bytecode(self, &code);
-                    self.lexical_body = saved_lexical;
-                    self.in_locals_unit = saved_inl;
-                    self.in_file_script = saved_file_ctx;
-                    return r;
+            let cached = self.bytecode_cache.get(script).map(Rc::clone);
+            let code = match cached {
+                Some(code) if !code.fallback && super::vm_exec::bytecode_applicable(self) => {
+                    if code.epoch == self.tier1_epoch {
+                        Some(code)
+                    } else {
+                        crate::interp::dbgtrace::event("recompile_eval", "");
+                        let fresh =
+                            Rc::new(Self::compile_eval_unit(self, &unit.source, &unit.commands));
+                        let byte_cost = fresh.estimated_heap_size();
+                        self.bytecode_cache_bytes = self
+                            .bytecode_cache_bytes
+                            .saturating_sub(code.estimated_heap_size())
+                            + byte_cost;
+                        self.const_pool_insert(&fresh);
+                        self.bytecode_cache
+                            .insert(Rc::clone(&unit.source), Rc::clone(&fresh));
+                        Some(fresh)
+                    }
                 }
+                _ => None,
+            };
+            if let Some(code) = code {
+                // exec_bytecode clears the lexical flag for the unit's
+                // DynCalls and restores this unit's context itself
+                // (and re-establishes the proc-context signal per its
+                // own locals_mode).
+                let r = super::vm_exec::exec_bytecode(self, &code);
+                self.lexical_body = saved_lexical;
+                self.in_locals_unit = saved_inl;
+                self.in_file_script = saved_file_ctx;
+                return r;
             }
         }
+        // 树遍历回落点（诊断写点）：走到这里 = 门未过——fallback /
+        // trace / 手动关断，或超 parse-cache 门（F5 前的大单元落树点）。
+        crate::interp::dbgtrace::event("tf_eval", "");
         let r = self.eval_commands(&unit);
         self.lexical_body = saved_lexical;
         self.in_locals_unit = saved_inl;

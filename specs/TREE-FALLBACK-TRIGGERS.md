@@ -21,9 +21,12 @@ parse-cache 单元（eval.rs:252）、循环体 memo（eval.rs:361）、
 `LoadArrayElem`/`MakeList`/`PushFrame`/`ReturnCode`/`StoreArrayElem`/
 `TailCallProc`/`UnsetVar`/`UpVar`/`VarExists`）在 compiler.rs 零发射，
 只服务 `::tcl::unsupported::assemble` 手组码（assemble 产物本就标
-fallback）。**故真实回落面 = F1–F6。**
+fallback）。**故真实回落面 = F2/F3/F4/F5/F6；F1 已收（D2 宽操作
+数，2026-11-26）；F3/F5/F6 已收（D3 第一批，task/d3-fallback1
+2026-11-28——见各节新状态）。驻留面收敛到 F2（exec trace 钉回）
++ F4（诊断模式）。**
 
-## F1. u16 操作数溢出（= C55）
+## F1. u16 操作数溢出（= C55）——已收（D2 第二步，2026-11-26）
 
 - **触发**：任一操作数超 u16——(a) 常量池超 65535 条
   （`bytecode.rs:294` add_const）；(b) 局部表超 65535 名
@@ -71,7 +74,7 @@ fallback）。**故真实回落面 = F1–F6。**
   运行方式（不缓存、不融合超指令）"——补齐 = VM 加一个
   no-cache/no-fusion 模式位，而不是独立执行器；诊断用途保留。
 
-## F5. 大脚本不走 parse-cache（>256KB）
+## F5. 大脚本不走 parse-cache（>256KB→现 1MiB 可配）——已收（D3 第一批，2026-11-28）
 
 - **触发**：`script.len() > PARSE_CACHE_MAX_SCRIPT`（262144，
   eval.rs:151）→ 顶层 eval 的字节码快路径（缓存查取+存入）整段跳过，
@@ -81,7 +84,7 @@ fallback）。**故真实回落面 = F1–F6。**
 - **VM 补齐**：大单元直接编译入口（不经 parse-cache 键，按请求编译
   一次执行），或把缓存键改成内容指纹。与 F1 叠加时上限更低。
 
-## F6. 循环体 memo 未命中
+## F6. 循环体 memo 未命中——已收（容量 4→32，2026-11-28）
 
 - **触发**：`body_memo` 指针驻留是 FIFO 有界（eval.rs:352-361）——
   多层嵌套循环 + 大体把更早的体挤出后，挤出的体落树。

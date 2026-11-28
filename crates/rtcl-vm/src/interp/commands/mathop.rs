@@ -26,7 +26,7 @@ pub fn cmd_mathop(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         "+" | "*" | "&" | "|" | "^" | "**" => fold(interp, op, rest),
         "-" => {
             if rest.is_empty() {
-                return Err(arity(op, "value ?value ...?"));
+                return Err(arity_invoked(&args[0], "value ?value ...?"));
             }
             let mut acc = rest[0].clone();
             if rest.len() == 1 {
@@ -40,7 +40,7 @@ pub fn cmd_mathop(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         "/" => {
             if rest.is_empty() {
-                return Err(arity(op, "value ?value ...?"));
+                return Err(arity_invoked(&args[0], "value ?value ...?"));
             }
             let mut acc = rest[0].clone();
             if rest.len() == 1 {
@@ -56,27 +56,41 @@ pub fn cmd_mathop(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         }
         "%" => {
             if rest.len() != 2 {
-                return Err(arity(op, "integer integer"));
+                return Err(arity_invoked(&args[0], "integer integer"));
             }
             expr_ops::int_mod(&rest[0], &rest[1])
         }
         "<<" | ">>" => {
             if rest.len() != 2 {
-                return Err(arity(op, "integer integer"));
+                return Err(arity_invoked(&args[0], "integer shift"));
             }
             expr_ops::int_shift(&rest[0], &rest[1], op == "<<")
         }
-        "<" | "<=" | ">" | ">=" | "==" | "!=" => chain(rest, |a, b| {
+        "<" | "<=" | ">" | ">=" | "==" => chain(rest, |a, b| {
             let cc = match op {
                 "<" => 0,
                 "<=" => 1,
                 ">" => 2,
                 ">=" => 3,
-                "==" => 4,
-                _ => 5,
+                _ => 4,
             };
             Ok(Value::from_bool(expr_ops::cmp_bool(a, b, cc)))
         }),
+        // 9.1 钉形（tclBasic.c mathOpCmds）：`!=` 与 `ne` 是
+        // TclSingleOpCmd numArgs=2——严格两参，不是排序链；同表的
+        // `< <= > >= == eq lt le gt ge` 才是 TclSortingOpCmd nary
+        // （0 参空真 1）。实测 `::tcl::mathop::!= 1` 与 `ne 1 2 3` 报
+        // wrong # args "value value"。
+        "!=" | "ne" => {
+            if rest.len() != 2 {
+                return Err(arity_invoked(&args[0], "value value"));
+            }
+            if op == "!=" {
+                Ok(Value::from_bool(!expr_ops::cmp_bool(&rest[0], &rest[1], 4)))
+            } else {
+                Ok(expr_ops::op_str_ne(&rest[0], &rest[1]))
+            }
+        }
         // lt/le/gt/ge（9.0 新增，TIP 461）：纯 UNICODE 字符串比较链
         // —— `::tcl::mathop::lt 2 10` 是 0（"2">"10" 的字典序），与
         // 数值比较运算符 `<` 系分界。少于两个实参恒真（9.1 手册）。
@@ -90,29 +104,22 @@ pub fn cmd_mathop(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             };
             Ok(Value::from_bool(ok))
         }),
-        "eq" | "ne" => chain(rest, |a, b| {
-            let r = if op == "eq" {
-                expr_ops::op_str_eq(a, b)
-            } else {
-                expr_ops::op_str_ne(a, b)
-            };
-            Ok(r)
-        }),
+        "eq" => chain(rest, |a, b| Ok(expr_ops::op_str_eq(a, b))),
         "~" => {
             if rest.len() != 1 {
-                return Err(arity(op, "integer"));
+                return Err(arity_invoked(&args[0], "integer"));
             }
             bitwise_not(&rest[0])
         }
         "!" => {
             if rest.len() != 1 {
-                return Err(arity(op, "boolean"));
+                return Err(arity_invoked(&args[0], "boolean"));
             }
             expr_ops::op_not(&rest[0])
         }
         "in" | "ni" => {
             if rest.len() != 2 {
-                return Err(arity(op, "value list"));
+                return Err(arity_invoked(&args[0], "value list"));
             }
             let list = rest[1].as_list().unwrap_or_default();
             let found = list.iter().any(|item| item.as_str() == rest[0].as_str());
@@ -125,10 +132,14 @@ pub fn cmd_mathop(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
 }
 
-fn arity(op: &str, sig: &str) -> Error {
+fn arity_invoked(invoked: &Value, sig: &str) -> Error {
+    // 9.1 钉形：usage 回显调用点的命令字面（tclsh 的 Tcl_WrongNumArgs
+    // 用 objv[0]）——`::tcl::mathop::in` 报 "::tcl::mathop::in value
+    // list"，`tcl::mathop::in` 报 "tcl::mathop::in value list"。
     Error::wrong_args_msg(format!(
-        "wrong # args: should be \"tcl::mathop::{} {}\"",
-        op, sig
+        "wrong # args: should be \"{} {}\"",
+        invoked.as_str(),
+        sig
     ))
 }
 

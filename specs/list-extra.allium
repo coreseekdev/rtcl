@@ -1,0 +1,704 @@
+-- allium: 3
+-- list-extra.allium
+-- Behaviour spec: list-command faces not pinned by list.allium —
+-- lmap/lrepeat/lreverse/lassign, the lset/linsert/lreplace/lrange index
+-- forms, the lsearch and lsort option surfaces, llength/lindex/lappend,
+-- concat/join/split, and residual lfilter/lseq/ledit/lpop/lremove faces.
+-- Oracle: tclsh 9.1.0 (core-9-1-0). All values measured 2026-11-28.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── llength ──────────────────────────────────────────────────────
+-- Probes: 2026-11-28 tclsh9.1.
+
+rule L2LlengthCountsElements {
+    -- llength counts top-level elements; braces group and whitespace
+    -- separates, and leading/trailing whitespace adds no element.
+    when: Evaluates("list [llength {a b c}] [llength {}] [llength { a  b }] [llength {{a b} c}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 0 2 2"
+}
+
+rule L2LlengthWrongArgs {
+    when: Evaluates("catch {llength} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"llength list\""
+}
+
+-- ── lindex ───────────────────────────────────────────────────────
+-- Probes: 2026-11-28 tclsh9.1.
+
+rule L2LindexEndForms {
+    -- end is the last element, end-N counts back, end+N is out of range;
+    -- an end index composes with a following nested index.
+    when: Evaluates("list [lindex {a b c} end] [lindex {a b c} end-1] [lindex {a b c} end+3] [lindex {{a b} {c d}} end 0]")
+    ensures: completion.code = ok
+    ensures: completion.value = "c b {} c"
+}
+
+rule L2LindexNegativeIsEmpty {
+    -- Negative indices and paths through short sublists yield the empty
+    -- string, not an error (contrast lset, which rejects them).
+    when: Evaluates("list [lindex {a b c} -1] [lindex {a b c} -5] [lindex {} 0] [lindex {{a b}} 0 5]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {} {} {}"
+}
+
+rule L2LindexBadIndexMessage {
+    when: Evaluates("catch {lindex {a b} foo} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad index \"foo\": must be integer?[+-]integer? or end?[+-]integer?"
+}
+
+rule L2LindexWrongArgs {
+    when: Evaluates("catch {lindex} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"lindex list ?index ...?\""
+}
+
+-- ── lrange ───────────────────────────────────────────────────────
+-- Probes: 2026-11-28 tclsh9.1.
+
+rule L2LrangeClampsIndices {
+    -- first below 0 clamps to 0, last past the end clamps to end, and a
+    -- first past the end or after last yields the empty list.
+    when: Evaluates("list [lrange {a b c} -2 1] [lrange {a b c} 0 99] [lrange {a b c} 99 100] [lrange {a b c} 2 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a b} {a b c} {} {}"
+}
+
+rule L2LrangeEndArithmetic {
+    when: Evaluates("list [lrange {a b c} 1 end-1] [lrange {a b c} 1 end+5] [lrange {a b c} end-5 1] [lrange {a b c} end end]")
+    ensures: completion.code = ok
+    ensures: completion.value = "b {b c} {a b} c"
+}
+
+rule L2LrangeEmptyAndOutOfRange {
+    -- An empty list always yields the empty list; negative ranges and
+    -- end offsets that fall before index 0 select nothing.
+    when: Evaluates("list [lrange {} 0 end] [lrange {a b c} -5 -1] [lrange {a b c} 0 end-5]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {} {}"
+}
+
+rule L2LrangeBadIndexMessage {
+    when: Evaluates("catch {lrange {a b} foo 1} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad index \"foo\": must be integer?[+-]integer? or end?[+-]integer?"
+}
+
+-- ── linsert ──────────────────────────────────────────────────────
+-- Probes: 2026-11-28 tclsh9.1.
+
+rule L2LinsertNegativeClampsToHead {
+    -- Any index below 0 inserts at the head; an index 0 into an empty list
+    -- yields just the new elements.
+    when: Evaluates("list [linsert {a b} -1 X] [linsert {a b} -5 X] [linsert {} 0 X]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{X a b} {X a b} X"
+}
+
+rule L2LinsertEndForms {
+    -- end inserts before the last element; end-N counts back; end+1 and
+    -- beyond append after the last element.
+    when: Evaluates("list [linsert {a b c} end X] [linsert {a b c} end-1 X] [linsert {a b c} end+1 X] [linsert {a b c} end-5 X]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a b c X} {a b X c} {a b c X} {X a b c}"
+}
+
+rule L2LinsertMultipleElements {
+    -- All trailing arguments are inserted in order as separate elements;
+    -- with no elements linsert returns the list unchanged.
+    when: Evaluates("list [linsert {a b} 1 X Y] [linsert {a b c} 0 X Y] [linsert {a b c} -1] [linsert {} 5 X]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a X Y b} {X Y a b c} {a b c} X"
+}
+
+rule L2LinsertBadIndexAndWrongArgs {
+    when: Evaluates("list [catch {linsert {a b} foo X} m] $m [catch {linsert} n] $n")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {bad index \"foo\": must be integer?[+-]integer? or end?[+-]integer?} 1 {wrong # args: should be \"linsert list index ?element ...?\"}"
+}
+
+-- ── lreplace ─────────────────────────────────────────────────────
+-- Probes: 2026-11-28 tclsh9.1.
+
+rule L2LreplaceEmptyReplacement {
+    -- Supplying no replacement elements deletes the range; a range wholly
+    -- past the end deletes nothing and the list is returned unchanged.
+    when: Evaluates("list [lreplace {a b c} 1 1] [lreplace {a b c} 0 end] [lreplace {a b c} -1 2] [lreplace {a b c} 5 6]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a c} {} {} {a b c}"
+}
+
+rule L2LreplaceClampsRange {
+    -- first below 0 clamps to 0, last past the end clamps to end; when
+    -- last is before first nothing is deleted and the elements are
+    -- inserted at first.
+    when: Evaluates("list [lreplace {a b c} -5 -1 X] [lreplace {a b c} 5 6 X] [lreplace {a b c} 0 -1 X] [lreplace {a b c} 2 -1 X]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{X a b c} {a b c X} {X a b c} {a b X c}"
+}
+
+rule L2LreplaceEndForms {
+    when: Evaluates("list [lreplace {a b c} end end X] [lreplace {a b c} end-1 end] [lreplace {a b c} 1 0 X] [lreplace {} 0 0 X]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a b X} a {a X b c} X"
+}
+
+rule L2LreplaceBadIndexAndWrongArgs {
+    when: Evaluates("list [catch {lreplace {a b} foo 1 X} m] $m [catch {lreplace} n] $n")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {bad index \"foo\": must be integer?[+-]integer? or end?[+-]integer?} 1 {wrong # args: should be \"lreplace list first last ?element ...?\"}"
+}
+
+-- ── lset ─────────────────────────────────────────────────────────
+-- Probes: 2026-11-28 tclsh9.1.
+
+rule L2LsetNestedDescends {
+    -- Multiple indices descend into nested sublists; each index may use
+    -- the end form.
+    when: Evaluates("set m {{a b} {c d}}; lset m 0 end Y; set l {{a b} {c d}}; lset l 1 0 X; list $l $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "{{a b} {X d}} {{a Y} {c d}}"
+}
+
+rule L2LsetEndForms {
+    -- end, end-N and end+1 all work; end+1 appends.
+    when: Evaluates("set l {a b c}; lset l end X; lset l end-1 Y; lset l end+1 Z; set l")
+    ensures: completion.code = ok
+    ensures: completion.value = "a Y X Z"
+}
+
+rule L2LsetEmptyListCreatesElement {
+    -- An empty index path replaces the whole value; an empty list grows
+    -- at index 0; a nested path creates the element inside a one-element
+    -- list.
+    when: Evaluates("set l {}; lset l 0 X; set a $l; lset l {} Y; set b $l; set m {{}}; lset m 0 0 Z; list $a $b $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "X Y Z"
+}
+
+rule L2LsetNegativeAndDeepOutOfRange {
+    -- Unlike lindex, lset rejects negative indices and a nested path that
+    -- skips past the existing elements.
+    when: Evaluates("set l {a b c}; list [catch {lset l -1 X} m] $m [set n {{}}; catch {lset n 0 2 X} o] $o")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {index \"-1\" out of range} 1 {index \"2\" out of range}"
+}
+
+rule L2LsetOneIndexIsElement {
+    -- A single index replaces that element (the last argument is the
+    -- value, never another index).
+    when: Evaluates("set l {a b c}; list [lset l 1 2] $l")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a 2 c} {a 2 c}"
+}
+
+rule L2LsetBadIndexAndWrongArgs {
+    when: Evaluates("set l {a b}; list [catch {lset l foo X} m] $m [catch {lset l} n] $n")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {bad index \"foo\": must be integer?[+-]integer? or end?[+-]integer?} 1 {wrong # args: should be \"lset listVar ?index? ?index ...? value\"}"
+}
+
+-- ── lmap ─────────────────────────────────────────────────────────
+-- Probes: 2026-11-28 tclsh9.1.
+
+rule L2LmapCollectsBodyResults {
+    when: Evaluates("lmap i {1 2 3} {expr {$i*2}}")
+    ensures: completion.code = ok
+    ensures: completion.value = "2 4 6"
+}
+
+rule L2LmapMultiVarLists {
+    -- Braces group several variables per iteration; several varList/list
+    -- pairs advance in parallel; a short final group binds the missing
+    -- variables to the empty string.
+    when: Evaluates("list [lmap {a b} {1 2 3 4} {list $a $b}] [lmap a {1 2} b {3 4} {list $a $b}] [lmap {a b} {1 2 3} {list $a $b}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{{1 2} {3 4}} {{1 3} {2 4}} {{1 2} {3 {}}}"
+}
+
+rule L2LmapContinueSkipsIteration {
+    -- continue discards the body result for that iteration; the collected
+    -- list simply has fewer elements.
+    when: Evaluates("list [lmap i {1 2 3} {if {$i==2} continue; set i}] [lmap i {1 2 3 4} {if {$i % 2} {set i} else continue}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{1 3} {1 3}"
+}
+
+rule L2LmapBreakStopsWithPrefix {
+    -- break stops the loop and returns the elements collected so far.
+    when: Evaluates("list [lmap i {1 2 3 4} {if {$i==3} break; set i}] [lmap i {1 2 3} {if {$i==2} break; set i}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{1 2} 1"
+}
+
+rule L2LmapEmptyInputAndEmptyBodies {
+    -- Empty input yields empty; an empty body result is still collected
+    -- as one empty element per iteration.
+    when: Evaluates("list [lmap i {} {set i}] [lmap i {1 2} {}] [llength [lmap i {1 2} {set x {}}]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {{} {}} 2"
+}
+
+rule L2LmapWrongArgs {
+    when: Evaluates("catch {lmap i {1}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"lmap varList list ?varList list ...? command\""
+}
+
+-- ── lrepeat ──────────────────────────────────────────────────────
+-- Probes: 2026-11-28 tclsh9.1.
+
+rule L2LrepeatRepeatsValues {
+    -- With several values the whole value list repeats; with none the
+    -- result is empty; empty values are kept as elements.
+    when: Evaluates("list [lrepeat 3 a] [lrepeat 2 a b] [lrepeat 1] [lrepeat 2 {}] [lrepeat 2 a {}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a a a} {a b a b} {} {{} {}} {a {} a {}}"
+}
+
+rule L2LrepeatZeroIsEmpty {
+    when: Evaluates("list [lrepeat 0 a] [llength [lrepeat 0 a b]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 0"
+}
+
+rule L2LrepeatNegativeCountErrs {
+    -- A negative count is an error, not an empty list.
+    when: Evaluates("catch {lrepeat -1 a} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad count \"-1\": must be integer >= 0"
+}
+
+rule L2LrepeatNonIntegerAndWrongArgs {
+    when: Evaluates("list [catch {lrepeat x a} m] $m [catch {lrepeat} n] $n")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {expected integer but got \"x\"} 1 {wrong # args: should be \"lrepeat count ?value ...?\"}"
+}
+
+-- ── lreverse ─────────────────────────────────────────────────────
+-- Probes: 2026-11-28 tclsh9.1.
+
+rule L2LreverseReversesElements {
+    -- Reversal moves whole elements; nested lists are not reversed
+    -- internally.
+    when: Evaluates("list [lreverse {a b c}] [lreverse {a {b c}}] [lreverse {}] [lreverse {a b c d}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{c b a} {{b c} a} {} {d c b a}"
+}
+
+rule L2LreverseWrongArgs {
+    when: Evaluates("catch {lreverse} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"lreverse list\""
+}
+
+-- ── lassign ──────────────────────────────────────────────────────
+-- Probes: 2026-11-28 tclsh9.1.
+
+rule L2LassignReturnsRemainder {
+    -- Surplus elements are returned as the result.
+    when: Evaluates("set r [lassign {a b c} x y]; list $r $x $y")
+    ensures: completion.code = ok
+    ensures: completion.value = "c a b"
+}
+
+rule L2LassignExactAndShort {
+    -- An exact fit returns empty; missing elements assign the empty
+    -- string to the remaining variables.
+    when: Evaluates("set r1 [lassign {a b} x y]; set r2 [lassign {a} p q]; list $r1 $r2 $p $q")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {} a {}"
+}
+
+rule L2LassignNoVarsReturnsList {
+    -- With no variable names the whole list is the remainder.
+    when: Evaluates("lassign {a b c}")
+    ensures: completion.code = ok
+    ensures: completion.value = "a b c"
+}
+
+rule L2LassignWrongArgs {
+    when: Evaluates("catch {lassign} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"lassign list ?varName ...?\""
+}
+
+-- ── lsearch: match modes ─────────────────────────────────────────
+-- Probes: 2026-11-28 tclsh9.1.
+
+rule L2LsearchExactAndNocase {
+    -- -exact compares strings; a miss is -1; -nocase folds both modes.
+    when: Evaluates("list [lsearch -exact {a b} b] [lsearch -exact {a b} z] [lsearch -nocase -exact {Abc} abc]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 -1 0"
+}
+
+rule L2LsearchGlobAndRegexp {
+    -- -glob uses string match rules; -regexp uses ARE syntax; -nocase
+    -- composes with both.
+    when: Evaluates("list [lsearch -glob {abc def} {a*}] [lsearch -glob {abc def} {d*}] [lsearch -regexp {abc def} {^d}] [lsearch -regexp -nocase {ABC} {abc}] [lsearch -glob -nocase {abc} {A*}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 1 1 0 0"
+}
+
+rule L2LsearchAllAndInline {
+    -- -all returns every matching index in ascending order; -inline
+    -- returns values; -all -inline returns all matching values.
+    when: Evaluates("list [lsearch -all {a b a} a] [lsearch -inline {a b} b] [lsearch -all -inline {a b a} a]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{0 2} b {a a}"
+}
+
+rule L2LsearchNot {
+    -- -not inverts the match; with -all it returns every non-matching
+    -- index, and with -inline the non-matching values.
+    when: Evaluates("list [lsearch -not -exact {a b} a] [lsearch -all -not -exact {a b a} a] [lsearch -all -inline -not {a b a} a]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 b"
+}
+
+rule L2LsearchStart {
+    -- -start accepts index arithmetic and end; a start past the end is a
+    -- miss (-1).
+    when: Evaluates("list [lsearch -start 1 {a b a} a] [lsearch -all -start 1 {a b a} a] [lsearch -start 99 {a b} a] [lsearch -start end {a b} b]")
+    ensures: completion.code = ok
+    ensures: completion.value = "2 2 -1 1"
+}
+
+rule L2LsearchIndexAndSubindices {
+    -- -index selects a nested value to compare; -subindices returns the
+    -- full path (or a list of paths with -all); -index accepts end.
+    when: Evaluates("list [lsearch -index 1 {{a 1} {b 2}} 2] [lsearch -index 1 -subindices {{a 1} {b 2}} 2] [lsearch -all -subindices -index 1 {{a 1} {b 1} {c 2}} 1] [lsearch -index end {{a 1} {b 2}} 2]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {1 1} {{0 1} {1 1}} 1"
+}
+
+rule L2LsearchIndexMissing {
+    -- A nested -index path that runs off a sublist is an error naming the
+    -- element and the sublist.
+    when: Evaluates("catch {lsearch -index 5 {{a 1}} 1} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "element 5 missing from sublist \"a 1\""
+}
+
+-- ── lsearch: sorted and numeric modes ───────────────────────────
+
+rule L2LsearchSortedAndBisect {
+    -- -sorted binary-searches an ordered list; -all with -sorted still
+    -- scans; -bisect returns the last position at or before the pattern
+    -- and implies sorted mode.
+    when: Evaluates("list [lsearch -sorted {a b c} b] [lsearch -sorted -all {a c e} d] [lsearch -bisect -sorted {a c e} d] [lsearch -bisect {a c e} c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {} 1 1"
+}
+
+rule L2LsearchBisectInlineAndIncompatible {
+    -- -bisect composes with -inline (returning the element at the bisect
+    -- position); it is incompatible with -all and -not.
+    when: Evaluates("list [lsearch -bisect -inline -sorted {a c e} d] [catch {lsearch -bisect -all -sorted {a c e} d} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "c 1 {-bisect is not compatible with -all or -not}"
+}
+
+rule L2LsearchIntegerRealNumeric {
+    -- With -exact or -sorted, -integer and -real compare numerically.
+    when: Evaluates("list [lsearch -sorted -integer {1 2 10} 2] [lsearch -integer -exact {2 3} 3] [lsearch -real -exact {1.00} 1.0]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 0"
+}
+
+rule L2LsearchDataTypeNeedsExactOrSorted {
+    -- Without -exact or -sorted, -integer/-real do not replace the
+    -- default glob matcher: 02 still matches only as the string "02", and
+    -- real 1.0 does not equal "1".
+    when: Evaluates("list [lsearch -integer {02 2} 2] [lsearch -integer {2.0} 2] [lsearch -real {1.0} 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 -1 -1"
+}
+
+rule L2LsearchDataTypeAndDirection {
+    -- The data-type options select the comparator on the sorted path
+    -- (-dictionary keeps numeric runs in order); -ascii is the string
+    -- mode; -increasing/-decreasing choose the binary-search direction.
+    when: Evaluates("list [lsearch -dictionary {a10 a2} a2] [lsearch -sorted -dictionary {a1 a2 a10} a2] [lsearch -ascii {A a} A] [lsearch -sorted -decreasing {c b a} b] [lsearch -sorted -increasing {a b c} b]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 0 1 1"
+}
+
+rule L2LsearchStrideErrors {
+    -- -stride must be at least 1, the list length must be a multiple of
+    -- it, and a leading -index used with -stride must fall inside the
+    -- group.
+    when: Evaluates("list [catch {lsearch -stride 0 {a b} a} m] $m [catch {lsearch -stride 2 {a b c} a} n] $n [catch {lsearch -stride 2 -index 5 {a 1 b 2} 1} o] $o")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {stride length must be at least 1} 1 {list size must be a multiple of the stride length} 1 {when used with \"-stride\", the leading \"-index\" value must be within the group}"
+}
+
+rule L2LsearchSubindicesRequiresIndex {
+    when: Evaluates("catch {lsearch -subindices {a b} b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "-subindices cannot be used without -index option"
+}
+
+rule L2LsearchBadOptionMenu {
+    when: Evaluates("catch {lsearch -foo {a} a} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"-foo\": must be -all, -ascii, -bisect, -decreasing, -dictionary, -exact, -glob, -increasing, -index, -inline, -integer, -nocase, -not, -real, -regexp, -sorted, -start, -stride, or -subindices"
+}
+
+-- ── lsort: comparison modes ──────────────────────────────────────
+-- Probes: 2026-11-28 tclsh9.1.
+
+rule L2LsortAsciiAndNocase {
+    -- -ascii is the default codepoint order; -nocase folds case (stable
+    -- among equals) and composes with -decreasing.
+    when: Evaluates("list [lsort -ascii {b A a}] [lsort -nocase {b A a}] [lsort -nocase -decreasing {a B c}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{A a b} {A a b} {c B a}"
+}
+
+rule L2LsortIntegerAndReal {
+    -- Numeric modes order by value, not by string, and compose with
+    -- -decreasing.
+    when: Evaluates("list [lsort -integer {10 2 1}] [lsort -real {10 2 1.5}] [lsort -integer -decreasing {10 2 1}] [lsort -real -decreasing {1.5 10 2}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{1 2 10} {1.5 2 10} {10 2 1} {10 2 1.5}"
+}
+
+rule L2LsortCommandComparator {
+    -- -command calls a two-argument comparator; its integer result
+    -- decides the order.
+    when: Evaluates("list [lsort -command {apply {{a b} {string compare $b $a}}} {a c b}] [lsort -command {apply {{a b} {expr {[string length $a] - [string length $b]}}}} {ccc a bb}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{c b a} {a bb ccc}"
+}
+
+rule L2LsortCommandErrors {
+    -- A non-integer comparator result is an error; an error in the
+    -- comparator propagates unchanged.
+    when: Evaluates("list [catch {lsort -command {apply {{a b} {return x}}} {a b}} m] $m [catch {lsort -command {apply {{a b} {error boom}}} {a b}} n] $n")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {-compare command returned non-integer result} 1 boom"
+}
+
+rule L2LsortIndexKey {
+    -- -index sorts by a nested key and composes with -decreasing.
+    when: Evaluates("list [lsort -index 1 {{a 3} {b 1} {c 2}}] [lsort -index 1 -decreasing {{a 1} {b 2}}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{{b 1} {c 2} {a 3}} {{b 2} {a 1}}"
+}
+
+rule L2LsortStrideGroups {
+    -- -stride sorts fixed-size records as units and returns them
+    -- flattened; -index chooses the in-record key.
+    when: Evaluates("list [lsort -stride 2 -index 0 {b 2 a 1}] [lsort -stride 3 {c 3 z a 1 x b 2 y}] [lsort -stride 2 -index 1 -integer {a 3 b 1}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a 1 b 2} {a 1 x b 2 y c 3 z} {b 1 a 3}"
+}
+
+rule L2LsortIncreasingDecreasing {
+    when: Evaluates("list [lsort -increasing {c a b}] [lsort -decreasing {a c b}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a b c} {c b a}"
+}
+
+rule L2LsortIndicesAndStableKeys {
+    -- -indices returns original indices in sorted order (with -stride, the
+    -- flattened indices of each record in sorted record order); equal keys
+    -- keep their input order (stable sort).
+    when: Evaluates("list [lsort -indices {c a b}] [lsort -indices -index 1 {{a 3} {b 1} {c 2}}] [lsort -index 1 {{x 1} {y 1} {z 0}}] [lsort -indices -stride 2 -index 1 {a 3 b 1}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{1 2 0} {1 2 0} {{z 0} {x 1} {y 1}} {2 3 0 1}"
+}
+
+rule L2LsortUniqueIndexAndIndices {
+    -- -unique keeps the last of each equal-key group, including under
+    -- -index and -stride; with -indices it reports the kept elements'
+    -- original indices.
+    when: Evaluates("list [lsort -unique -index 1 {{a 1} {b 1} {c 2}}] [lsort -unique -indices {b a a}] [lsort -unique -stride 2 -index 0 {a 1 a 2 b 3}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{{b 1} {c 2}} {2 0} {a 2 b 3}"
+}
+
+rule L2LsortStrideErrors {
+    -- -stride must be at least 2 for lsort; the list length must be a
+    -- multiple; a leading -index must fall inside the group.
+    when: Evaluates("list [catch {lsort -stride 1 {a b}} m] $m [catch {lsort -stride 2 {a b c}} n] $n [catch {lsort -stride 2 -index 5 {a 1 b 2}} o] $o")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {stride length must be at least 2} 1 {list size must be a multiple of the stride length} 1 {when used with \"-stride\", the leading \"-index\" value must be within the group}"
+}
+
+rule L2LsortBadIndexAndMissing {
+    -- A malformed -index is a bad-index error; a well-formed index that
+    -- runs off a sublist is an element-missing error.
+    when: Evaluates("list [catch {lsort -index foo {{a 1}}} m] $m [catch {lsort -index 5 {{a 1}}} n] $n")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {bad index \"foo\": must be integer?[+-]integer? or end?[+-]integer?} 1 {element 5 missing from sublist \"a 1\"}"
+}
+
+rule L2LsortLastModeOptionWins {
+    -- When several comparison modes are given, the last one wins (no
+    -- option-conflict error): -command overrides an earlier -integer, and
+    -- a later -integer overrides -command and rejects a real element.
+    when: Evaluates("list [lsort -integer -command {apply {{a b} {string compare $b $a}}} {1 2 3}] [lsort -command {apply {{a b} {string compare $b $a}}} -integer {1 2 3}] [catch {lsort -real -integer {1.5 2}} p] $p")
+    ensures: completion.code = ok
+    ensures: completion.value = "{3 2 1} {1 2 3} 1 {expected integer but got \"1.5\"}"
+}
+
+rule L2LsortRealValidation {
+    when: Evaluates("catch {lsort -real {x 1.5}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "expected floating-point number but got \"x\""
+}
+
+rule L2LsortBadOptionMenu {
+    when: Evaluates("catch {lsort -foo {a}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"-foo\": must be -ascii, -command, -decreasing, -dictionary, -increasing, -index, -indices, -integer, -nocase, -real, -stride, or -unique"
+}
+
+-- ── lappend ──────────────────────────────────────────────────────
+-- Probes: 2026-11-28 tclsh9.1.
+
+rule L2LappendMultipleValues {
+    when: Evaluates("set l {a}; lappend l b c; set l")
+    ensures: completion.code = ok
+    ensures: completion.value = "a b c"
+}
+
+rule L2LappendEachValueIsOneElement {
+    -- Braced multi-word values remain a single element; an empty value is
+    -- appended as an empty element.
+    when: Evaluates("set l {}; lappend l {a b} c {}; set l")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a b} c {}"
+}
+
+rule L2LappendNoValuesReturnsCurrent {
+    -- With no values lappend only returns the current value (creating an
+    -- empty variable if absent).
+    when: Evaluates("set l {a b}; list [lappend l] $l")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a b} {a b}"
+}
+
+rule L2LappendWrongArgs {
+    when: Evaluates("catch {lappend} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"lappend varName ?value ...?\""
+}
+
+-- ── concat / join / split ────────────────────────────────────────
+-- Probes: 2026-11-28 tclsh9.1.
+
+rule L2ConcatFlattensOneLevel {
+    -- concat removes one level of list grouping from each argument and
+    -- joins the results; nested lists stay nested.
+    when: Evaluates("concat {a {b c}} {d e}")
+    ensures: completion.code = ok
+    ensures: completion.value = "a {b c} d e"
+}
+
+rule L2ConcatNoArgsAndTrimsEnds {
+    -- No arguments gives empty; only leading/trailing whitespace of each
+    -- argument is trimmed (internal runs survive); empty arguments add
+    -- nothing.
+    when: Evaluates("list [concat] [concat {  a  b  }] [concat {a} {} {b}] [concat {a b} {c d} {e f}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {a  b} {a b} {a b c d e f}"
+}
+
+rule L2JoinDefaultAndSeparators {
+    -- The default separator is a space; any string (including empty or
+    -- multi-character) may be used.
+    when: Evaluates("list [join {a b c}] [join {a b} {, }] [join {a b} {}] [join {a b c} {++}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a b c} {a, b} ab a++b++c"
+}
+
+rule L2JoinEmptyAndSingle {
+    -- Empty input gives empty for any separator; one element is returned
+    -- as-is; element spacing is not changed.
+    when: Evaluates("list [join {}] [join {} -] [join {a} -] [join {{a b} c} -]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {} a {a b-c}"
+}
+
+rule L2SplitDefaultWhitespace {
+    -- The default separator is whitespace; every separator character
+    -- produces a field, so adjacent whitespace yields empty fields.
+    when: Evaluates("list [split { a b }] [split {a  b}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{{} a b {}} {a {} b}"
+}
+
+rule L2SplitSeparatorCharSet {
+    -- Each character in the separator string is a separate separator;
+    -- empty input gives the empty list; an empty separator splits into
+    -- characters.
+    when: Evaluates("list [split {a,b;c} {,;}] [split {aXbXc} X] [split {} ,] [split abc {}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a b c} {a b c} {} {a b c}"
+}
+
+rule L2SplitAllSeparatorsAndEmptySeparator {
+    -- A string of only separators yields one empty field per separator
+    -- plus a trailing one; the empty separator splits spaces as ordinary
+    -- characters; splitting an empty string by an empty separator is
+    -- empty.
+    when: Evaluates("list [split {,,,} ,] [split {a b} {}] [split {} {}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{{} {} {} {}} {a { } b} {}"
+}
+
+-- ── residual 9.1 list faces ───────────────────────────────────────
+-- Faces of lfilter/lseq/ledit/lpop/lremove not already covered by
+-- list.allium.
+
+rule L2LfilterMultiVarlist {
+    -- lfilter accepts a braced multi-variable list and collects the first
+    -- variable of each accepted group.
+    when: Evaluates("list [lfilter {a b} {1 2 3 4} {expr {$a < $b}}] [lfilter {a b} {1 2 3 4} {expr {$a > $b}}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{1 3} {}"
+}
+
+rule L2LseqZeroAndImpliedDirection {
+    -- A zero or negative count is empty; from>to with no explicit by
+    -- counts downward; an explicit by direction mismatch is empty; by 0
+    -- yields only the first value.
+    when: Evaluates("list [lseq 0] [lseq -2] [lseq 3 1] [lseq 3 1 by 1] [lseq 1 5 by 0] [lseq 5 1 by 0]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {} {3 2 1} {} 1 5"
+}
+
+rule L2LeditInsertsWhenRangeEmpty {
+    -- ledit with last before first inserts the new elements at first and
+    -- updates the variable in place.
+    when: Evaluates("set l {a b c}; ledit l 1 0 X; set l")
+    ensures: completion.code = ok
+    ensures: completion.value = "a X b c"
+}
+
+rule L2LpopMissingVariableAndRange {
+    -- lpop requires an existing variable and rejects an out-of-range
+    -- index without changing the list.
+    when: Evaluates("list [catch {lpop nosuchvar} m] $m [set l {a b c}; catch {lpop l 5} n] $n $l")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {can't read \"nosuchvar\": no such variable} 1 {index \"5\" out of range} {a b c}"
+}
+
+rule L2LremoveNoIndicesAndOutOfRange {
+    -- With no indices lremove returns the list unchanged; out-of-range
+    -- indices are ignored.
+    when: Evaluates("list [lremove {a b c}] [lremove {a b c} 5]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a b c} {a b c}"
+}

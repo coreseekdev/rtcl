@@ -416,8 +416,12 @@ impl Interp {
     /// bodies inline into the surrounding bytecode and pays nothing per
     /// iteration).  A miss runs plain `eval` and memoizes the bytecode
     /// that eval seeded for this text; the hit path re-checks `eval`'s
-    /// bytecode gates every iteration, so a Tier1 epoch bump or a
-    /// registered exec trace falls straight back to `eval`.
+    /// applicability gates every iteration, so a registered exec trace
+    /// falls straight back to `eval`.  A Tier1 epoch bump used to pin the
+    /// body to the tree-walk — D3 F3/F6: the miss path recompiles the
+    /// stale unit through `eval`'s gate (per epoch generation), so
+    /// eviction/staleness never tree-falls a body; only fallback ops,
+    /// traces and the manual switch do.
     pub(crate) fn eval_body_value(&mut self, body: &Value) -> Result<Value> {
         // A caller that armed the "same unit" request (cmd_while/cmd_for —
         // the constructs whose bodies the compiler inlines when the gates
@@ -429,8 +433,15 @@ impl Interp {
         // script with the proc-unit context (the tree-walk twin of the
         // compiler inlining the body into the surrounding unit).
         let armed = std::mem::take(&mut self.next_eval_lexical);
-        // Pointer-identity scan of the resident bodies (FIFO, bounded):
-        // body/next of one `for` plus one nested loop's bodies all fit.
+        // Pointer-identity scan of the resident bodies (FIFO, bounded).
+        // D3 F6：容量 4→32。旧 4 槽 = 单层 for 的驻留形状（body + next
+        // + 一层嵌套的 body/next）；三层以上嵌套循环的驻留集互相挤出，
+        // 被挤出的体每次迭代退回 eval 的双哈希查取。32 覆盖 ~10 层嵌
+        // 套的驻集上界，超出仍走 FIFO 淘汰（有界驻留，wasm32 目标）。
+        // 淘汰永不落树（F3/F5 后的不变式）：miss 路径走 eval → 缓存门
+        // ——epoch 失配即重编译、超门即按请求编译、缓存被预算清掉即重
+        // 解析重编译，全部回到字节码；落树只剩 fallback / trace / 手动
+        // 关断。即「挤出后下次遇到同 body 重新编译」，不再因挤出回落。
         let hit = self
             .body_memo
             .iter()
@@ -446,7 +457,7 @@ impl Interp {
         let r = self.eval(text);
         if r.is_ok() {
             if let Some(code) = self.bytecode_cache.get(text) {
-                const BODY_MEMO_MAX: usize = 4;
+                const BODY_MEMO_MAX: usize = 32;
                 if self.body_memo.len() == BODY_MEMO_MAX {
                     self.body_memo.remove(0);
                 }

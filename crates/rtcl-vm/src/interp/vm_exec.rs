@@ -4776,6 +4776,45 @@ p 1";
     }
 
     #[test]
+    fn test_f6_body_memo_capacity_nested_loops() {
+        // D3 F6：深嵌套 + 多互异动态体（非 braced 字面量才进
+        // eval_body_value/memo——braced 体被编译器内联进外层单元）。
+        // 驻集 10（5 体 + 5 next）> 旧 4 槽：容量 32 覆盖深嵌套驻集；
+        // 淘汰永不落树（F3/F5 不变式：miss 经 eval 缓存门回字节码）。
+        let mut interp = Interp::new();
+        interp
+            .eval(
+                r#"
+set acc 0
+set b1 {incr acc 1}
+set b2 {incr acc 2}
+set b3 {incr acc 3}
+set b4 {incr acc 4}
+set b5 {incr acc 5}
+for {set i 0} {$i < 2} {incr i} {
+    for {set j 0} {$j < 1} {incr j} $b1
+    for {set j 0} {$j < 1} {incr j} $b2
+    for {set j 0} {$j < 1} {incr j} $b3
+    for {set j 0} {$j < 1} {incr j} $b4
+    for {set j 0} {$j < 1} {incr j} $b5
+}
+set acc
+"#,
+            )
+            .unwrap();
+        // 2 × (1+2+3+4+5) = 30——全部动态体/next 执行完毕且语义正确。
+        assert_eq!(interp.eval("set acc").unwrap().as_str(), "30");
+        assert!(
+            interp.body_memo.len() > 4,
+            "nested-loop resident set must exceed the old 4-slot capacity, got {}",
+            interp.body_memo.len()
+        );
+        // 淘汰路径的语义面：挤出后同体仍字节码执行（结果一致）——此处
+        // 靠 10+ 驻集循环的正确性间接钉住；tf 事件由 f6-bodymemo.sh 在
+        // dbg 构建下钉 0。
+    }
+
+    #[test]
     fn test_slot_statics_stay_name_keyed() {
         assert_both(
             "proc p {} { set c 5; return $c }; p",

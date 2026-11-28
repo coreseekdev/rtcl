@@ -1,0 +1,379 @@
+-- allium: 3
+-- binary.allium
+-- Behaviour spec: the binary command — format / scan field specifiers,
+-- counts and cursor movement, native vs fixed endianness, and the
+-- encode / decode transfer encodings (hex, base64, uuencode).
+-- Oracle: tclsh 9.1.0 (core-9-1-0), probed 2026-11-28 on this host.
+-- The float Inf/NaN bit patterns and the t/n/m field sanity rule live in
+-- matching.allium (T7 batch); this file covers the rest of the surface.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── binary format: byte and text fields ──────────────────────────
+
+rule BinaryFormatByteStringsPadAndTruncate {
+    -- a pads short arguments with NUL, A with spaces; long arguments are
+    -- cut to the count; * takes the whole argument.
+    when: Evaluates("list [binary encode hex [binary format a3 ab]] [binary encode hex [binary format a5 ab]] [binary encode hex [binary format A5 ab]] [binary encode hex [binary format a* abc]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "616200 6162000000 6162202020 616263"
+    -- probe: 2026-11-28 tclsh9.1; doc/binary.n a/A
+}
+
+rule BinaryFormatByteStringsUseLowByte {
+    -- a/A take each character modulo 256 (the low byte), so U+0100 becomes
+    -- 00 and U+20AC becomes AC rather than its UTF-8 bytes.
+    when: Evaluates("list [binary encode hex [binary format a1 \\u0100]] [binary encode hex [binary format a1 \\u00ff]] [binary encode hex [binary format a* \\u20ac]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "00 ff ac"
+    -- probe: 2026-11-28 tclsh9.1; doc/binary.n says encoding convertto is
+    -- the way to keep non-Latin-1 text
+}
+
+rule BinaryFormatBitStringsOrderAndPadding {
+    -- b stores bits low-to-high within each byte, B high-to-low; a partial
+    -- last byte is zero-filled. * takes every digit.
+    when: Evaluates("list [binary encode hex [binary format b5 11100]] [binary encode hex [binary format B5 11100]] [binary encode hex [binary format b5b* 11100 111000011010]] [binary encode hex [binary format B5B* 11100 111000011010]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "07 e0 078705 e0e1a0"
+    -- probe: 2026-11-28 tclsh9.1; doc/binary.n b/B examples
+}
+
+rule BinaryFormatHexStringsOrderAndPadding {
+    -- H takes digits high-to-low within each byte, h low-to-high; an odd
+    -- digit count leaves the missing low nibble zero. * takes all digits.
+    when: Evaluates("list [binary encode hex [binary format h3 AB]] [binary encode hex [binary format H3 ab]] [binary encode hex [binary format h3h*h2 AB def 987]] [binary encode hex [binary format H3H*H2 ab DEF 987]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "ba00 ab00 ba00ed0f89 ab00def098"
+    -- probe: 2026-11-28 tclsh9.1; doc/binary.n h/H examples
+}
+
+rule BinaryFormatBitAndHexRejectInvalidDigits {
+    -- b/B accept only 0/1 and h/H only hex digits; the message names the
+    -- expected alphabet.
+    when: Evaluates("list [catch {binary format b4 11x0} m1] $m1 [catch {binary format h4 zz} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {expected binary string but got \"11x0\" instead} 1 {expected hexadecimal string but got \"zz\" instead}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── binary format: integers ──────────────────────────────────────
+
+rule BinaryFormatIntegerWidthsAndEndianness {
+    -- c=8 bits; s/t=16; i/n=32; w/m=64. Lowercase is little-endian and
+    -- uppercase big-endian, except t/n/m which are native order.
+    when: Evaluates("list [binary encode hex [binary format c3 {3 -3 128 1}]] [binary encode hex [binary format s3 {3 -3 258 1}]] [binary encode hex [binary format S3 {3 -3 258 1}]] [binary encode hex [binary format i3 {3 -3 65536 1}]] [binary encode hex [binary format I3 {3 -3 65536 1}]] [binary encode hex [binary format w 7810179016327718216]] [binary encode hex [binary format W 4785469626960341345]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "03fd80 0300fdff0201 0003fffd0102 03000000fdffffff00000100 00000003fffffffd00010000 48656c6c6f54636c 426967456e646961"
+    -- probe: 2026-11-28 tclsh9.1; doc/binary.n integer examples. Note
+    -- that t/n/m are native order, not network order.
+}
+
+rule BinaryFormatIntegerTruncatesLowBits {
+    -- Only the low-order bits of each integer are stored: 260 -> 04,
+    -- -1 -> FF, 65535 in a 16-bit field -> FFFF, 2^32 in a 32-bit field
+    -- -> 00000000. Values wrap modulo the field width, never saturate.
+    when: Evaluates("list [binary encode hex [binary format c 260]] [binary encode hex [binary format c -1]] [binary encode hex [binary format s 65535]] [binary encode hex [binary format i 4294967296]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "04 ff ffff 00000000"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule BinaryFormatNativeIntegerWidths {
+    -- t/n/m have the same 16/32/64-bit widths as s/i/w and round-trip in
+    -- native order. Their byte order is host-dependent, so this rule pins
+    -- only widths and the round-trip, not a fixed byte pattern.
+    when: Evaluates("list [string length [binary format t 1]] [string length [binary format n 1]] [string length [binary format m 1]] [binary scan [binary format {t n m} 1 2 3] {t n m} tv nv mv] $tv $nv $mv")
+    ensures: completion.code = ok
+    ensures: completion.value = "2 4 8 3 1 2 3"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── binary format: floats ────────────────────────────────────────
+
+rule BinaryFormatFloatRepresentations {
+    -- r/R are IEEE-754 single precision little/big endian; q/Q are double
+    -- little/big endian; f/d use the machine's native layout (little-endian
+    -- IEEE-754 here).
+    when: Evaluates("list [binary encode hex [binary format r 1.5]] [binary encode hex [binary format R 1.5]] [binary encode hex [binary format q 1.5]] [binary encode hex [binary format Q 1.5]] [binary encode hex [binary format f 1.5]] [binary encode hex [binary format d 1.5]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0000c03f 3fc00000 000000000000f83f 3ff8000000000000 0000c03f 000000000000f83f"
+    -- probe: 2026-11-28 tclsh9.1. Non-finite bit patterns are pinned in
+    -- matching.allium (pbr6_float_bits).
+}
+
+-- ── binary format: counts and cursor ─────────────────────────────
+
+rule BinaryFormatCountsTakeListPrefixAndStar {
+    -- A count takes that many leading elements of a list argument (extra
+    -- elements ignored); * takes all of them.
+    when: Evaluates("list [binary encode hex [binary format c3 {3 -3 128 1}]] [binary encode hex [binary format c3cc* {3 -3 128 1} 260 {2 5}]] [binary encode hex [binary format c* {1 2 3}]] [binary encode hex [binary format s* {1 2 3}]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "03fd80 03fd80040205 010203 010002000300"
+    -- probe: 2026-11-28 tclsh9.1; doc/binary.n d3 / c3cc* examples
+}
+
+rule BinaryFormatListArgWithoutCountErrors {
+    -- A bare c/s/i/w field takes one integer, not a list.
+    when: Evaluates("catch {binary format c {2 5}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "expected integer but got a list"
+    -- probe: 2026-11-28 tclsh9.1; doc/binary.n c example
+}
+
+rule BinaryFormatCursorSkipAndSeek {
+    -- x writes NULs, X moves back (clamped at 0), @ seeks absolutely (NUL
+    -- filling gaps, * means end). Later writes overwrite earlier bytes.
+    when: Evaluates("list [binary encode hex [binary format a3xa3x2a3 abc def ghi]] [binary encode hex [binary format a3X*a3X2a3 abc def ghi]] [binary encode hex [binary format a5@2a1@*a3@10a1 abcde f ghi j]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "616263006465660000676869 64676869 616266646567686900006a"
+    -- probe: 2026-11-28 tclsh9.1; doc/binary.n x/X/@ examples
+}
+
+rule BinaryFormatCursorCountErrorsAndFlag {
+    -- x* is rejected (it has no meaningful all-bytes reading); @ with no
+    -- count is rejected; the scan-only "u" flag is ignored by format.
+    when: Evaluates("list [catch {binary format x*} m1] $m1 [catch {binary format @} m2] $m2 [binary encode hex [binary format cu 300]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {cannot use \"*\" in format string with \"x\"} 1 {missing count for \"@\" field specifier} 2c"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule BinaryFormatArityAndExtraArguments {
+    -- Every argument-consuming field needs an argument, but surplus
+    -- arguments are silently ignored. An empty format produces empty data.
+    when: Evaluates("list [catch {binary format a1a1 a} m] $m [binary encode hex [binary format a1 a b]] [binary format {}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {not enough arguments for all format specifiers} 61 {}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule BinaryFormatBadFieldSpecifierAndWrongArgs {
+    -- Unknown type letters and a negative count are bad field specifiers;
+    -- no format string at all is an arity error.
+    when: Evaluates("list [catch {binary format Z 1} m1] $m1 [catch {binary format a-1 x} m2] $m2 [catch {binary format} m3] $m3")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {bad field specifier \"Z\"} 1 {bad field specifier \"-\"} 1 {wrong # args: should be \"binary format formatString ?arg ...?\"}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── binary scan: byte and text fields ────────────────────────────
+
+rule BinaryScanByteStringsAndCString {
+    -- a scans exactly count bytes; A also strips trailing blanks and NULs;
+    -- C stops at the first NUL (C-string semantics, new in 9.1).
+    when: Evaluates("binary scan abcde a2 a; binary scan \"abc efghi  \\u0000\" A* b; binary scan \"abc\\u0000efghi\" C* c; list $a $b $c")
+    ensures: completion.code = ok
+    ensures: completion.value = "ab {abc efghi} abc"
+    -- probe: 2026-11-28 tclsh9.1; doc/binary.n a/A/C
+}
+
+rule BinaryScanBitStringsOrder {
+    -- b emits bits low-to-high per byte, B high-to-low; * scans all
+    -- remaining bits including the zero padding of the last byte.
+    when: Evaluates("binary scan \\x07\\x87\\x05 b5b* v1 v2; set r1 [list $v1 $v2]; binary scan \\x70\\x87\\x05 B5B* v3 v4; list $r1 [list $v3 $v4]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{11100 1110000110100000} {01110 1000011100000101}"
+    -- probe: 2026-11-28 tclsh9.1; doc/binary.n b/B examples
+}
+
+rule BinaryScanHexStringsOrder {
+    -- H emits hex digits high-to-low per byte, h low-to-high; output is
+    -- lowercase.
+    when: Evaluates("binary scan \\x07\\x86\\x05\\x12\\x34 h3h* v1 v2; set r1 [list $v1 $v2]; binary scan \\x07\\xc6\\x05\\x1f\\x34 H3H* v3 v4; list $r1 [list $v3 $v4]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{706 502143} {07c 051f34}"
+    -- probe: 2026-11-28 tclsh9.1; doc/binary.n h/H examples
+}
+
+-- ── binary scan: integers ────────────────────────────────────────
+
+rule BinaryScanSignedIntegersSignExtend {
+    -- c/s/S sign-extend into Tcl's wide integers: FF byte -> -1,
+    -- FFFF short -> -1. A multi-item field becomes a list.
+    when: Evaluates("binary scan \\x07\\x86\\x05 c2c* v1 v2; set r1 [list $v1 $v2]; binary scan \\x05\\x00\\x07\\x00\\xf0\\xff s2s* v3 v4; set r2 [list $v3 $v4]; binary scan \\x00\\x05\\x00\\x07\\xff\\xf0 S2S* v5 v6; list $r1 $r2 [list $v5 $v6]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{{7 -122} 5} {{5 7} -16} {{5 7} -16}"
+    -- probe: 2026-11-28 tclsh9.1; doc/binary.n signedness note
+}
+
+rule BinaryScanThirtyTwoAnd64BitIntegers {
+    -- i/I are 32-bit little/big endian, w/W are 64-bit little/big endian;
+    -- each multi-item field yields a list.
+    when: Evaluates("binary scan \\x05\\x00\\x00\\x00\\x07\\x00\\x00\\x00\\xf0\\xff\\xff\\xff i2i* v1 v2; binary scan \\x00\\x00\\x00\\x05\\x00\\x00\\x00\\x07\\xff\\xff\\xff\\xf0 I2I* v3 v4; binary scan \\x05\\x00\\x00\\x00\\x07\\x00\\x00\\x00 w v5; binary scan \\x00\\x00\\x00\\x05\\x00\\x00\\x00\\x07 W v6; list $v1 $v2 $v3 $v4 $v5 $v6")
+    ensures: completion.code = ok
+    ensures: completion.value = "{5 7} -16 {5 7} -16 30064771077 21474836487"
+    -- probe: 2026-11-28 tclsh9.1; doc/binary.n i/I/w/W examples
+}
+
+rule BinaryScanUnsignedFlag {
+    -- The u flag immediately after an integer type reads unsigned; it is
+    -- accepted but ignored for floating-point fields.
+    when: Evaluates("binary scan \\xff cu v1; binary scan \\xff\\xff su v2; binary scan \\xff\\xff\\xff\\xff iu v3; binary scan \\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff wu v4; binary scan \\x3f\\xc0\\x00\\x00 Ru v5; list $v1 $v2 $v3 $v4 $v5")
+    ensures: completion.code = ok
+    ensures: completion.value = "255 65535 4294967295 18446744073709551615 1.5"
+    -- probe: 2026-11-28 tclsh9.1; doc/binary.n u flag
+}
+
+-- ── binary scan: floats ──────────────────────────────────────────
+
+rule BinaryScanFixedEndianFloats {
+    -- r/R single and q/Q double precision decode to the same Tcl double;
+    -- f/d read the machine's native layout.
+    when: Evaluates("list [binary scan \\x00\\x00\\xc0\\x3f r a; set a] [binary scan \\x3f\\xc0\\x00\\x00 R b; set b] [binary scan \\x00\\x00\\x00\\x00\\x00\\x00\\xf8\\x3f q c; set c] [binary scan \\x3f\\xf8\\x00\\x00\\x00\\x00\\x00\\x00 Q d; set d] [binary scan \\x00\\x00\\xc0\\x3f f e; set e] [binary scan \\x00\\x00\\x00\\x00\\x00\\x00\\xf8\\x3f d g; set g]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1.5 1.5 1.5 1.5 1.5 1.5"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── binary scan: cursor and errors ───────────────────────────────
+
+rule BinaryScanStopsAtIncompleteField {
+    -- Scanning stops before a field that does not have enough remaining
+    -- bytes: earlier variables are set, the failing variable is untouched,
+    -- and the return value counts only completed conversions.
+    when: Evaluates("set second PRE; set r [binary scan abcdefg s3s first second]; list $r $first $second")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {25185 25699 26213} PRE"
+    -- probe: 2026-11-28 tclsh9.1; doc/binary.n s3s example
+}
+
+rule BinaryScanZeroLengthFieldsSetEmpty {
+    -- A zero count (explicit 0 or * with nothing left) is a completed
+    -- conversion that sets an empty value; a missing non-zero field does
+    -- not run at all.
+    when: Evaluates("list [binary scan {} a0 v] $v [binary scan {} a1 w] [info exists w]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {} 0 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule BinaryScanCursorSkipAndSeek {
+    -- x moves forward, X moves back (clamped at 0), @ seeks absolutely;
+    -- H* after a seek shows the remaining bytes from the new position.
+    when: Evaluates("binary scan \\x01\\x02\\x03\\x04 x2H* a; binary scan \\x01\\x02\\x03\\x04 c2XH* b1 b2; binary scan \\x01\\x02\\x03\\x04 c2@1H* c1 c2; list $a $b1 $b2 $c1 $c2")
+    ensures: completion.code = ok
+    ensures: completion.value = "0304 {1 2} 020304 {1 2} 020304"
+    -- probe: 2026-11-28 tclsh9.1; doc/binary.n x/X/@ scan examples
+}
+
+rule BinaryScanArityAndBadSpecifier {
+    -- A field that consumes a variable with no name left is an arity
+    -- error; surplus variable names are ignored; the u flag must follow
+    -- the type directly, not the count.
+    when: Evaluates("list [catch {binary scan abc a1} m] $m [binary scan abc a1 v extra] $v [catch {binary scan abc Z v} m2] $m2 [catch {binary scan abc c2u v} m3] $m3")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {not enough arguments for all format specifiers} 1 a 1 {bad field specifier \"Z\"} 1 {bad field specifier \"u\"}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule BinaryScanRejectsNonBinaryInput {
+    -- Values outside U+0000..U+00FF are not binary data; the message names
+    -- the byte offset and value.
+    when: Evaluates("catch {binary scan \\u0100 a1 v} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "expected code point values below 0xff but value at byte offset 0 was 0x100"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── binary encode / decode: hex ──────────────────────────────────
+
+rule BinaryHexEncodeDecodeRoundTrip {
+    -- Encoding uses lowercase pairs; decoding accepts either case and
+    -- reproduces the original bytes exactly.
+    when: Evaluates("list [binary encode hex \"Hi!\"] [binary decode hex 486921] [binary encode hex [binary decode hex 00FF10]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "486921 Hi! 00ff10"
+    -- probe: 2026-11-28 tclsh9.1; doc/binary.n hex
+}
+
+rule BinaryHexDecodeWhitespaceAndStrict {
+    -- Non-strict hex decoding ignores whitespace; -strict rejects it with
+    -- the offending character and position.
+    when: Evaluates("list [binary decode hex \"48 69 21\"] [catch {binary decode hex -strict \"48 69 21\"} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "Hi! 1 {invalid hexadecimal digit \" \" (U+000020) at position 2}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule BinaryHexDecodeOddAndInvalid {
+    -- A dangling high nibble is accepted as the low nibble zero; a
+    -- non-hex character is an error with its position.
+    when: Evaluates("list [binary decode hex 486] [catch {binary decode hex 48zz} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "H 1 {invalid hexadecimal digit \"z\" (U+00007A) at position 2}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── binary encode / decode: base64 ───────────────────────────────
+
+rule BinaryBase64RoundTrip {
+    -- Standard base64 alphabet with = padding; a missing final padding is
+    -- tolerated on decode.
+    when: Evaluates("list [binary encode base64 \"Hello, World!\"] [binary decode base64 SGVsbG8sIFdvcmxkIQ==] [binary encode hex [binary decode base64 SGVsbG8sIFdvcmxkIQ]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "SGVsbG8sIFdvcmxkIQ== {Hello, World!} 48656c6c6f2c20576f726c6421"
+    -- probe: 2026-11-28 tclsh9.1; doc/binary.n base64
+}
+
+rule BinaryBase64LineWrapping {
+    -- -maxlen splits encoded lines; -wrapchar replaces the default newline
+    -- separator and is not inserted when no split is needed.
+    when: Evaluates("list [string map [list \\n |] [binary encode base64 -maxlen 4 \"Hello, World!\"]] [binary encode base64 -maxlen 4 -wrapchar XX \"Hello, World!\"]")
+    ensures: completion.code = ok
+    ensures: completion.value = "SGVs|bG8s|IFdv|cmxk|IQ== SGVsXXbG8sXXIFdvXXcmxkXXIQ=="
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule BinaryBase64StrictRejectsInvalid {
+    -- Non-strict base64 decoding drops characters outside the alphabet;
+    -- -strict raises with the character and position.
+    when: Evaluates("list [binary decode base64 SGVs*bG8s] [catch {binary decode base64 -strict SGVs*bG8s} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "Hello, 1 {invalid base64 character \"*\" (U+00002A) at position 4}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── binary encode / decode: uuencode ─────────────────────────────
+
+rule BinaryUuencodeRoundTrip {
+    -- uuencode round-trips arbitrary bytes; encoding empty data is empty
+    -- (no begin/end header is added).
+    when: Evaluates("list [binary encode hex [binary decode uuencode [binary encode uuencode \"\\u0000\\u0001\\u00ffABC\"]]] [binary encode uuencode {}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0001ff414243 {}"
+    -- probe: 2026-11-28 tclsh9.1; doc/binary.n uuencode
+}
+
+rule BinaryUuencodeOptionValidation {
+    -- -maxlen must be 5..85 for uuencode; a wrapchar outside the permitted
+    -- whitespace set is rejected because it would defeat decoding.
+    when: Evaluates("list [catch {binary encode uuencode -maxlen 4 abc} m1] $m1 [catch {binary encode uuencode -maxlen 86 abc} m2] $m2 [catch {binary encode uuencode -wrapchar x abc} m3] $m3")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {line length out of range} 1 {line length out of range} 1 {invalid wrapchar; will defeat decoding}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── binary encode / decode: shared errors ────────────────────────
+
+rule BinaryEncodeRejectsNonBinaryData {
+    -- encode refuses values with characters above U+00FF instead of
+    -- silently truncating them.
+    when: Evaluates("catch {binary encode hex \\u0100} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "expected code point values below 0xff but value at byte offset 0 was 0x100"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule BinaryEncodeFormatMenuAndArity {
+    -- The encoding names are base64/hex/uuencode; hex takes no options and
+    -- decode hex only -strict, so extra words are misread as options.
+    when: Evaluates("list [catch {binary encode bogus abc} m1] $m1 [catch {binary encode hex} m2] $m2 [catch {binary decode hex} m3] $m3 [catch {binary decode hex abc def} m4] $m4 [catch {binary bogus} m5] $m5")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {unknown subcommand \"bogus\": must be base64, hex, or uuencode} 1 {wrong # args: should be \"binary encode hex data\"} 1 {wrong # args: should be \"binary decode hex ?options? data\"} 1 {bad option \"abc\": must be -strict} 1 {unknown or ambiguous subcommand \"bogus\": must be decode, encode, format, or scan}"
+    -- probe: 2026-11-28 tclsh9.1
+}

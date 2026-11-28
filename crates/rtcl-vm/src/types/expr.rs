@@ -409,7 +409,9 @@ impl<'a> ExprParser<'a> {
         Ok(left)
     }
 
-    /// Equality: `==`, `!=`, `eq`, `ne`, `in`, `ni`, `lt`, `gt`, `le`, `ge`, `=*`, `=~`
+    /// Equality: `==`, `!=`, `eq`, `ne`, `in`, `ni`, `=*`, `=~`
+    /// （9.1 的 PREC_EQUAL 一层；`lt/gt/le/ge` 在上一级 parse_relational，
+    /// 见 9.1 tclCompExpr.c Precedence 枚举）
     fn parse_equality(&mut self) -> Result<Value> {
         let mut left = self.parse_relational()?;
         loop {
@@ -471,18 +473,6 @@ impl<'a> ExprParser<'a> {
                 let items = strict_list(self.interp, &right)?;
                 let found = items.iter().any(|v| v.as_str() == left.as_str());
                 left = Value::from_bool(!found);
-            } else if self.match_word_op("lt") {
-                let right = self.parse_relational()?;
-                left = Value::from_bool(left.as_str() < right.as_str());
-            } else if self.match_word_op("gt") {
-                let right = self.parse_relational()?;
-                left = Value::from_bool(left.as_str() > right.as_str());
-            } else if self.match_word_op("le") {
-                let right = self.parse_relational()?;
-                left = Value::from_bool(left.as_str() <= right.as_str());
-            } else if self.match_word_op("ge") {
-                let right = self.parse_relational()?;
-                left = Value::from_bool(left.as_str() >= right.as_str());
             } else {
                 break;
             }
@@ -490,10 +480,32 @@ impl<'a> ExprParser<'a> {
         Ok(left)
     }
 
-    /// Relational: `<`, `<=`, `>`, `>=`
+    /// Relational: `<`, `<=`, `>`, `>=` and the 9.0 word forms
+    /// `lt`/`le`/`gt`/`ge`.  9.1 的优先级表（tclCompExpr.c Precedence 枚举）
+    /// 把 STR_LT/STR_GT/STR_LEQ/STR_GEQ 与 `<`/`>`/`<=`/`>=` 同归
+    /// PREC_COMPARE——高于 `==`/`eq` 的 PREC_EQUAL：`expr 5 == 10 lt 2`
+    /// 是 `5 == ("10" lt "2")` → 0（9.1 实测钉形），不是 `(5 == 10) lt 2`
+    /// 的 1。词形是纯字符串比较，符号形两者都数值时比数值、否则按
+    /// 9.x 的字符串回退（op_rel）。
     fn parse_relational(&mut self) -> Result<Value> {
         let mut left = self.parse_shift()?;
         loop {
+            let str_op: Option<fn(&Value, &Value) -> Value> = if self.match_word_op("lt") {
+                Some(|l: &Value, r: &Value| Value::from_bool(l.as_str() < r.as_str()))
+            } else if self.match_word_op("le") {
+                Some(|l: &Value, r: &Value| Value::from_bool(l.as_str() <= r.as_str()))
+            } else if self.match_word_op("gt") {
+                Some(|l: &Value, r: &Value| Value::from_bool(l.as_str() > r.as_str()))
+            } else if self.match_word_op("ge") {
+                Some(|l: &Value, r: &Value| Value::from_bool(l.as_str() >= r.as_str()))
+            } else {
+                None
+            };
+            if let Some(f) = str_op {
+                let right = self.parse_shift()?;
+                left = f(&left, &right);
+                continue;
+            }
             let op = if self.match_op("<=") {
                 "<="
             } else if self.match_op(">=") {
@@ -972,10 +984,17 @@ impl<'a> ExprParser<'a> {
     }
 
     /// tclsh: letters glued to a number are only legal as the word
-    /// operators `eq`/`ne`/`in` followed by a digit-led operand
-    /// (`3eq2`); any other digit-led alnum run is an invalid bareword
-    /// (`3x2`, `3e`, `5mod3`, `3lt2`).  Rewinds to just after the digits
-    /// so operator matching sees `eq`.
+    /// operators `eq`/`ne`/`in`/`ni`/`lt`/`le`/`gt`/`ge` followed by a
+    /// digit-led operand (`3eq2`, 9.1: `3lt2` → 0); any other digit-led
+    /// alnum run is an invalid bareword (`3x2`, `3e`, `5mod3`, `3EQ2`,
+    /// `5ltinf`).  Mirrors tclCompExpr.c ParseLexeme: the 2-letter word
+    /// operator is recognized when its third byte is not an ASCII letter
+    /// (`start[2] & 0x80 || !isalpha(start[2])`)——`and`/`or` are not
+    /// expr operators at all, so `3and2` joins into one bareword.  A
+    /// double literal whose digits the dot splits (`1.5lt2`) never
+    /// joins; it lexes `1.5` + operator tail (ParseLexeme's
+    /// tclDoubleType branch).  Rewinds to just after the digits so
+    /// operator matching sees the word form.
     fn check_number_trail(&mut self, prefix: &str) -> Result<()> {
         if !self.peek().is_ascii_alphabetic() {
             return Ok(());
@@ -985,13 +1004,15 @@ impl<'a> ExprParser<'a> {
             self.advance();
         }
         let run: String = self.chars[run_start..self.pos].iter().collect();
-        let word_op = run == "eq" || run == "ne" || run == "in";
-        let glued = (run.starts_with("eq") || run.starts_with("ne") || run.starts_with("in"))
+        const WORD_OPS: [&str; 8] = ["eq", "ne", "in", "ni", "lt", "le", "gt", "ge"];
+        let word_op = WORD_OPS.contains(&run.as_str());
+        let glued = run.len() >= 2
+            && WORD_OPS.contains(&&run[..2])
             && run
                 .as_bytes()
                 .get(2)
-                .map(|b| b.is_ascii_digit() || *b == b'.')
-                .unwrap_or(false);
+                .map(|b| !b.is_ascii_alphabetic())
+                .unwrap_or(true);
         if word_op || glued {
             self.pos = run_start;
             return Ok(());
@@ -1393,8 +1414,8 @@ impl<'a> ExprParser<'a> {
     }
 
     /// Match a word operator (requires non-alphanumeric boundary after
-    /// it).  Exception: a number immediately followed by eq/ne/in
-    /// (`3eq2`, validated by `check_number_trail`) still lexes as
+    /// it).  Exception: a number immediately followed by a word operator
+    /// (`3eq2`/`3lt2`, validated by `check_number_trail`) still lexes as
     /// operator + digit-led operand, tclsh-style.
     fn match_word_op(&mut self, op: &str) -> bool {
         self.skip_whitespace();

@@ -1202,9 +1202,20 @@ pub fn cmd_lseq(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             set_error_code(interp, "TCL VALUE INTEGER");
             tcl_err(format!("expected integer but got \"{}\"", v.as_str()))
         };
+        // GetWideIntFromObj 的两条失败路径（9.1 实测）：文本 bignum
+        // （0x8000000000000000）值出 wide 范围 → `ARITH IOVERFLOW
+        // integer value too large to represent`；double（1e20、2.5、
+        // inf）→ `expected integer but got "<串>"`——字面量经编译是纯
+        // string rep，count 转换块跳过后在 GetWideIntFromObj 先
+        // shimmer 成 double 再报本错（`set x 1e20; lseq 5 count $x`
+        // 变量间接也同报文，双路一致）。
+        let ioverflow = |interp: &mut Interp| -> Error {
+            set_error_code(interp, "ARITH IOVERFLOW {integer value too large to represent}");
+            tcl_err("integer value too large to represent")
+        };
         count_val = Some(match num_at(&nums, &count) {
             Some(Num::Int(i)) => i,
-            Some(Num::Big) => return Err(wide(interp, cv)),
+            Some(Num::Big) => return Err(ioverflow(interp)),
             Some(Num::Dbl(d)) => {
                 use_doubles = use_doubles.saturating_sub(1);
                 if d.is_finite() && d.floor() == d && d >= -(2f64.powi(63)) && d < 2f64.powi(63) {
@@ -1222,9 +1233,17 @@ pub fn cmd_lseq(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     let as_wide = |interp: &mut Interp, n: Num, v: &Value| -> Result<i64> {
         match n {
             Num::Int(i) => Ok(i),
-            Num::Big | Num::Dbl(_) => {
-                // int mode: a double truncates; out of wide range or a
-                // bignum fails GetWideIntFromObj.
+            Num::Big => {
+                // ExtractNumber 的 TCL_NUMBER_BIG 分支：GetWideIntFromObj
+                // 对超 wide 的 bignum 报 IOVERFLOW（`lseq 0 10
+                // 0x8000000000000000` → integer value too large to
+                // represent，9.1 实测，start/end/step 同）。
+                set_error_code(interp, "ARITH IOVERFLOW {integer value too large to represent}");
+                Err(tcl_err("integer value too large to represent"))
+            }
+            Num::Dbl(_) => {
+                // int mode: a double truncates; out of wide range fails
+                // GetWideIntFromObj's double branch.
                 let d = num_as_f64(n);
                 if d.is_finite() && d >= -(2f64.powi(63)) && d < 2f64.powi(63) {
                     Ok(d as i64)
@@ -1370,10 +1389,16 @@ pub fn cmd_lseq(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                     set_error_code(interp, "TCL MEMORY");
                     return Err(tcl_err("max length of a Tcl list exceeded"));
                 }
-                if dstart.is_nan() || dend.is_nan() {
+                // 9.1 实测分诊（tclArithSeries 长度估计）：start 为 NaN
+                // 不走本路径——len 循环首测即败、len=1，落 post-check 的
+                // isnan(dstart+(len-1)*dstep) → domain（`lseq NaN 5`、
+                // `lseq nan nan` 都是 domain error）；只有 end 为 NaN 而
+                // start 有效才报 estimate-length 文案，且 Tcl_PrintDouble
+                // 渲染小写 "nan"（与 rtcl 值规范形 "NaN" 不同）。
+                if dend.is_nan() && !dstart.is_nan() {
                     set_error_code(interp, "ARITH DOMAIN non-numeric floating-point value");
                     return Err(tcl_err(
-                        "cannot use non-numeric floating-point value \"NaN\" to estimate length of arith-series",
+                        "cannot use non-numeric floating-point value \"nan\" to estimate length of arith-series",
                     ));
                 }
                 let precision = prec_of(&start_obj).max(prec_of(&end_obj)).max(prec_of(&step_obj));
@@ -1428,7 +1453,9 @@ pub fn cmd_lseq(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             return Err(invalid(interp));
         }
     }
-    if use_d && len >= 1 {
+    // C 的 post-check 无 len≥1 守卫（NaN step 让 len 落 0 也必须过本
+    // 检：`lseq 0 10 nan` → d = 0 + (0-1)*NaN = NaN → domain，9.1 实测）。
+    if use_d {
         let d = dstart + ((len - 1) as f64) * dstep;
         if d.is_nan() {
             set_error_code(interp, "ARITH DOMAIN domain error: argument not in valid range");

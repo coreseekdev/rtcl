@@ -1,0 +1,441 @@
+-- allium: 3
+-- package.allium
+-- Behaviour spec: the package database and auto-loading surface —
+-- package require/provide/ifneeded/names/versions/vcompare/vsatisfies/
+-- prefer/present/files/forget/unknown, auto_load/auto_import/
+-- auto_load_index/auto_execok/auto_qualify, and load/unload.
+-- Oracle: tclsh 9.1.0 (core-9-1-0).
+--
+-- Scope: observable completions and errors of the package/auto-load
+-- commands in a fresh interpreter. Synthetic packages are used so the
+-- rules do not depend on which optional packages happen to be installed;
+-- the only core version pinned is Tcl's own (the oracle anchor).
+-- Doc: doc/package.n, doc/load.n, doc/unload.n. Probes re-run against
+-- tclsh 9.1.0 on 2026-11-28. `package files msgcat` is covered by
+-- interp.allium (PackageFilesListsScripts) and not repeated here.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── require / provide ─────────────────────────────────────────────
+
+rule PackageRequireTclReturnsCoreVersion {
+    -- Requiring the statically built core package returns its version.
+    when: Evaluates("package require Tcl")
+    ensures: completion.code = ok
+    ensures: completion.value = "9.1.0"
+    -- probe: 2026-11-28 tclsh9.1 (package require Tcl)
+}
+
+rule PackageRequireExactAcceptsVersion {
+    -- -exact requires the named version literally.
+    when: Evaluates("package require -exact Tcl 9.1.0")
+    ensures: completion.code = ok
+    ensures: completion.value = "9.1.0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule PackageRequireExactRejectsOtherVersion {
+    when: Evaluates("catch {package require -exact Tcl 8.6} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "version conflict for package \"Tcl\": have 9.1.0, need exactly 8.6"
+    -- probe: 2026-11-28 tclsh9.1; doc/package.n "require -exact"
+}
+
+rule PackageRequireMissingPackageErrors {
+    when: Evaluates("catch {package require nosuchpkgxyz} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "can't find package nosuchpkgxyz"
+    -- probe: 2026-11-28 tclsh9.1 (default package unknown handler)
+}
+
+rule PackageProvideRegistersAndReturnsVersion {
+    -- provide records a version; both the getter and a later require
+    -- report it.
+    when: Evaluates("package provide foo 1.2; list [package provide foo] [package require foo]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1.2 1.2"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule PackageProvideUnknownPackageReturnsEmpty {
+    when: Evaluates("package provide neversetpkg")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+    -- probe: 2026-11-28 tclsh9.1; doc/package.n "provide"
+}
+
+rule PackageProvideConflictErrors {
+    -- A second, different version for the same package is rejected and
+    -- names both versions.
+    when: Evaluates("package provide cc 1; catch {package provide cc 2} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "conflicting versions provided for package \"cc\": 1, then 2"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule PackageProvideEmptyVersionRejected {
+    when: Evaluates("catch {package provide ee {}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "expected version number but got \"\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule PackageRequireWrongArgs {
+    when: Evaluates("catch {package require} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"package require ?-exact? package ?requirement ...?\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule PackageProvideWrongArgs {
+    when: Evaluates("catch {package provide} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"package provide package ?version?\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── ifneeded ──────────────────────────────────────────────────────
+
+rule PackageIfneededStoresAndRunsScript {
+    -- ifneeded stores a loader script per (package, version); require
+    -- evaluates it in the global namespace and expects it to provide the
+    -- package.
+    when: Evaluates("package ifneeded bar 1.0 {package provide bar 1.0; set ::barloaded 1}; list [package ifneeded bar 1.0] [package require bar] $::barloaded")
+    ensures: completion.code = ok
+    ensures: completion.value = "{package provide bar 1.0; set ::barloaded 1} 1.0 1"
+    -- probe: 2026-11-28 tclsh9.1; doc/package.n "ifneeded"
+}
+
+rule PackageIfneededMissingReturnsEmpty {
+    when: Evaluates("package ifneeded nosuchpkgxyz 9.9")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule PackageIfneededReplacesScriptForVersion {
+    -- Registering the same package/version again replaces the script.
+    when: Evaluates("package ifneeded rr 1.0 {set ::rr A}; package ifneeded rr 1.0 {set ::rr B}; package ifneeded rr 1.0")
+    ensures: completion.code = ok
+    ensures: completion.value = "set ::rr B"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule PackageIfneededVersionsListsRegistered {
+    -- versions lists ifneeded registrations in registration order.
+    when: Evaluates("package ifneeded ss 1.0 {}; package ifneeded ss 2.0 {}; package versions ss")
+    ensures: completion.code = ok
+    ensures: completion.value = "1.0 2.0"
+    -- probe: 2026-11-28 tclsh9.1; doc/package.n "versions"
+}
+
+rule PackageRequireScriptExpectingProvide {
+    -- A loader that never provides the package produces a stable error
+    -- naming the package and version.
+    when: Evaluates("package ifneeded qq 1.5 {}; catch {package require qq} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "attempt to provide package qq 1.5 failed: no version of package qq provided"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule PackageRequireSelectsHighestVersion {
+    -- With several acceptable ifneeded versions, require loads the
+    -- highest one.
+    when: Evaluates("package ifneeded tt 1.0 {package provide tt 1.0}; package ifneeded tt 2.0 {package provide tt 2.0}; package require tt")
+    ensures: completion.code = ok
+    ensures: completion.value = "2.0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule PackageRequireBoundedRequirement {
+    -- min-max is inclusive at min and exclusive at max; 1.5 is the
+    -- highest registered version below 2.0.
+    when: Evaluates("package ifneeded uu 1.0 {package provide uu 1.0}; package ifneeded uu 1.5 {package provide uu 1.5}; package ifneeded uu 2.0 {package provide uu 2.0}; package require uu 1.0-2.0")
+    ensures: completion.code = ok
+    ensures: completion.value = "1.5"
+    -- probe: 2026-11-28 tclsh9.1; doc/package.n REQUIREMENT
+}
+
+rule PackageRequireAcceptableAlternatives {
+    -- Requirement arguments are alternatives (OR), not a conjunction.
+    when: Evaluates("catch {package require Tcl 8.6 9.1} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "9.1.0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule PackageRequireUnsatisfiedAlternatives {
+    when: Evaluates("catch {package require Tcl 8.6 8.7} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "version conflict for package \"Tcl\": have 9.1.0, need 8.6 8.7"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── present / forget / names / files ─────────────────────────────
+
+rule PackagePresentDoesNotLoadIfneeded {
+    -- present only reports what is already provided; an ifneeded
+    -- registration alone is not present and its script is not run.
+    when: Evaluates("package ifneeded qq 1.5 {}; catch {package present qq} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "package qq is not present"
+    -- probe: 2026-11-28 tclsh9.1; doc/package.n "present"
+}
+
+rule PackageForgetDropsAllInformation {
+    -- forget removes both provided and ifneeded records and the name
+    -- disappears from the database.
+    when: Evaluates("package provide aa 1.0; package ifneeded aa 1.0 {}; package forget aa; list [package provide aa] [package versions aa] [expr {[lsearch -exact [package names] aa] >= 0}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {} 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule PackageForgetNoArgsIsNoOp {
+    when: Evaluates("package provide gg 1.0; package forget; package provide gg")
+    ensures: completion.code = ok
+    ensures: completion.value = "1.0"
+    -- probe: 2026-11-28 tclsh9.1 (no-arg forget changes nothing)
+}
+
+rule PackageNamesListsProvidedAndCore {
+    -- names membership is stable even though order is arbitrary.
+    when: Evaluates("package provide zz 1.0; list [expr {[lsearch -exact [package names] zz] >= 0}] [expr {[lsearch -exact [package names] Tcl] >= 0}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+    -- probe: 2026-11-28 tclsh9.1; doc/package.n "names"
+}
+
+rule PackageVersionsOfStaticCoreIsEmpty {
+    -- versions reports only ifneeded registrations; the statically
+    -- linked core has none.
+    when: Evaluates("package versions Tcl")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule PackageFilesOfStaticCoreIsEmpty {
+    -- files lists scripts sourced during package loading; the static
+    -- core has none. (msgcat's files are covered in interp.allium.)
+    when: Evaluates("package files Tcl")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+    -- probe: 2026-11-28 tclsh9.1; doc/package.n "files"
+}
+
+-- ── version arithmetic ───────────────────────────────────────────
+
+rule PackageVcompareOrdersVersions {
+    -- Component-wise comparison; trailing zero components are equal and
+    -- a/b prerelease letters sort before the plain version.
+    when: Evaluates("list [package vcompare 1.0 1.0] [package vcompare 1.2 1.10] [package vcompare 1.10 1.2] [package vcompare 1.3 1.3.0] [package vcompare 1.3a1 1.3]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 -1 1 0 -1"
+    -- probe: 2026-11-28 tclsh9.1; doc/package.n VERSION NUMBERS
+}
+
+rule PackageVcompareRejectsBadVersion {
+    when: Evaluates("catch {package vcompare a b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "expected version number but got \"a\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule PackageVsatisfiesRequirementForms {
+    -- Bounded [min,max), min-unbound, and legacy min-bounded forms.
+    when: Evaluates("list [package vsatisfies 1.5 1.0-2.0] [package vsatisfies 2.0 1.0-2.0] [package vsatisfies 2.0 1.0-] [package vsatisfies 1.0 1.0] [package vsatisfies 1.9 1.0]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 1 1 1"
+    -- probe: 2026-11-28 tclsh9.1; doc/package.n REQUIREMENT
+}
+
+rule PackageVsatisfiesAnyRequirement {
+    when: Evaluates("list [package vsatisfies 1.5 0.9 1.4] [package vsatisfies 1.5 0.9 2.0]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── prefer / unknown ────────────────────────────────────────────
+
+rule PackagePreferModeSelection {
+    -- stable is the initial mode; switching to latest permanently
+    -- overrides a later request for stable.
+    when: Evaluates("list [package prefer] [package prefer latest] [package prefer] [package prefer stable] [package prefer]")
+    ensures: completion.code = ok
+    ensures: completion.value = "stable latest latest latest latest"
+    -- probe: 2026-11-28 tclsh9.1; doc/package.n "prefer"
+}
+
+rule PackagePreferRejectsUnknownMode {
+    when: Evaluates("catch {package prefer foo} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad preference \"foo\": must be latest or stable"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule PackageUnknownGetSetClear {
+    -- The default last-resort handler is the core pkg-unknown command;
+    -- a new command replaces it, and an empty string clears it. The
+    -- setter itself returns the empty string.
+    when: Evaluates("list [string match {*tclPkgUnknown*} [package unknown]] [package unknown {myhandler}] [package unknown] [package unknown {}] [package unknown]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {} myhandler {} {}"
+    -- probe: 2026-11-28 tclsh9.1; doc/package.n "unknown"
+}
+
+rule PackageUnknownHandlerReceivesRequirement {
+    -- require appends the package name and requirement to the unknown
+    -- command; an unqualified require supplies the implicit "0-"
+    -- requirement.
+    when: Evaluates("set got {}; package unknown [list apply {{name args} {lappend ::got $name $args; package provide $name 7.0}}]; list [package require zzpkg] $got")
+    ensures: completion.code = ok
+    ensures: completion.value = "7.0 {zzpkg 0-}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule PackageBadOptionMenu {
+    when: Evaluates("catch {package gorp} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"gorp\": must be files, forget, ifneeded, names, prefer, present, provide, require, unknown, vcompare, versions, or vsatisfies"
+    -- probe: 2026-11-28 tclsh9.1 (9.1 adds present/vsatisfies)
+}
+
+-- ── auto_load family ────────────────────────────────────────────
+
+rule AutoLoadLoadsFromAutoIndex {
+    -- auto_load evaluates the matching auto_index entry and reports 1
+    -- once the command exists.
+    when: Evaluates("set auto_index(foo) {proc foo {} {return loaded}}; list [auto_load foo] [foo]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 loaded"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule AutoLoadMissingReturnsZero {
+    when: Evaluates("auto_load nosuchcmdxyz")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule AutoLoadQualifiesInNamespace {
+    -- The optional namespace argument controls the qualified names tried.
+    when: Evaluates("set auto_index(foo) {proc foo {} {return ok}}; list [auto_load foo ::] [foo]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 ok"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule AutoLoadWrongArgs {
+    when: Evaluates("catch {auto_load} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"auto_load cmd ?namespace?\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule AutoImportRequiresNamespacePattern {
+    -- auto_import only acts on patterns containing "::"; it loads every
+    -- matching namespaced auto_index command not already defined and
+    -- returns the empty string.
+    when: Evaluates("namespace eval ::ns {}; set auto_index(::ns::foo) {proc ::ns::foo {} {return ok}}; list [auto_import ::ns::*] [::ns::foo]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} ok"
+    -- probe: 2026-11-28 tclsh9.1 (proc body of auto_import)
+}
+
+rule AutoImportIgnoresUnqualifiedPattern {
+    when: Evaluates("set auto_index(foo) {proc foo {} {return ok}}; list [auto_import foo*] [info commands foo]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule AutoImportWrongArgs {
+    when: Evaluates("catch {auto_import} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"auto_import pattern\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule AutoLoadIndexScansOnce {
+    -- The index scan reports 1 the first time and 0 while auto_path is
+    -- unchanged; clearing the cache forces a rescan.
+    when: Evaluates("unset -nocomplain ::tcl::auto_oldpath; list [auto_load_index] [auto_load_index]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+    -- probe: 2026-11-28 tclsh9.1 (auto_load_index returns a boolean)
+}
+
+rule AutoExecokFindsExecutable {
+    -- auto_execok resolves a command name to an executable path and
+    -- returns the tail name unchanged.
+    when: Evaluates("list [expr {[string length [auto_execok ls]] > 0}] [file tail [auto_execok ls]] [file executable [auto_execok ls]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 ls 1"
+    -- probe: 2026-11-28 tclsh9.1 (path itself is environment-specific)
+}
+
+rule AutoExecokReturnsEmptyForNonExecutables {
+    -- Missing names, shell built-ins, and multi-word arguments all
+    -- resolve to the empty string.
+    when: Evaluates("list [auto_execok nosuchprogxyz] [auto_execok cd] [auto_execok {ls -l}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {} {}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule AutoExecokWrongArgs {
+    when: Evaluates("catch {auto_execok} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"auto_execok arg\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule AutoQualifyResolvesNames {
+    -- Global namespace keeps the bare name; a namespace yields the
+    -- qualified name first and the bare fallback second; already
+    -- qualified names are returned as-is (leading :: stripped for a
+    -- single-component name).
+    when: Evaluates("list [auto_qualify foo ::] [auto_qualify foo ::a::b] [auto_qualify {foo bar} ::a] [auto_qualify ::foo ::a] [auto_qualify {} ::a]")
+    ensures: completion.code = ok
+    ensures: completion.value = "foo {::a::b::foo foo} {{::a::foo bar} {foo bar}} foo {::a:: {}}"
+    -- probe: 2026-11-28 tclsh9.1 (proc body of auto_qualify)
+}
+
+-- ── load / unload ───────────────────────────────────────────────
+
+rule LoadMissingSharedLibraryErrors {
+    -- The message keeps the OS loader detail, so only the stable prefix
+    -- (position + file name) is pinned.
+    when: Evaluates("catch {load /nonexistent/libfoo.so} m; string match {couldn't load file \"/nonexistent/libfoo.so\":*} $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: 2026-11-28 tclsh9.1; doc/load.n
+}
+
+rule LoadWrongArgs {
+    when: Evaluates("catch {load} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"load ?-global? ?-lazy? ?--? fileName ?prefix? ?interp?\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule UnloadNotLoadedErrors {
+    when: Evaluates("catch {unload /nonexistent/libfoo.so} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "file \"/nonexistent/libfoo.so\" has never been loaded"
+    -- probe: 2026-11-28 tclsh9.1; doc/unload.n
+}
+
+rule UnloadWrongArgs {
+    when: Evaluates("catch {unload} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"unload ?-switch ...? fileName ?prefix? ?interp?\""
+    -- probe: 2026-11-28 tclsh9.1
+}

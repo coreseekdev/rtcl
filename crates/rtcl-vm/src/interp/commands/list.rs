@@ -121,6 +121,11 @@ pub(crate) fn tcl_get_int(s: &str) -> Option<i64> {
 pub(crate) const MAX_VALUE_BYTES: usize = i32::MAX as usize;
 pub(crate) const MAX_LIST_ELEMENTS: usize = 536870909;
 
+/// Small series windows/results keep the eager (materialized) path; only
+/// larger results stay lazy.  This gives both implementations and keeps
+/// ordinary-sized results indistinguishable from a normal list.
+const SERIES_EAGER_MAX: i64 = 4096;
+
 /// tclsh 9.1.0（x86-64）的 `LIST_MAX`：tclInt.h 的
 /// `(TCL_SIZE_MAX - offsetof(ListStore, slots)) / sizeof(Tcl_Obj *)`，
 /// 实测 `lrepeat 9223372036854775807 x` 报
@@ -433,6 +438,15 @@ pub fn cmd_lrange(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         let first = first_raw.max(0);
         let last = last_raw.min(len as i64 - 1);
         if first <= last && (first as usize) < len {
+            let count = last - first + 1;
+            if count <= SERIES_EAGER_MAX {
+                // Non-lazy version for ordinary-sized windows.
+                let mut out = Vec::with_capacity(count as usize);
+                for i in first..=last {
+                    out.push(s.element(i));
+                }
+                return Ok(Value::from_list(&out));
+            }
             return Ok(Value::from_series(s.slice(first, last)));
         }
         return Ok(Value::empty());
@@ -531,6 +545,14 @@ pub fn cmd_lassign(interp: &mut Interp, args: &[Value]) -> Result<Value> {
             interp.set_var(var, value)?;
         }
         if len > vars.len() as i64 {
+            let rest = len - vars.len() as i64;
+            if rest <= SERIES_EAGER_MAX {
+                let mut out = Vec::with_capacity(rest as usize);
+                for i in vars.len() as i64..len {
+                    out.push(s.element(i));
+                }
+                return Ok(Value::from_list(&out));
+            }
             return Ok(Value::from_series(s.slice(vars.len() as i64, len - 1)));
         }
         return Ok(Value::empty());
@@ -604,6 +626,14 @@ pub fn cmd_lreverse(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         return Err(wrong_args("lreverse", "list"));
     }
     if let Some(s) = args[1].series() {
+        if s.len <= SERIES_EAGER_MAX {
+            // Non-lazy version for ordinary-sized series.
+            let mut out = Vec::with_capacity(s.len.max(0) as usize);
+            for i in (0..s.len).rev() {
+                out.push(s.element(i));
+            }
+            return Ok(Value::from_list(&out));
+        }
         return Ok(Value::from_series(s.reverse()));
     }
     let mut list = strict_list(interp, &args[1])?;
@@ -1694,6 +1724,7 @@ pub fn cmd_lsubst(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use crate::interp::Interp;
+    use crate::value::{SeriesRep, Value};
     use super::{concat_trim, parse_tcl_index};
 
     // --- parse_tcl_index: Tcl 8.6 index grammar (all values probed) ---
@@ -1881,6 +1912,49 @@ mod tests {
         assert_eq!(
             interp.eval("foreach x [lseq 0x7fffffff] {if {$x > 2} break; set x}; set x").unwrap().as_str(),
             "3"
+        );
+    }
+
+    fn series(start: i64, step: i64, len: i64) -> Value {
+        Value::from_series(SeriesRep {
+            is_double: false,
+            start,
+            step,
+            dstart: 0.0,
+            dstep: 1.0,
+            len,
+            precision: 0,
+        })
+    }
+
+    #[test]
+    fn test_series_lazy_and_eager_paths_agree() {
+        let mut interp = Interp::new();
+        // Small series: operations take the eager (non-lazy) path.
+        let small = series(0, 2, 10);
+        assert_eq!(
+            small.as_list().unwrap().iter().map(|v| v.as_str().to_string()).collect::<Vec<_>>(),
+            vec!["0", "2", "4", "6", "8", "10", "12", "14", "16", "18"]
+        );
+        interp.set_var("s", small).unwrap();
+        assert_eq!(interp.eval("lrange $s 2 4").unwrap().as_str(), "4 6 8");
+        assert_eq!(interp.eval("lreverse $s").unwrap().as_str(), "18 16 14 12 10 8 6 4 2 0");
+        assert_eq!(interp.eval("lsearch $s 6").unwrap().as_str(), "3");
+        assert_eq!(
+            interp.eval("set rest [lassign $s a b]; list $a $b $rest").unwrap().as_str(),
+            "0 2 {4 6 8 10 12 14 16 18}"
+        );
+
+        // Large series: large results stay lazy, small windows stay eager,
+        // and both agree with direct indexing.
+        let big = series(0, 1, 100_000);
+        interp.set_var("b", big).unwrap();
+        assert_eq!(interp.eval("lrange $b 0 3").unwrap().as_str(), "0 1 2 3");
+        assert_eq!(interp.eval("llength [lrange $b 0 end]").unwrap().as_str(), "100000");
+        assert_eq!(interp.eval("lindex [lrange $b 0 end] 99999").unwrap().as_str(), "99999");
+        assert_eq!(
+            interp.eval("list [lindex [lreverse $b] 0] [llength [lreverse $b]]").unwrap().as_str(),
+            "99999 100000"
         );
     }
 }

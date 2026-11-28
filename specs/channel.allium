@@ -1,0 +1,249 @@
+-- allium: 3
+-- channel.allium
+-- Behaviour spec: the deeper chan ensemble, reflected and transform
+-- channels, chan copy/fcopy, pipes, and socket option/accept surface.
+-- Base channel rules (open/puts/gets/read/seek/eof/close/fconfigure and
+-- chan names/isbinary) live in io.allium and are not repeated here.
+-- Oracle: tclsh 9.1.0 (core-9-1-0). Probed 2026-11-28.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── chan ensemble surface ───────────────────────────────────────
+-- probe: 2026-11-28 tclsh9.1; doc/chan.n.
+
+rule ChanSubcommandMenu {
+    when: Evaluates("catch {chan gorp} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown or ambiguous subcommand \"gorp\": must be blocked, close, configure, copy, create, eof, event, flush, gets, isbinary, names, pending, pipe, pop, postevent, push, puts, read, seek, tell, or truncate"
+}
+
+rule ChanNoArgsArity {
+    when: Evaluates("catch {chan} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"chan subcommand ?arg ...?\""
+}
+
+-- ── chan pipe / chan event ──────────────────────────────────────
+
+rule ChanPipeReturnsConnectedPair {
+    -- chan pipe returns two file* channels wired to the same pipe; bytes
+    -- written on the write end are readable on the read end.
+    when: Evaluates("lassign [chan pipe] r w; puts -nonewline $w hi; flush $w; set got [read $r 2]; set rn [string match file* $r]; set wn [string match file* $w]; close $r; close $w; list $got $rn $wn")
+    ensures: completion.code = ok
+    ensures: completion.value = "hi 1 1"
+}
+
+rule ChanEventIsFileeventAlias {
+    -- chan event is the ensemble spelling of fileevent: the handler runs on
+    -- readability and stays registered until replaced or removed.
+    when: Evaluates("lassign [chan pipe] r w; chan event $r readable {set ::ev 1}; puts -nonewline $w x; flush $w; vwait ::ev; set q [chan event $r readable]; close $r; close $w; list $q $::ev")
+    ensures: completion.code = ok
+    ensures: completion.value = "{set ::ev 1} 1"
+}
+
+-- ── position / truncate / pending ───────────────────────────────
+
+rule ChanTellTracksAndSeekMovesPosition {
+    -- chan tell reports the shared channel position; chan seek changes it.
+    when: Evaluates("set f [open /tmp/rtcl_spec_chtell.txt w+]; puts -nonewline $f abc; flush $f; set a [chan tell $f]; chan seek $f 1; set b [chan tell $f]; close $f; list $a $b")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 1"
+}
+
+rule ChanTruncateCutsFileWithoutMovingPosition {
+    -- chan truncate cuts at the given length but does not move the access
+    -- position (still 6 after truncating a 6-byte file to 2).
+    when: Evaluates("set f [open /tmp/rtcl_spec_chtr.txt w+]; puts -nonewline $f abcdef; flush $f; set r [chan truncate $f 2]; set s [file size /tmp/rtcl_spec_chtr.txt]; set p [chan tell $f]; close $f; list $r $s $p")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 2 6"
+}
+
+rule ChanPendingReportsBufferedData {
+    -- chan pending input counts buffered input bytes (0 for a fresh file);
+    -- pending output is -1 on a channel with no output queue.
+    when: Evaluates("set f [open /tmp/rtcl_spec_chpend.txt w]; close $f; set f [open /tmp/rtcl_spec_chpend.txt r]; set r [list [chan pending input $f] [chan pending output $f] [chan blocked $f]]; close $f; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 -1 0"
+}
+
+rule ChanPendingBadModeMenu {
+    when: Evaluates("catch {chan pending foo stdin} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad mode \"foo\": must be input or output"
+}
+
+rule ChanConfigureHasNoInputmodeOption {
+    -- 9.1 does not offer -inputmode; the bad-option message lists the real
+    -- channel option table (io.allium pins the values themselves).
+    when: Evaluates("set f [open /tmp/rtcl_spec_chim.txt w]; catch {chan configure $f -inputmode x} m; close $f; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"-inputmode\": should be one of -blocking, -buffering, -buffersize, -encoding, -eofchar, -profile, or -translation"
+}
+
+-- ── reflected channels (chan create) ────────────────────────────
+-- probe: 2026-11-28 tclsh9.1; doc/refchan.n.
+
+rule ChanCreateRejectsBadMode {
+    -- The mode must be a list of read and/or write.
+    when: Evaluates("catch {chan create x {}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad mode \"x\": must be read or write"
+}
+
+rule ChanCreateRequiresMandatoryMethods {
+    -- initialize must advertise initialize, finalize and watch; a handler
+    -- missing them aborts channel creation.
+    when: Evaluates("proc h {m args} {return {}}; catch {chan create read h} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "chan handler \"h\" does not support all required methods"
+}
+
+rule ChanCreateHandlerErrorAborts {
+    -- An error thrown by initialize is the error of chan create and no
+    -- channel handle is left behind.
+    when: Evaluates("proc h {m args} {error boom}; catch {chan create read h} m; list $m [info commands rc*]")
+    ensures: completion.code = ok
+    ensures: completion.value = "boom {}"
+}
+
+rule ChanCreateReflectedWriteChannel {
+    -- A write reflected channel forwards each buffered chunk to the
+    -- handler's write method (channel buffer, not our string), and a
+    -- write-only reflected channel has no tell position.
+    when: Evaluates("proc wh {m args} {if {$m eq \"initialize\"} {return {initialize finalize write watch}}; if {$m eq \"write\"} {set ::cap [lindex $args 1]; return [string length $::cap]}; return}; set ::cap {}; set c [chan create write wh]; puts -nonewline $c hello; flush $c; set r [list $::cap [chan tell $c]]; close $c; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "hello -1"
+}
+
+rule ChanCreateReflectedReadChannel {
+    -- A read reflected channel returns handler chunks through the normal
+    -- channel buffer; an empty handler result is EOF.
+    when: Evaluates("proc rh {m args} {if {$m eq \"initialize\"} {return {initialize finalize read watch}}; if {$m eq \"read\"} {set n [lindex $args 1]; set t [expr {min($n,[string length $::buf])}]; set out [string range $::buf 0 [expr {$t-1}]]; set ::buf [string range $::buf $t end]; return $out}; return}; set ::buf abcdef; set ch [chan create read rh]; set a [read $ch 3]; set b [read $ch 3]; set d [read $ch 3]; set e [eof $ch]; close $ch; list $a $b $d $e")
+    ensures: completion.code = ok
+    ensures: completion.value = "abc def {} 1"
+}
+
+rule ChanPosteventRejectsRegularChannel {
+    -- Only channels made by chan create are reflected; postevent on a core
+    -- channel names that restriction.
+    when: Evaluates("catch {chan postevent stdout read} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "can not find reflected channel named \"stdout\""
+}
+
+rule ChanPosteventRequiresWatchInterest {
+    -- postevent may only report events the core has registered interest in
+    -- via watch; an empty event list is rejected separately.
+    when: Evaluates("proc wh {m args} {if {$m eq \"initialize\"} {return {initialize finalize write watch}}; if {$m eq \"write\"} {return [string length [lindex $args 1]]}; return}; set c [chan create write wh]; set a [catch {chan postevent $c read} m]; set b [catch {chan postevent $c {}} m2]; close $c; list $a [string match {tried to post events channel*} $m] $b $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 {bad event list: is empty}"
+}
+
+-- ── transform channels (chan push/pop) ──────────────────────────
+-- probe: 2026-11-28 tclsh9.1; doc/transchan.n.
+
+rule ChanPushTransformRewritesReads {
+    -- chan push installs a read transform over the underlying channel; the
+    -- handler receives the raw chunk and its result is what the reader sees.
+    when: Evaluates("proc th {m args} {if {$m eq \"initialize\"} {return {initialize finalize read write}}; if {$m eq \"read\"} {return [string toupper [lindex $args 1]]}; if {$m eq \"write\"} {return [string length [lindex $args 1]]}; return}; set f [open /tmp/rtcl_spec_chpush.txt w+]; puts -nonewline $f abc; seek $f 0; chan push $f th; set out [read $f]; chan pop $f; close $f; set out")
+    ensures: completion.code = ok
+    ensures: completion.value = "ABC"
+}
+
+rule ChanPopRemovesTransform {
+    -- chan pop removes the topmost transform; the same bytes then read
+    -- through unchanged, and the channel stays open.
+    when: Evaluates("proc th {m args} {if {$m eq \"initialize\"} {return {initialize finalize read write}}; if {$m eq \"read\"} {return [string toupper [lindex $args 1]]}; if {$m eq \"write\"} {return [string length [lindex $args 1]]}; return}; set f [open /tmp/rtcl_spec_chpop.txt w+]; puts -nonewline $f abc; seek $f 0; chan push $f th; set a [read $f]; chan seek $f 0; chan pop $f; set b [read $f]; close $f; list $a $b")
+    ensures: completion.code = ok
+    ensures: completion.value = "ABC abc"
+}
+
+-- ── copy — chan copy / fcopy ────────────────────────────────────
+-- probe: 2026-11-28 tclsh9.1; doc/chan.n, doc/fcopy.n.
+
+rule ChanCopySizeLimitsAndReturnsCount {
+    -- -size bounds the copy; both positions advance by exactly the number
+    -- of bytes copied and the remainder stays unread.
+    when: Evaluates("set in [open /tmp/rtcl_spec_cpin.txt w+]; puts -nonewline $in abcdefgh; seek $in 0; set out [open /tmp/rtcl_spec_cpout.txt w+]; set n [chan copy $in $out -size 3]; set p [chan tell $in]; chan seek $out 0; set s [read $out]; close $in; close $out; list $n $p $s")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 3 abc"
+}
+
+rule ChanCopyCommandCallbackReceivesByteCount {
+    -- With -command the copy is asynchronous: chan copy returns empty and
+    -- the callback receives the byte count plus an optional error argument.
+    when: Evaluates("set in [open /tmp/rtcl_spec_cpin.txt r]; set out [open /tmp/rtcl_spec_cpout2.txt w+]; set ::cb {}; chan copy $in $out -command {apply {{n args} {set ::cb [list $n $args]}}}; vwait ::cb; close $in; close $out; set ::cb")
+    ensures: completion.code = ok
+    ensures: completion.value = "8 {}"
+}
+
+rule ChanCopyBadOptionArity {
+    -- Unknown trailing words fail the command arity, not option parsing.
+    when: Evaluates("set in [open /tmp/rtcl_spec_cpin.txt r]; set out [open /tmp/rtcl_spec_cpout3.txt w]; catch {chan copy $in $out -foo} m; close $in; close $out; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"chan copy input output ?-size size? ?-command callback?\""
+}
+
+rule FcopyCopiesWholeChannel {
+    -- fcopy is the legacy spelling; without -size it copies to EOF and
+    -- returns the byte count.
+    when: Evaluates("set in [open /tmp/rtcl_spec_cpin.txt r]; set out [open /tmp/rtcl_spec_fcout.txt w+]; set n [fcopy $in $out]; set p [chan tell $out]; close $in; close $out; list $n $p")
+    ensures: completion.code = ok
+    ensures: completion.value = "8 8"
+}
+
+rule FcopySizeLimitsCopy {
+    -- fcopy -size N copies N bytes and leaves the input positioned there.
+    when: Evaluates("set in [open /tmp/rtcl_spec_cpin.txt r]; set out [open /tmp/rtcl_spec_fcout2.txt w+]; set n [fcopy $in $out -size 2]; set p [chan tell $in]; close $in; close $out; list $n $p")
+    ensures: completion.code = ok
+    ensures: completion.value = "2 2"
+}
+
+-- ── socket: options, sockname and accept ────────────────────────
+-- probe: 2026-11-28 tclsh9.1 loopback, ephemeral port 0;
+-- doc/socket.n. -nodelay/-keepalive are pinned in io.allium.
+
+rule SocketServerSocknameLoopback {
+    -- -myaddr binds the listening socket; port 0 asks the OS for an
+    -- ephemeral port, reported at index 2 of -sockname.
+    when: Evaluates("proc a {c h p} {close $c}; set srv [socket -server a -myaddr 127.0.0.1 0]; set sn [fconfigure $srv -sockname]; close $srv; list [lindex $sn 0] [expr {[lindex $sn 2] > 0}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "127.0.0.1 1"
+}
+
+rule SocketAcceptCallbackGetsClientAddress {
+    -- The accept callback receives the peer host, peer port and the
+    -- channel; the server side's -peername is the client's local address,
+    -- while its -sockname is the listening port and the client's
+    -- -peername is that same server port.
+    when: Evaluates("proc acc {c h p} {set ::acc [list $h $p [lindex [fconfigure $c -peername] 2] [lindex [fconfigure $c -sockname] 2]]; close $c}; set srv [socket -server acc -myaddr 127.0.0.1 0]; set sp [lindex [fconfigure $srv -sockname] 2]; set cli [socket 127.0.0.1 $sp]; vwait ::acc; set my [lindex [fconfigure $cli -sockname] 2]; set peer [lindex [fconfigure $cli -peername] 2]; close $cli; close $srv; list [lindex $::acc 0] [expr {[lindex $::acc 1] == $my}] [expr {$peer == $sp}] [expr {[lindex $::acc 2] == $my}] [expr {[lindex $::acc 3] == $sp}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "127.0.0.1 1 1 1 1"
+}
+
+rule SocketOptionMenu {
+    when: Evaluates("catch {socket -foo} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"-foo\": must be -async, -backlog, -myaddr, -myport, -reuseaddr, -reuseport, or -server"
+}
+
+rule SocketServerNeedsArgument {
+    when: Evaluates("catch {socket -server} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "no argument given for -server option"
+}
+
+rule SocketPortMustBeInteger {
+    when: Evaluates("catch {socket 127.0.0.1 abc} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "expected integer but got \"abc\""
+}
+
+-- Not pinned here: -async connection timing, -backlog/-reuseaddr OS
+-- behaviour, socket handle transfer, and chan copy's "channel busy"
+-- cross-call state (needs a live background copy whose interleaving is
+-- scheduler-dependent).

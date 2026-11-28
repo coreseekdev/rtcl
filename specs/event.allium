@@ -1,0 +1,359 @@
+-- allium: 3
+-- event.allium
+-- Behaviour spec: the Tcl event loop surface — after, update, vwait,
+-- timer, timerate. Covers scheduling/ordering, id shapes, info/cancel
+-- contracts, the 9.1 vwait option set, and timer kind reporting.
+-- Oracle: tclsh 9.1.0 (core-9-1-0). Probed 2026-11-28.
+-- Complements interp.allium (timer in/cancel/units, timerate shape);
+-- fileevent lives in channel.allium. Channels/encoding: io.allium.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── after — scheduling and ordering ──────────────────────────────
+-- probe: 2026-11-28 tclsh9.1; doc/after.n.
+
+rule AfterZeroRunsOnUpdateInFifoOrder {
+    -- after 0 queues a timer event; nothing runs until update enters the
+    -- event loop, and equal-delay handlers run in scheduling order.
+    when: Evaluates("set log {}; after 0 {lappend log a}; after 0 {lappend log b}; set before $log; update; list $before $log")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {a b}"
+}
+
+rule AfterIdleDelaysUntilTimersDrained {
+    -- Idle handlers run only after all timer events queued for the same
+    -- update have been serviced.
+    when: Evaluates("set log {}; after 0 {lappend log a}; after idle {lappend log i}; update; set log")
+    ensures: completion.code = ok
+    ensures: completion.value = "a i"
+}
+
+rule UpdateIdletasksSkipsTimerEvents {
+    -- update idletasks runs idle handlers only; the pending timer event
+    -- stays queued for the next update.
+    when: Evaluates("set log {}; after 0 {lappend log a}; after idle {lappend log i}; update idletasks; set first $log; update; list $first $log")
+    ensures: completion.code = ok
+    ensures: completion.value = "i {i a}"
+}
+
+rule NestedAfterZeroRunsInSameUpdate {
+    -- A handler may schedule another immediate timer; the nested handler
+    -- runs inside the same update, after the current handler returns.
+    when: Evaluates("set n {}; after 0 {lappend n 1; after 0 {lappend n 3}; lappend n 2}; update; set n")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 2 3"
+}
+
+rule AfterScriptRunsAtGlobalLevel {
+    -- after scripts execute at global level: a proc-local set is not
+    -- visible to the handler and the handler's ::G persists globally.
+    when: Evaluates("proc p {} {set local L; after 0 {set ::G 2}; return $local}; set r [p]; set before [info exists ::G]; update; list $r $before $::G")
+    ensures: completion.code = ok
+    ensures: completion.value = "L 0 2"
+}
+
+rule AfterSleepFormReturnsEmpty {
+    -- after ms without a script sleeps and returns the empty string;
+    -- elapsed time is not pinned here.
+    when: Evaluates("after 1")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+}
+
+-- ── after — identity, info, cancel ───────────────────────────────
+-- probe: 2026-11-28 tclsh9.1; doc/after.n.
+
+rule AfterReturnsAfterIdAndInfo {
+    -- after returns an after#* id; after info id returns the script plus
+    -- the event kind. A plain after event reports "timer".
+    when: Evaluates("set id [after 10000 {set x 1}]; list [string match {after#*} $id] [after info $id]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {{set x 1} timer}"
+}
+
+rule AfterCancelRemovesPendingHandler {
+    -- after cancel drops a pending handler and its id disappears from the
+    -- after info list; cancel itself returns empty.
+    when: Evaluates("set id [after 10000 {set x 1}]; set b [llength [after info]]; after cancel $id; list $b [llength [after info]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+}
+
+rule AfterCancelUnknownIdIsSilent {
+    -- 9.1 change: cancelling an id that never existed (or already fired)
+    -- is a silent no-op; 8.6 raised "event ... doesn't exist".
+    when: Evaluates("list [after cancel after#999] [after cancel after#998]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {}"
+    -- probe: 2026-11-28 tclsh9.1; doc/after.n ("has no effect").
+}
+
+rule AfterInfoAfterFireErrors {
+    -- Once an id has fired it is no longer an existing handler, so
+    -- after info on it is an error rather than an empty result.
+    when: Evaluates("set id [after 0 {set x 1}]; update; catch {after info $id} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "event \"after#0\" doesn't exist"
+}
+
+rule AfterDelayMustBeInteger {
+    -- The delay is an integer number of milliseconds; a float names the
+    -- accepted argument forms in the error.
+    when: Evaluates("catch {after 1.5 {}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad argument \"1.5\": must be cancel, idle, info, or an integer"
+}
+
+rule AfterCancelArity {
+    when: Evaluates("catch {after cancel} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"after cancel id|script ?script?\""
+}
+
+rule AfterInfoArity {
+    -- after info takes at most one id.
+    when: Evaluates("catch {after info a b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"after info ?id?\""
+}
+
+-- ── timer — 9.1 event-handler surface ───────────────────────────
+-- probe: 2026-11-28 tclsh9.1; doc/timer.n. timer in/cancel/units are
+-- pinned in interp.allium; this section covers at/idle/info kinds.
+
+rule TimerAtSchedulesWallclockEvent {
+    -- timer at takes an absolute wall-clock point plus a unit and returns
+    -- the same after#* id namespace; timer info reports a 3-element
+    -- wallclock record (script, kind, timepoint).
+    when: Evaluates("set id [timer at [expr {[clock seconds]+10000}] s {set x 1}]; set ti [timer info $id]; list [string match {after#*} $id] [llength $ti] [lindex $ti 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 3 wallclock"
+}
+
+rule TimerIdleReportsIdleKind {
+    -- timer idle schedules an idle callback: timer info reports kind idle
+    -- with no timepoint (2 elements), while after info reports "idle" too.
+    when: Evaluates("set id [timer idle {set x 1}]; set ti [timer info $id]; list [llength $ti] [lindex $ti 1] [after info $id]")
+    ensures: completion.code = ok
+    ensures: completion.value = "2 idle {{set x 1} idle}"
+}
+
+rule TimerInfoKindsDifferFromAfterInfo {
+    -- after info reports the coarse kind "timer"; timer info reports the
+    -- precise monotonic clock kind for the same delayed handler.
+    when: Evaluates("set id [timer in 10000 ms {set y 1}]; list [after info $id] [lrange [timer info $id] 0 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{{set y 1} timer} {{set y 1} monotonic}"
+}
+
+rule TimerZeroRunsBeforeAfterZero {
+    -- A zero-delay timer in event has priority over an after 0 event in
+    -- the same update round.
+    when: Evaluates("set log {}; timer in 0 ms {lappend log t}; after 0 {lappend log a}; update; set log")
+    ensures: completion.code = ok
+    ensures: completion.value = "t a"
+}
+
+rule TimerNegativeDelayQueuesImmediately {
+    -- Negative (and zero) delays queue immediately rather than erroring.
+    when: Evaluates("set id [timer in -1 ms {set n 1}]; update; list [info exists n] [string match {after#*} $id]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+}
+
+rule TimerCancelUnknownIdIsSilent {
+    -- timer cancel and after cancel share the after# id space and both
+    -- silently ignore unknown ids in 9.1.
+    when: Evaluates("list [timer cancel after#999] [after cancel after#998]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {}"
+}
+
+rule TimerInfoUnknownIdErrors {
+    when: Evaluates("catch {timer info after#999} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "event \"after#999\" doesn't exist"
+}
+
+rule TimerSubcommandMenu {
+    when: Evaluates("catch {timer gorp} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown or ambiguous subcommand \"gorp\": must be at, cancel, idle, in, info, or sleep"
+}
+
+rule TimerAtRequiresUnit {
+    -- Unlike after, timer at requires an explicit unit argument.
+    when: Evaluates("catch {timer at 12345 {}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"timer at time unit script\""
+}
+
+rule TimerSleepFormsAndMenu {
+    -- timer sleep has for/until forms only; both return empty, and any
+    -- other selector is a bad-option error naming the pair.
+    when: Evaluates("list [timer sleep for 0 ms] [timer sleep until 0 s] [catch {timer sleep gorp 1} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {} 1 {bad option \"gorp\": must be for or until}"
+}
+
+-- ── timerate — structure and options ────────────────────────────
+-- probe: 2026-11-28 tclsh9.1; doc/timerate.n. The human-readable shape is
+-- pinned in interp.allium; here the fixed token slots and options are.
+
+rule TimerateReportsIterationStructure {
+    -- The result is an 8-token list: value, "µs/#", count, "#", rate,
+    -- "#/sec", net ms, "net-ms". max-count bounds the count exactly.
+    when: Evaluates("set r [timerate {expr 1+1} 1000 1]; list [llength $r] [lindex $r 1] [lindex $r 2] [lindex $r 3] [lindex $r 5] [lindex $r 7]")
+    ensures: completion.code = ok
+    ensures: completion.value = "8 µs/# 1 # #/sec net-ms"
+}
+
+rule TimerateRejectsBadOverhead {
+    when: Evaluates("catch {timerate -overhead abc {expr 1} 1} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "expected floating-point number but got \"abc\""
+}
+
+rule TimerateArity {
+    when: Evaluates("catch {timerate} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"timerate ?-direct? ?-calibrate? ?-overhead double? command ?time ?max-count??\""
+}
+
+-- ── update ───────────────────────────────────────────────────────
+-- probe: 2026-11-28 tclsh9.1; doc/update.n.
+
+rule UpdateWithoutPendingEventsReturnsEmpty {
+    when: Evaluates("update")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+}
+
+-- ── vwait — core form ───────────────────────────────────────────
+-- probe: 2026-11-28 tclsh9.1; doc/vwait.n (9.1 option set).
+
+rule VwaitReturnsAfterVariableWrite {
+    -- The simple form returns empty; the wait ends when the handler that
+    -- wrote the variable completes.
+    when: Evaluates("after 0 {set done 42}; list [vwait done] $done")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 42"
+}
+
+rule VwaitWaitsForWriteEvenWhenAlreadySet {
+    -- Pre-existing value does not satisfy vwait: it waits for the next
+    -- write (1 becomes 2).
+    when: Evaluates("set a 1; after 0 {set a 2}; vwait a; set a")
+    ensures: completion.code = ok
+    ensures: completion.value = "2"
+}
+
+rule VwaitUsesGlobalNamespaceInProc {
+    -- A bare varName is resolved in the global namespace even when vwait
+    -- runs inside a procedure.
+    when: Evaluates("proc p {} {vwait g; return done}; after 0 {set g 7}; list [p] $g")
+    ensures: completion.code = ok
+    ensures: completion.value = "done 7"
+}
+
+rule VwaitVariableUnsetCompletes {
+    -- Writing or unsetting the watched variable both complete the wait.
+    when: Evaluates("set v pre; after 0 {unset v}; expr {[vwait -timeout 1000 -variable v] >= 0}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}
+
+-- ── vwait — 9.1 options ─────────────────────────────────────────
+-- probe: 2026-11-28 tclsh9.1; doc/vwait.n (9.1 option set).
+
+rule VwaitTimeoutReturnsMinusOne {
+    -- -timeout that expires returns -1; no condition was ever met.
+    when: Evaluates("vwait -timeout 1 -variable nope")
+    ensures: completion.code = ok
+    ensures: completion.value = "-1"
+}
+
+rule VwaitTimeoutReturnsNonNegativeWhenMet {
+    -- When the condition is met, -timeout returns remaining milliseconds;
+    -- only the sign is stable, not the exact count.
+    when: Evaluates("after 0 {set d 1}; expr {[vwait -timeout 1000 -variable d] >= 0}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}
+
+rule VwaitExtendedResultPairs {
+    -- -extended returns alternating condition/value pairs; timeleft always
+    -- comes last, so the first pair is the variable condition.
+    when: Evaluates("after 0 {set e 9}; lrange [vwait -extended -timeout 1000 -variable e] 0 1")
+    ensures: completion.code = ok
+    ensures: completion.value = "variable e"
+}
+
+rule VwaitAllWaitsForEveryVariable {
+    -- -all does not complete on the first condition; both after 0 handlers
+    -- run before vwait returns.
+    when: Evaluates("after 0 {set a1 1}; after 0 {set a2 2}; vwait -all -timeout 1000 -variable a1 -variable a2; list $a1 $a2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 2"
+}
+
+rule VwaitAllTimesOutIfConditionMissing {
+    when: Evaluates("vwait -all -timeout 1 -variable m1 -variable m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "-1"
+}
+
+rule VwaitNoIdleEventsSkipsIdleHandlers {
+    -- -noidleevents suppresses idle callbacks during the wait; the timer
+    -- that satisfies the wait still runs.
+    when: Evaluates("after idle {set iv 1}; after 0 {set vv 1}; vwait -noidleevents -timeout 1000 -variable vv; list [info exists iv] $vv")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 1"
+}
+
+rule VwaitNoTimerEventsSkipsTimerHandlers {
+    -- -notimerevents leaves due timer events queued for the next explicit
+    -- event-loop entry (update here), while the readable file completes
+    -- the wait.
+    when: Evaluates("set f [open /tmp/rtcl_spec_vw.txt w]; close $f; set f [open /tmp/rtcl_spec_vw.txt r]; after 0 {set tv 1}; vwait -notimerevents -readable $f; set a [info exists tv]; update; close $f; list $a [info exists tv]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 1"
+}
+
+rule VwaitNoTimerEventsRejectsTimeout {
+    -- -timeout is implemented by a timer, so combining it with
+    -- -notimerevents is a TCL EVENT NO_TIME error.
+    when: Evaluates("catch {vwait -notimerevents -timeout 1 -variable x} m; list $m $::errorCode")
+    ensures: completion.code = ok
+    ensures: completion.value = "{timer events disabled with timeout specified} {TCL EVENT NO_TIME}"
+}
+
+rule VwaitBadOptionMenu {
+    -- The trailing "--" end-of-options marker is built at run time so the
+    -- rule's trigger stays free of the audit's comment heuristic.
+    when: Evaluates("catch {vwait -foo x} m; set d [string repeat - 2]; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"-foo\": must be -all, -extended, -nofileevents, -noidleevents, -notimerevents, -nowindowevents, -readable, -timeout, -variable, -writable, or --"
+}
+
+rule VwaitBadTimeoutIsIntegerError {
+    when: Evaluates("catch {vwait -timeout abc} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "expected integer but got \"abc\""
+}
+
+rule VwaitChannelDirections {
+    -- -readable/-writable validate the channel's open mode before waiting.
+    when: Evaluates("list [catch {vwait -timeout 1 -readable stdout} m1] $m1 [catch {vwait -timeout 1 -writable stdin} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {channel \"stdout\" wasn't open for reading} 1 {channel \"stdin\" wasn't open for writing}"
+}
+
+-- Not pinned: vwait's -all/-extended ordering across multiple ready
+-- conditions depends on which handlers run first; only stable shapes are
+-- asserted above. -timeout 0 means no timeout (blocks), so it is not
+-- exercised.

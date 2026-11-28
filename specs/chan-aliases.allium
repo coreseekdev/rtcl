@@ -1,0 +1,264 @@
+-- allium: 3
+-- chan-aliases.allium
+-- Behaviour spec: the 9.1 chan ensemble spellings of the channel I/O
+-- commands (close/eof/flush/gets/puts/read) and the fileevent command
+-- itself — handler registration, query/replace, removal, direction
+-- multiplexing and background-error behaviour.
+-- Oracle: tclsh 9.1.0 (core-9-1-0). Probed 2026-11-28.
+-- Base channel I/O (open/read/gets/puts/seek/eof via the bare commands)
+-- is in io.allium; reflected/transform/copy/socket faces are in
+-- channel.allium. Only the chan alias surface is new here.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── chan close ──────────────────────────────────────────────────
+-- probe: 2026-11-28 tclsh9.1; doc/chan.n (9.1 adds ?direction?).
+
+rule Chan2CloseReturnsEmptyAndReleases {
+    -- chan close returns empty and removes the handle: it disappears from
+    -- chan names and a later read on the stale name fails.
+    when: Evaluates("set f [open /tmp/ca_r1 w]; chan puts $f hi; set r [chan close $f]; set hit [lsearch -exact [chan names] $f]; set c [catch {chan read $f} m]; list $r $hit $c")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} -1 1"
+}
+
+rule Chan2CloseUnknownChannel {
+    -- Closing an already-closed handle names the missing channel.
+    when: Evaluates("set f [open /tmp/ca_r2 w]; set n $f; close $f; catch {chan close $n} m; string match {can not find channel named *} $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}
+
+rule Chan2CloseArity {
+    -- 9.1's arity advertises the optional direction word.
+    when: Evaluates("catch {chan close} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"chan close channel ?direction?\""
+}
+
+rule Chan2CloseBadDirection {
+    -- The direction word is validated against read/write before closing.
+    when: Evaluates("set f [open /tmp/ca_r3 w]; set c [catch {chan close $f foo} m]; close $f; list $c $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {bad direction \"foo\": must be read or write}"
+}
+
+-- ── chan eof ────────────────────────────────────────────────────
+-- probe: 2026-11-28 tclsh9.1; doc/chan.n.
+
+rule Chan2EofTracksEndOfInput {
+    -- chan eof is 0 before an end-of-file read and 1 after a full read;
+    -- the read itself still returns the data.
+    when: Evaluates("set f [open /tmp/ca_r4 w]; chan puts -nonewline $f abc; close $f; set g [open /tmp/ca_r4 r]; set a [chan eof $g]; set d [chan read $g]; set b [chan eof $g]; close $g; list $a $d $b")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 abc 1"
+}
+
+rule Chan2EofOnWriteChannelIsZero {
+    -- A write-only channel has no EOF condition and reports 0.
+    when: Evaluates("set f [open /tmp/ca_r5 w]; set e [chan eof $f]; close $f; set e")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+}
+
+rule Chan2EofArity {
+    when: Evaluates("catch {chan eof} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"chan eof channel\""
+}
+
+-- ── chan flush ──────────────────────────────────────────────────
+-- probe: 2026-11-28 tclsh9.1; doc/chan.n.
+
+rule Chan2FlushPushesBufferedOutput {
+    -- Buffered writes become visible to file size after chan flush, while
+    -- the channel is still open; flush returns empty.
+    when: Evaluates("set f [open /tmp/ca_r6 w]; chan puts -nonewline $f abc; set r [chan flush $f]; set s [file size /tmp/ca_r6]; close $f; list $r $s")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 3"
+}
+
+rule Chan2FlushReadWriteChannelIsNoOp {
+    -- Flushing an r+ channel is harmless and does not disturb the read
+    -- position.
+    when: Evaluates("set f [open /tmp/ca_r7 w+]; chan puts -nonewline $f abc; chan seek $f 0; set r [chan flush $f]; set d [chan read $f 2]; close $f; list $r $d")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} ab"
+}
+
+rule Chan2FlushArity {
+    when: Evaluates("catch {chan flush} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"chan flush channel\""
+}
+
+-- ── chan gets ───────────────────────────────────────────────────
+-- probe: 2026-11-28 tclsh9.1; doc/chan.n.
+
+rule Chan2GetsReadsLinesIntoVariable {
+    -- chan gets returns the character count, stores the line without its
+    -- newline in the variable, and advances one line per call.
+    when: Evaluates("set f [open /tmp/ca_r8 w]; chan puts $f hello; chan puts $f world; close $f; set g [open /tmp/ca_r8 r]; set n1 [chan gets $g v1]; set n2 [chan gets $g v2]; close $g; list $n1 $v1 $n2 $v2")
+    ensures: completion.code = ok
+    ensures: completion.value = "5 hello 5 world"
+}
+
+rule Chan2GetsAtEofReturnsMinusOne {
+    -- At EOF chan gets returns -1 and sets the variable to empty (the
+    -- variable still exists afterwards).
+    when: Evaluates("set f [open /tmp/ca_r9 w]; chan puts $f hello; close $f; set g [open /tmp/ca_r9 r]; chan gets $g v; set n [chan gets $g v]; set e [info exists v]; set val $v; close $g; list $n $e $val")
+    ensures: completion.code = ok
+    ensures: completion.value = "-1 1 {}"
+}
+
+rule Chan2GetsArity {
+    when: Evaluates("catch {chan gets} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"chan gets channel ?varName?\""
+}
+
+-- ── chan puts ───────────────────────────────────────────────────
+-- probe: 2026-11-28 tclsh9.1; doc/chan.n.
+
+rule Chan2PutsAppendsNewline {
+    -- chan puts writes the string plus one newline and returns empty; the
+    -- file therefore grows by length+1.
+    when: Evaluates("set f [open /tmp/ca_r10 w]; set r [chan puts $f hi]; close $f; set g [open /tmp/ca_r10 r]; set d [chan read $g]; close $g; list $r [string length $d]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 3"
+}
+
+rule Chan2PutsNonewlineWritesExactBytes {
+    -- -nonewline suppresses the terminator; the file holds exactly two
+    -- bytes for "hi".
+    when: Evaluates("set f [open /tmp/ca_r11 w]; set r [chan puts -nonewline $f hi]; close $f; list $r [file size /tmp/ca_r11]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 2"
+}
+
+rule Chan2PutsArity {
+    when: Evaluates("catch {chan puts} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"chan puts ?-nonewline? ?channel? string\""
+}
+
+rule Chan2PutsUnknownChannel {
+    when: Evaluates("catch {chan puts nosuch hi} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "can not find channel named \"nosuch\""
+}
+
+-- ── chan read ───────────────────────────────────────────────────
+-- probe: 2026-11-28 tclsh9.1; doc/chan.n.
+
+rule Chan2ReadAllReadsToEof {
+    -- Without a count, chan read drains the channel and marks EOF.
+    when: Evaluates("set f [open /tmp/ca_r12 w]; chan puts -nonewline $f abc; close $f; set g [open /tmp/ca_r12 r]; set d [chan read $g]; set e [chan eof $g]; close $g; list $d $e")
+    ensures: completion.code = ok
+    ensures: completion.value = "abc 1"
+}
+
+rule Chan2ReadNonewlineTrimsOneNewline {
+    -- The read ?-nonewline? channel form trims one trailing newline.
+    when: Evaluates("set f [open /tmp/ca_r13 w]; chan puts $f abc; close $f; set g [open /tmp/ca_r13 r]; set d [chan read -nonewline $g]; close $g; set d")
+    ensures: completion.code = ok
+    ensures: completion.value = "abc"
+}
+
+rule Chan2ReadArity {
+    -- Both documented read forms appear in the arity message.
+    when: Evaluates("catch {chan read} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"chan read channel ?numChars?\" or \"chan read ?-nonewline? channel\""
+}
+
+rule Chan2ReadUnknownChannel {
+    when: Evaluates("catch {chan read nosuch} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "can not find channel named \"nosuch\""
+}
+
+-- ── fileevent: registration and firing ──────────────────────────
+-- probe: 2026-11-28 tclsh9.1; doc/fileevent.n. The one existing
+-- fileevent rule in io.allium only pins the "channel is not readable"
+-- error face; this section covers the command's working surface.
+
+rule FileeventReadableFiresThroughVwait {
+    -- A readable handler on a pipe read end fires during vwait; the
+    -- handler runs at global level and can consume the channel data.
+    when: Evaluates("lassign [chan pipe] r w; fileevent $r readable {set ::line [chan read $r 5]; set ::n [string length $::line]}; chan puts -nonewline $w hello; chan flush $w; vwait ::n; set out [list $::line $::n]; close $r; close $w; set out")
+    ensures: completion.code = ok
+    ensures: completion.value = "hello 5"
+}
+
+rule FileeventReadableFiresThroughUpdate {
+    -- The same handler also runs inside update, without vwait.
+    when: Evaluates("lassign [chan pipe] r w; fileevent $r readable {set ::fe 1; fileevent $r readable {}}; chan puts -nonewline $w x; chan flush $w; update; set fe $::fe; close $r; close $w; set fe")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}
+
+rule FileeventHandlerQueryAndReplace {
+    -- With no script, fileevent returns the current handler; setting a new
+    -- script replaces it.
+    when: Evaluates("lassign [chan pipe] r w; proc h1 {} {set ::x 1}; proc h2 {} {set ::x 2}; fileevent $r readable h1; set q1 [fileevent $r readable]; fileevent $r readable h2; set q2 [fileevent $r readable]; close $r; close $w; list [expr {$q1 eq {h1}}] [expr {$q2 eq {h2}}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+}
+
+rule FileeventRemoveWithEmptyScript {
+    -- An empty script removes the handler: the query becomes empty and a
+    -- later readable event does not invoke the old script.
+    when: Evaluates("lassign [chan pipe] r w; set ::fe 0; fileevent $r readable {set ::fe 1}; set rem [fileevent $r readable {}]; set q [fileevent $r readable]; chan puts -nonewline $w x; chan flush $w; update; set out [list $rem $q $::fe]; close $r; close $w; set out")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {} 0"
+}
+
+rule FileeventMultipleDirectionHandlers {
+    -- Readable and writable handlers coexist on the two ends of a pipe;
+    -- each removes itself so update terminates after one round.
+    when: Evaluates("lassign [chan pipe] r w; fileevent $r readable {set ::rd 1; fileevent $r readable {}}; fileevent $w writable {set ::wr 1; fileevent $w writable {}}; chan puts -nonewline $w x; chan flush $w; update; set out [list $::rd $::wr]; close $r; close $w; set out")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+}
+
+-- ── fileevent: errors and background errors ─────────────────────
+
+rule FileeventBadEventName {
+    when: Evaluates("catch {fileevent stdout x {}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad event name \"x\": must be readable or writable"
+}
+
+rule FileeventUnknownChannel {
+    when: Evaluates("catch {fileevent nosuch readable {}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "can not find channel named \"nosuch\""
+}
+
+rule FileeventClosedChannel {
+    -- A handle that was open and then closed is just as unknown as a name
+    -- that never existed.
+    when: Evaluates("set f [open /tmp/ca_r14 w]; set n $f; close $f; catch {fileevent $n readable {}} m; string match {can not find channel named *} $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}
+
+rule FileeventArity {
+    when: Evaluates("catch {fileevent stdout} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"fileevent channel event ?script?\""
+}
+
+rule FileeventHandlerErrorDoesNotStopEventLoop {
+    -- An error in a fileevent script is a background error: update itself
+    -- still completes ok and other queued events (the after 0 handler)
+    -- still run.
+    when: Evaluates("lassign [chan pipe] r w; fileevent $r readable {set ::fe 1; fileevent $r readable {}; error boom}; after 0 {set ::aft 1}; chan puts -nonewline $w x; chan flush $w; set c [catch {update} m]; set out [list $c $m $::fe $::aft]; close $r; close $w; set out")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 {} 1 1"
+}

@@ -1,0 +1,554 @@
+-- allium: 3
+-- format.allium
+-- Behaviour spec: the format command's 9.1 conversion surface not already
+-- pinned by matching.allium — conversions, flags, field width and
+-- precision (including *), size modifiers, integer/float/bignum/Unicode
+-- semantics, argument consumption and malformed-specifier errors.
+-- Oracle: tclsh 9.1.0 (core-9-1-0).
+--
+-- Doc: doc/format.n. Probes re-run against tclsh 9.1.0 on 2026-11-28.
+-- matching.allium already pins %c's Unicode scalar range, bare 32-bit
+-- truncation, alternate prefixes, the 64-bit size-modifier set, integer
+-- literal grammar, and the incomplete / mixed / not-enough-arguments
+-- errors; those faces are not repeated here.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+
+-- ── literal text, conversions and malformed specifiers ───────────
+
+rule FmtEmptyFormatString {
+    -- An empty format string with no arguments is a valid empty result.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("string length [format {}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+}
+
+rule FmtLiteralPercent {
+    -- %% inserts one % and consumes no argument.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format {a%%b}] [format {%%%d} 5]")
+    ensures: completion.code = ok
+    ensures: completion.value = "a%b %5"
+}
+
+rule FmtPercentFieldIsMalformed {
+    -- % accepts no flags, width or precision: with an argument it is a bad
+    -- field specifier; with no argument the missing argument is reported
+    -- first, before the specifier itself is rejected.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [catch {format {%5%} 7} m] $m [catch {format {%5%}} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {bad field specifier \"%\"} 1 {not enough arguments for all format specifiers}"
+}
+
+rule FmtWrongArgCount {
+    -- format with no arguments reports the command's usage.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("catch {format} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"format formatString ?arg ...?\""
+}
+
+rule FmtUnknownConversionLetters {
+    -- %F, %B, %D and %n are not conversion characters in 9.1.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [catch {format %F 1} m1] $m1 [catch {format %B 1} m2] $m2 [catch {format %n 1} m3] $m3 [catch {format %D 1} m4] $m4")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {bad field specifier \"F\"} 1 {bad field specifier \"B\"} 1 {bad field specifier \"n\"} 1 {bad field specifier \"D\"}"
+}
+
+rule FmtInvalidFlagCharacter {
+    -- Only - + space 0 # are flags; anything else is a bad field specifier.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [catch {format %_d 1} m1] $m1 [catch {format %'d 1} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {bad field specifier \"_\"} 1 {bad field specifier \"'\"}"
+}
+
+rule FmtInvalidSizeModifier {
+    -- Size modifiers are a closed set; an extra or unknown letter is the
+    -- bad field specifier at the point where the conversion letter was
+    -- expected.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [catch {format %llld 1} m1] $m1 [catch {format %hhd 1} m2] $m2 [catch {format %zzd 1} m3] $m3")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {bad field specifier \"l\"} 1 {bad field specifier \"h\"} 1 {bad field specifier \"z\"}"
+}
+
+rule FmtSizeModifiersOnFloatStringCharIgnored {
+    -- The size modifiers are ignored for floating-point, string and
+    -- character conversions (doc/format.n difference [4]).
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %Lf 1.5] [format %lf 1.5] [format %hf 1.5] [format %llf 1.5] [format %zf 1.5] [format %ls abc] [format %hc 65] [format %llc 65] [format %lls abc]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1.500000 1.500000 1.500000 1.500000 1.500000 abc A A abc"
+}
+
+
+-- ── integer conversions, bases and size modifiers ─────────────────
+
+rule FmtSizeLSelectsWideInteger {
+    -- l selects the 64-bit integer range: -1 prints as -1 for signed d but
+    -- as 2^64-1 for the unsigned bases.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %ld -1] [format %lu -1] [format %lx -1] [format %ld 4294967296]")
+    ensures: completion.code = ok
+    ensures: completion.value = "-1 18446744073709551615 ffffffffffffffff 4294967296"
+}
+
+rule FmtSizeLUnsignedBases {
+    -- The 64-bit l range is two's complement for octal and binary too.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %lo -1] [format %lb -2]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1777777777777777777777 1111111111111111111111111111111111111111111111111111111111111110"
+}
+
+rule FmtSizeLLIsBignum {
+    -- ll means take the integer without truncation, i.e. bignum, not merely
+    -- 64 bits: values beyond 2^64 survive exactly.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %lld 9223372036854775808] [format %lld -9223372036854775809] [format %llu 18446744073709551616] [format %llx 18446744073709551616]")
+    ensures: completion.code = ok
+    ensures: completion.value = "9223372036854775808 -9223372036854775809 18446744073709551616 10000000000000000"
+}
+
+rule FmtSizeLLSignedBasesKeepSign {
+    -- On the bignum path the x/o/b conversions keep the minus sign instead
+    -- of printing a two's-complement bit pattern.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %llx -1] [format %llx -255] [format %llo -1] [format %llb -1] [format %#llx -255]")
+    ensures: completion.code = ok
+    ensures: completion.value = "-1 -ff -1 -1 -0xff"
+}
+
+rule FmtSizeLLUnsignedNegativeRejected {
+    -- There is no unsigned bignum representation of a negative value; %llu
+    -- rejects it instead of wrapping.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("catch {format %llu -1} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unsigned bignum format is invalid"
+}
+
+rule FmtBareIntegerTruncatesModulo32 {
+    -- Without a size modifier every integer base truncates modulo 2^32,
+    -- including values that arrive as bignums (9.0 change).
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %d 4294967296] [format %x 4294967297] [format %u 4294967295] [format %o 4294967296] [format %b 4294967296] [format %d 123456789012345678901234567890]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 1 4294967295 0 0 1312754386"
+}
+
+rule FmtSignedTruncationWraps {
+    -- Out-of-range values wrap into the 32-bit range rather than saturate;
+    -- %u and %x show the same 32 bits as unsigned.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %d 2147483647] [format %d 2147483649] [format %d -2147483648] [format %d -2147483649] [format %u -2147483648] [format %x -2147483648]")
+    ensures: completion.code = ok
+    ensures: completion.value = "2147483647 -2147483647 -2147483648 2147483647 2147483648 80000000"
+}
+
+rule FmtHSixteenBitTruncation {
+    -- h truncates integers to 16 bits before conversion.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %hd -32769] [format %hu 65535] [format %hx 65535] [format %ho 65535] [format %hb 65535]")
+    ensures: completion.code = ok
+    ensures: completion.value = "32767 65535 ffff 177777 1111111111111111"
+}
+
+rule FmtIntegerBaseConversions {
+    -- %i is identical to %d; o/x/X/b select the other unsigned bases and
+    -- digit case.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %o 255] [format %x 255] [format %X 255] [format %b 255] [format %i -42] [format %d -42]")
+    ensures: completion.code = ok
+    ensures: completion.value = "377 ff FF 11111111 -42 -42"
+}
+
+
+-- ── alternate form, precision and flags ───────────────────────────
+
+rule FmtAlternateDecimalAndUpperHex {
+    -- #d/#i add the 9.x 0d prefix (after any sign); #u is ignored; #X
+    -- uppercases the hex digits while the 0x prefix stays lowercase.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %#d 5] [format %#d -5] [format %#i 5] [format %#u 5] [format %#X 255] [format %#X 0]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0d5 -0d5 0d5 5 0xFF 0"
+}
+
+rule FmtAlternatePrefixZeroAndPointer {
+    -- A zero value gets no alternate prefix, except that %p always keeps
+    -- its 0x.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %#b 0] [format %#d 0] [format %#p 0] [format %#p 255]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0 0x0 0xff"
+}
+
+rule FmtAlternatePrefixWithPrecision {
+    -- For integer conversions precision counts digits only; the alternate
+    -- prefix is added outside the padded digits.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %#.5x 255] [format %#.5d 5] [format %#.5o 8] [format %#.8b 5] [format %#.0o 0] [format %#.0x 0]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0x000ff 0d00005 0o00010 0b00000101 0 0"
+}
+
+rule FmtIntegerPrecisionMinimumDigits {
+    -- Precision on integer conversions is a minimum digit count; the sign
+    -- is outside the zero padding.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %.5d 42] [format %.5d -42] [format %.3x 255] [format %.4b 5] [format %.4o 8]")
+    ensures: completion.code = ok
+    ensures: completion.value = "00042 -00042 0ff 0101 0010"
+}
+
+rule FmtIntegerPrecisionZeroKeepsZero {
+    -- Unlike C printf, a zero value is still printed when the integer
+    -- precision is zero (the result is 0, not the empty string).
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %.0d 0] [format %.0d 7] [format %.0x 0] [format %.0o 0] [format %.0b 0]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 7 0 0 0"
+}
+
+rule FmtIntegerPrecisionDisablesZeroPad {
+    -- When an integer precision is present the 0 flag no longer pads with
+    -- zeroes; width padding is spaces (or right-side spaces with -).
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %08.3d 42] [format %05.3d 42] [format %-05.3d 42] [format %08.3d -42] [format %08.4u 255]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{     042} {  042} {042  } {    -042} {    0255}"
+}
+
+rule FmtZeroFlagIntegers {
+    -- The 0 flag pads integers to the field width with zeroes, after any
+    -- sign or alternate prefix; repeated 0 flags are harmless.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %05d 3] [format %+05d 5] [format {% 05d} 5] [format %#05d 5] [format %#05x 255] [format %#08x 255] [format %0005d 3]")
+    ensures: completion.code = ok
+    ensures: completion.value = "00003 +0005 { 0005} 0d005 0x0ff 0x0000ff 00003"
+}
+
+rule FmtZeroFlagStringsAndChars {
+    -- The 0 flag also applies to %s and %c, padding with zeroes on the
+    -- selected side (C printf ignores 0 for these).
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %05s ab] [format %-05s ab] [format %05c 65] [format %-05c 65] [format %08.2s abcdef]")
+    ensures: completion.code = ok
+    ensures: completion.value = "000ab ab000 0000A A0000 000000ab"
+}
+
+rule FmtMinusFlagDoesNotCancelZero {
+    -- Tcl does not let - cancel the 0 flag the way C does: with both,
+    -- integers pad left with zeroes, while %s still pads on the right.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %-05d 3] [format %0-5d 3] [format %-5d 3] [format %-05s ab]")
+    ensures: completion.code = ok
+    ensures: completion.value = "00003 00003 {3    } ab000"
+}
+
+rule FmtSignFlags {
+    -- + forces a sign; space supplies a sign position for non-negative
+    -- values and loses to +; repeated flags are accepted.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %+d 3] [format {% d} 3] [format %+d -3] [format {% d} -3] [format {% +d} 3] [format %++d 3]")
+    ensures: completion.code = ok
+    ensures: completion.value = "+3 { 3} -3 -3 +3 +3"
+}
+
+rule FmtPlusAndSpaceIgnoredForUnsigned {
+    -- Sign flags have no effect on unsigned conversions.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %+u -1] [format %+x 255] [format {% u} 5] [format %+o 8] [format %+b 5]")
+    ensures: completion.code = ok
+    ensures: completion.value = "4294967295 ff 5 10 101"
+}
+
+
+-- ── field width, precision stars and argument consumption ─────────
+
+rule FmtFieldWidthPadding {
+    -- A numeric field width pads on the left with spaces unless - is given;
+    -- the alternate prefix counts inside the width.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %5d 3] [format %-5d 3] [format %5s ab] [format %-5s ab] [format %#8x 255]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{    3} {3    } {   ab} {ab   } {    0xff}"
+}
+
+rule FmtStarWidth {
+    -- * consumes the next argument as the field width; a negative width
+    -- means left justification and 0 means no padding.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %*d 5 3] [format %*d -5 3] [format %*d 0 5] [format %*d +5 5] [format %*d 0x5 5]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{    3} {3    } 5 {    5} {    5}"
+}
+
+rule FmtStarPrecision {
+    -- .* consumes the next argument as the precision; a negative precision
+    -- is clamped to zero (C treats it as omitted), so %s becomes empty and
+    -- floating conversions use zero fractional digits.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %.*f 2 3.14159] [format %.*f -2 3.14159] [format %.*s 3 abcdef] [format %.*s -2 abc] [format %.*s 0 abc]")
+    ensures: completion.code = ok
+    ensures: completion.value = "3.14 3 abc {} {}"
+}
+
+rule FmtStarWidthAndPrecision {
+    -- Width and precision stars may appear together and are consumed left
+    -- to right.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %*.*s 6 3 abcdef] [format %*.*s -6 3 abcdef]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{   abc} {abc   }"
+}
+
+rule FmtStarArgumentsMustBeIntegers {
+    -- Both * arguments must be integers; a merely numeric string such as a
+    -- float or 1e1 is rejected by the integer parser.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [catch {format %*d abc 3} m1] $m1 [catch {format %.*f 2.9 3.1} m2] $m2 [catch {format %.*f 1e1 3.1} m3] $m3")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {expected integer but got \"abc\"} 1 {expected integer but got \"2.9\"} 1 {expected integer but got \"1e1\"}"
+}
+
+rule FmtStarWidthOverflow {
+    -- A * width beyond the C int range is an integer-representation error.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("catch {format %*d 999999999999999999999 5} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "integer value too large to represent"
+}
+
+rule FmtStarMissingArguments {
+    -- Each * consumes an argument before the conversion value; missing ones
+    -- are the standard not-enough-arguments error.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [catch {format {%*d}} m1] $m1 [catch {format {%.*d}} m2] $m2 [catch {format {%*.*f} 5} m3] $m3")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {not enough arguments for all format specifiers} 1 {not enough arguments for all format specifiers} 1 {not enough arguments for all format specifiers}"
+}
+
+rule FmtExtraArgumentsIgnored {
+    -- Arguments beyond what the format string consumes are ignored, and a
+    -- format string with no conversions consumes none.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format {%d} 1 2 3] [format abc 1 2] [format {%s} a b]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 abc a"
+}
+
+rule FmtPositionalReordering {
+    -- n$ selects the argument by 1-based position, allowing reordering and
+    -- reuse of arguments.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format {%3$s-%1$d-%2$s} 7 a b] [format {%2$s %1$s} a b] [format {%1$d %1$d} 7]")
+    ensures: completion.code = ok
+    ensures: completion.value = "b-7-a {b a} {7 7}"
+}
+
+rule FmtPositionalOutOfRange {
+    -- A position of 0 or beyond the supplied arguments reports the same
+    -- %n$ range error.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [catch {format {%0$d} 1} m1] $m1 [catch {format {%3$d} 1 2} m2] $m2 [catch {format {%2$s}} m3] $m3")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {\"%n$\" argument index out of range} 1 {\"%n$\" argument index out of range} 1 {\"%n$\" argument index out of range}"
+}
+
+rule FmtPositionalStarConsumesSuccessiveArguments {
+    -- With n$ the * and .* arguments are taken successively after position
+    -- n, so %2$*d uses arg2 as width and arg3 as the value.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format {%2$*d} 0 5 42] [format {%1$*d} 5 42] [catch {format {%2$.*f} 2 3.14159} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "{   42} {   42} 1 {\"%n$\" argument index out of range}"
+}
+
+rule FmtStarCannotBePositional {
+    -- The * itself cannot carry a position; only the leading n$ form is
+    -- accepted.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [catch {format {%1$*2$d} 42 5} m1] $m1 [catch {format {%*2$d} 5 42} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {bad field specifier \"$\"} 1 {bad field specifier \"$\"}"
+}
+
+rule FmtPositionalPercentRejected {
+    -- A positional prefix on %% is malformed; with no argument the range is
+    -- checked first.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [catch {format {%1$%} 1} m1] $m1 [catch {format {%1$%}} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {bad field specifier \"%\"} 1 {\"%n$\" argument index out of range}"
+}
+
+
+-- ── %c and %s: Unicode code points ───────────────────────────────
+
+rule FmtCWidthPrecisionAndZero {
+    -- For %c the field width and 0 flag apply, while precision is ignored.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %5c 65] [format %-3c 65] [format %03c 65] [format %.0c 65] [format %.2c 65]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{    A} {A  } 00A A A"
+}
+
+rule FmtCNulAndSurrogate {
+    -- %c 0 produces a NUL byte; 9.1 stores a lone surrogate code point and
+    -- %c/scan round-trip it.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [binary encode hex [format %c 0]] [string length [format %c 55296]] [scan [format %c 55296] %c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "00 1 55296"
+}
+
+rule FmtStringPrecisionCodePoints {
+    -- %s precision counts Unicode code points, so one emoji counts as one
+    -- character and combining marks are separate.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [scan [format %.1s [format %c 233][format %c 232]] %c] [scan [format %.1s [format %c 128512]x] %c] [string length [format %.1s [format %c 128512]x]] [string length [format %.0s abc]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "233 128512 1 0"
+}
+
+rule FmtStringWidthCodePoints {
+    -- Field width also counts code points; a combining mark occupies its own
+    -- position.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [string length [format %5s [format %c 233]]] [string length [format %5s [format %c 128512]]] [string length [format %3s [format %c 101][format %c 769]]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "5 5 3"
+}
+
+
+-- ── floating point: f, e, E, g, G, a, A ──────────────────────────
+
+rule FmtFloatFixedAndRounding {
+    -- %f defaults to six fractional digits; ties round to even.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %f 3.14159265] [format %.2f 3.14159265] [format %.0f 2.5] [format %.0f 3.5] [format %.1f 0.25] [format %.1f 0.35]")
+    ensures: completion.code = ok
+    ensures: completion.value = "3.141593 3.14 2 4 0.2 0.3"
+}
+
+rule FmtFloatHashAndZeroPrecision {
+    -- # guarantees a decimal point for f/e (even at precision 0); a zero
+    -- precision e result still has its exponent.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %#.0f 3.0] [format %#.2f 3.0] [format %#.0e 3.0] [format %.0e 0.0] [format %.0e 2.5]")
+    ensures: completion.code = ok
+    ensures: completion.value = "3. 3.00 3.e+00 0e+00 2e+00"
+}
+
+rule FmtScientificNotation {
+    -- %e/E use d.dddddd e[+-]dd with at least two exponent digits and the
+    -- requested precision; precision 0 omits the decimal point.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %e 12345.678] [format %E 12345.678] [format %.2e 12345.678] [format %.2e 0.000123] [format %.0e 12345.678]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1.234568e+04 1.234568E+04 1.23e+04 1.23e-04 1e+04"
+}
+
+rule FmtGeneralConversionChoice {
+    -- %g chooses f style unless the exponent is less than -4 or at least the
+    -- precision; %G uses E in the exponent.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %g 12345.678] [format %.3g 12345.678] [format %g 0.0001234] [format %g 0.00001234] [format %g 1000000.0] [format %G 1e20] [format %G 12345.678]")
+    ensures: completion.code = ok
+    ensures: completion.value = "12345.7 1.23e+04 0.0001234 1.234e-05 1e+06 1E+20 12345.7"
+}
+
+rule FmtGeneralHashKeepsZeros {
+    -- For %g/#g the # flag keeps trailing zeroes and the decimal point that
+    -- would otherwise be stripped.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %#g 1.5] [format %#.3g 1.5] [format %#g 0.0] [format %#g 100000.0] [format %#.0g 3.0]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1.50000 1.50 0.00000 100000. 3."
+}
+
+rule FmtHexFloatDefaultAndPrecision {
+    -- %a prints 0x1.hexp+-n with a default of 13 hex digits; precision
+    -- controls the digits and rounding can carry into the leading digit.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %a 1.0] [format %a 1.8] [format %.13a 1.8] [format %.12a 1.8] [format %.3a 1.8] [format %.0a 1.9]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0x1p+0 0x1.ccccccccccccdp+0 0x1.ccccccccccccdp+0 0x1.cccccccccccdp+0 0x1.ccdp+0 0x2p+0"
+}
+
+rule FmtHexFloatSignedZeroSubnormal {
+    -- Zero renders as 0x0p+0 (no 1. prefix), keeps its sign, and subnormals
+    -- use the 0x0.digits p-1022 form.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %a 0.0] [format %a -0.0] [format %a 5e-324] [format %a 2.2250738585072014e-308]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0x0p+0 -0x0p+0 0x0.0000000000001p-1022 0x1p-1022"
+}
+
+rule FmtHexFloatHashAndUppercase {
+    -- #a forces a decimal point even when precision is 0; %A uppercases the
+    -- hex digits only, leaving 0x and p lowercase.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %#a 1.0] [format %#.0a 1.0] [format %#.3a 1.8] [format %A 1.8] [format %A 1.0]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0x1.p+0 0x1.p+0 0x1.ccdp+0 0x1.CCCCCCCCCCCCDp+0 0x1p+0"
+}
+
+rule FmtFloatSpecialValues {
+    -- Infinity is accepted and printed as inf; an uppercase conversion
+    -- uppercases that text (%A also uppercases hex digits).
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %f Inf] [format %f -Inf] [format %e Inf] [format %g Inf] [format %a Inf] [format %E Inf] [format %A Inf]")
+    ensures: completion.code = ok
+    ensures: completion.value = "inf -inf inf inf inf INF IxF"
+}
+
+rule FmtFloatNanRejected {
+    -- NaN is rejected by every floating-point conversion with the same
+    -- message, unlike infinity which formats.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [catch {format %f NaN} m1] $m1 [catch {format %g NaN} m2] $m2 [catch {format %a NaN} m3] $m3")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {floating point value is Not a Number} 1 {floating point value is Not a Number} 1 {floating point value is Not a Number}"
+}
+
+rule FmtFloatArgumentParsing {
+    -- Floating conversions accept integer, hex, surrounding-whitespace and
+    -- infinity spellings for their argument.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %f 3] [format %f 0x10] [format %f { 1.5 }] [format %f infinity] [format %f +Inf]")
+    ensures: completion.code = ok
+    ensures: completion.value = "3.000000 16.000000 1.500000 inf inf"
+}
+
+rule FmtNumericArgumentTypeErrors {
+    -- Each conversion uses its own argument parser, so a float is not an
+    -- integer and a non-number is reported by conversion kind.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [catch {format %d 3.0} m1] $m1 [catch {format %f abc} m2] $m2 [catch {format %c abc} m3] $m3 [catch {format %x 3.0} m4] $m4")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {expected integer but got \"3.0\"} 1 {expected floating-point number but got \"abc\"} 1 {expected integer but got \"abc\"} 1 {expected integer but got \"3.0\"}"
+}
+
+
+-- ── p ─────────────────────────────────────────────────────────────
+
+rule FmtPointerConversion {
+    -- %p is 0x%zx shorthand: 64-bit two's complement for negatives, and
+    -- width/precision apply while # is ignored.
+    -- probe: 2026-11-28 tclsh9.1 (doc/format.n)
+    when: Evaluates("list [format %p 255] [format %p 0] [format %20p 255] [format %p -1] [format %.3p 255] [format %llp 255]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0xff 0x0 {                0xff} 0xffffffffffffffff 0x0ff 0xf"
+}

@@ -1,0 +1,363 @@
+-- allium: 3
+-- zipfs.allium
+-- Behaviour spec: the zipfs ensemble — canonical, exists, find, info,
+-- list, lmkimg, lmkzip, mkimg, mkkey, mkzip, mount, mountdata, unmount.
+-- Oracle: tclsh 9.1.0 (core-9-1-0).
+--
+-- Scope: deterministic completions of the zipfs virtual filesystem. All
+-- archives are generated in-script from fixed /tmp fixtures, used, and
+-- removed again; no archive byte length, compressed size or timestamp is
+-- pinned (only decompressed content sizes, which are archive-independent).
+-- `zipfs root` and the built-in volume itself are covered by
+-- interp.allium (ZipfsRootIsVolumeRoot); package.allium's load surface is
+-- unrelated. Doc: doc/zipfs.n. Probes re-run against tclsh 9.1.0 on
+-- 2026-11-28.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── dispatch ─────────────────────────────────────────────────────
+
+rule ZipfsRequiresSubcommand {
+    when: Evaluates("catch {zipfs} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"zipfs subcommand ?arg ...?\""
+    -- probe: 2026-11-28 tclsh9.1; doc/zipfs.n
+}
+
+rule ZipfsSubcommandMenu {
+    -- The menu is closed and alphabetical; root is included even though
+    -- its value is pinned in interp.allium.
+    when: Evaluates("catch {zipfs gorp} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown or ambiguous subcommand \"gorp\": must be canonical, exists, find, info, list, lmkimg, lmkzip, mkimg, mkkey, mkzip, mount, mountdata, root, or unmount"
+    -- probe: 2026-11-28 tclsh9.1; doc/zipfs.n
+}
+
+-- ── canonical ────────────────────────────────────────────────────
+
+rule ZipfsCanonicalDefaultsToRoot {
+    -- With no mountpoint, a filename is mapped under the zipfs volume
+    -- root; a leading slash is not doubled and an already-absolute zipfs
+    -- path is returned normalized.
+    when: Evaluates("list [zipfs canonical /a/b] [zipfs canonical relative/path] [zipfs canonical {} /a/b] [zipfs canonical //zipfs:/a/b]")
+    ensures: completion.code = ok
+    ensures: completion.value = "//zipfs:/a/b //zipfs:/relative/path //zipfs:/a/b //zipfs:/a/b"
+    -- probe: 2026-11-28 tclsh9.1; doc/zipfs.n "canonical"
+}
+
+rule ZipfsCanonicalNormalizes {
+    -- Redundant separators collapse and dot segments resolve lexically;
+    -- no filesystem lookup or mount validation is involved.
+    when: Evaluates("list [zipfs canonical //zipfs:/a//b] [zipfs canonical //zipfs:/a/b ../c] [zipfs canonical //zipfs:/a/b ./c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "//zipfs:/a/b //zipfs:/a/c //zipfs:/a/b/c"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ZipfsCanonicalHonoursMountpoint {
+    -- A mountpoint is itself canonicalized against the zipfs root; an
+    -- absolute filename is placed under the mountpoint rather than
+    -- replacing it, and a non-existent mountpoint is accepted.
+    when: Evaluates("list [zipfs canonical mt foo] [zipfs canonical /mt foo] [zipfs canonical //zipfs:/lib/tcl tcl_library] [zipfs canonical //zipfs:/lib/tcl /abs/path] [zipfs canonical /no/such/mount foo]")
+    ensures: completion.code = ok
+    ensures: completion.value = "//zipfs:/mt/foo //zipfs:/mt/foo //zipfs:/lib/tcl/tcl_library //zipfs:/lib/tcl/abs/path //zipfs:/no/such/mount/foo"
+    -- probe: 2026-11-28 tclsh9.1; doc/zipfs.n "canonical"
+}
+
+rule ZipfsCanonicalArity {
+    when: Evaluates("list [catch {zipfs canonical} m1] $m1 [catch {zipfs canonical a b c} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {wrong # args: should be \"zipfs canonical ?mountpoint? filename\"} 1 {wrong # args: should be \"zipfs canonical ?mountpoint? filename\"}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── queries on absent paths ──────────────────────────────────────
+
+rule ZipfsExistsPaths {
+    -- exists is false for paths outside the volume and for absent mounts;
+    -- it is true for files in the built-in library archive and for the
+    -- archive-level ancestor directory of a mount.
+    when: Evaluates("list [zipfs exists /no/such/file] [zipfs exists //zipfs:/no/such/mount/file] [zipfs exists //zipfs:/lib/tcl/tcl_library/init.tcl] [zipfs exists //zipfs:/lib]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0 1 1"
+    -- probe: 2026-11-28 tclsh9.1; doc/zipfs.n "exists"
+}
+
+rule ZipfsExistsArity {
+    when: Evaluates("catch {zipfs exists} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"zipfs exists filename\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ZipfsFindAbsent {
+    -- find over a non-zipfs directory or an absent mount is empty, not an
+    -- error (find is also the walker behind mkzip/mkimg).
+    when: Evaluates("list [zipfs find /no/such/dir] [zipfs find //zipfs:/no/such/mount]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {}"
+    -- probe: 2026-11-28 tclsh9.1; doc/zipfs.n "find"
+}
+
+rule ZipfsInfoAbsent {
+    -- info needs an archived file or a mount point; anything else is a
+    -- not-found error naming the path.
+    when: Evaluates("catch {zipfs info /no/such/file} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "path \"/no/such/file\" not found in any zipfs volume"
+    -- probe: 2026-11-28 tclsh9.1; doc/zipfs.n "info"
+}
+
+rule ZipfsInfoAncestorErrors {
+    -- An ancestor of a mount point (here //zipfs:/lib, parent of the
+    -- built-in lib/tcl mount) is not queryable; only the mount point
+    -- itself is.
+    when: Evaluates("catch {zipfs info //zipfs:/lib} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "path \"//zipfs:/lib\" not found in any zipfs volume"
+    -- probe: 2026-11-28 tclsh9.1; doc/zipfs.n "info" (ancestor special case)
+}
+
+rule ZipfsListPatterns {
+    -- The pattern matches full zipfs paths: glob and regexp modes agree
+    -- on the built-in init.tcl, a bare -glob is taken as a pattern (not a
+    -- mode with no pattern) and matches nothing here, and a non-matching
+    -- pattern is empty.
+    when: Evaluates("list [zipfs list -glob] [zipfs list -glob *init.tcl] [zipfs list -regexp {init\\.tcl$}] [zipfs list /no/such/*]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} //zipfs:/lib/tcl/tcl_library/init.tcl //zipfs:/lib/tcl/tcl_library/init.tcl {}"
+    -- probe: 2026-11-28 tclsh9.1; doc/zipfs.n "list" (path separators are
+    -- ordinary characters for matching)
+}
+
+rule ZipfsListArity {
+    when: Evaluates("catch {zipfs list -glob a b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"zipfs list ?(-glob|-regexp)? ?pattern?\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── mount table ──────────────────────────────────────────────────
+
+rule ZipfsMountReportsTable {
+    -- With no arguments mount returns a dict of mountpoint to archive
+    -- path (the built-in library mount is present); with a mountpoint
+    -- argument it returns that archive path or the empty string.
+    when: Evaluates("list [zipfs mount //zipfs:/nope] [dict exists [zipfs mount] //zipfs:/lib/tcl] [dict exists [zipfs mount] //zipfs:/nope] [string match {libtcl*} [file tail [zipfs mount //zipfs:/lib/tcl]]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 1 0 1"
+    -- probe: 2026-11-28 tclsh9.1; doc/zipfs.n "mount" (installation path
+    -- itself is not pinned)
+}
+
+rule ZipfsMountWrongArgs {
+    when: Evaluates("catch {zipfs mount a b c d} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"zipfs mount ?zipfile? ?mountpoint? ?password?\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ZipfsMountRejectsNetworkPath {
+    -- A UNC-style mountpoint is rejected before any archive access.
+    when: Evaluates("catch {zipfs mount /tmp/nope.zip //server/share} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "Invalid mount path \"//server/share\""
+    -- probe: 2026-11-28 tclsh9.1; doc/zipfs.n "mount"
+}
+
+rule ZipfsUnmountAbsentIsSilent {
+    -- Unmounting a mountpoint that was never mounted succeeds with the
+    -- empty result (no error).
+    when: Evaluates("list [zipfs unmount /no/such/mount] [zipfs unmount //zipfs:/no/such]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ZipfsUnmountArity {
+    when: Evaluates("catch {zipfs unmount} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"zipfs unmount mountpoint\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ZipfsUnmountBusyFails {
+    -- While a file in the mount is open, unmount errors with
+    -- "filesystem is busy" and the mount stays usable; after the channel
+    -- closes the same unmount succeeds and the paths disappear.
+    when: Evaluates("set d /tmp/rtcl-zipfs-busy; file delete -force $d; file mkdir $d; set f [open $d/a.txt w]; puts -nonewline $f ALPHA; close $f; set z /tmp/rtcl-zipfs-busy.zip; file delete -force $z; zipfs mkzip $z $d $d; zipfs mount $z //zipfs:/busy; set fh [open //zipfs:/busy/a.txt r]; set r [list [catch {zipfs unmount //zipfs:/busy} m] $m [file exists //zipfs:/busy/a.txt]]; close $fh; set r2 [list [zipfs unmount //zipfs:/busy] [file exists //zipfs:/busy/a.txt]]; file delete -force $z; file delete -force $d; list $r $r2")
+    ensures: completion.code = ok
+    ensures: completion.value = "{1 {filesystem is busy} 1} {{} 0}"
+    -- probe: 2026-11-28 tclsh9.1; doc/zipfs.n "unmount"
+}
+
+-- ── mkkey ────────────────────────────────────────────────────────
+
+rule ZipfsMkkeyShape {
+    -- mkkey appends a length marker byte and the fixed PKZZ tag to an
+    -- obfuscated form of the password: the result is length+5 characters,
+    -- ends in PKZZ, and the marker at index length equals the length.
+    -- (The obfuscation mapping itself is not pinned.)
+    when: Evaluates("list [zipfs mkkey {}] [string length [zipfs mkkey hello]] [string length [zipfs mkkey hunter2]] [string match {*PKZZ} [zipfs mkkey hello]] [string range [zipfs mkkey hello] end-3 end] [scan [string index [zipfs mkkey abcdefgh] 8] %c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 10 12 1 PKZZ 8"
+    -- probe: 2026-11-28 tclsh9.1; doc/zipfs.n "mkkey"
+}
+
+rule ZipfsMkkeyArity {
+    when: Evaluates("catch {zipfs mkkey} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"zipfs mkkey password\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── mkzip / info round trip ──────────────────────────────────────
+
+rule ZipfsMkzipRoundTrip {
+    -- mkzip writes an archive, mount returns its normalized mountpoint,
+    -- the archived file is visible through both file and zipfs APIs, find
+    -- lists the archive's own tree, and unmount removes it again.
+    when: Evaluates("set d /tmp/rtcl-zipfs-rt; file delete -force $d; file mkdir $d/sub; set f [open $d/sub/a.txt w]; puts -nonewline $f ALPHA; close $f; set z /tmp/rtcl-zipfs-rt.zip; file delete -force $z; set r [list [zipfs mkzip $z $d $d] [file exists $z] [zipfs mount $z //zipfs:/rt] [file exists //zipfs:/rt/sub/a.txt] [zipfs exists //zipfs:/rt/sub/a.txt] [lsort [zipfs find //zipfs:/rt]] [zipfs unmount //zipfs:/rt] [zipfs exists //zipfs:/rt/sub/a.txt]]; file delete -force $z; file delete -force $d; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 1 //zipfs:/rt 1 1 {//zipfs:/rt/sub //zipfs:/rt/sub/a.txt} {} 0"
+    -- probe: 2026-11-28 tclsh9.1; doc/zipfs.n "mkzip", "mount", "find"
+}
+
+rule ZipfsMkzipStripControlsPaths {
+    -- The optional strip prefix is removed from each archived name; the
+    -- enclosing directory itself still appears as an intermediate path.
+    when: Evaluates("set d /tmp/rtcl-zipfs-strip; file delete -force $d; file mkdir $d/sub; set f [open $d/sub/a.txt w]; puts -nonewline $f ALPHA; close $f; set z /tmp/rtcl-zipfs-strip.zip; file delete -force $z; zipfs mkzip $z $d $d; zipfs mount $z //zipfs:/st; set r [lsort [zipfs list -glob //zipfs:/st/*]]; zipfs unmount //zipfs:/st; file delete -force $z; file delete -force $d; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "//zipfs:/st/sub //zipfs:/st/sub/a.txt"
+    -- probe: 2026-11-28 tclsh9.1; doc/zipfs.n "mkzip" strip parameter
+}
+
+rule ZipfsMkzipRootNameFollowsIndir {
+    -- Without a strip prefix the archive names keep the input path (minus
+    -- its leading separator), so /tmp/... becomes tmp/... at the archive
+    -- root — the documented caution about choosing indir.
+    when: Evaluates("set d /tmp/rtcl-zipfs-nostrip; file delete -force $d; file mkdir $d; set f [open $d/a.txt w]; puts -nonewline $f ALPHA; close $f; set z /tmp/rtcl-zipfs-nostrip.zip; file delete -force $z; zipfs mkzip $z $d; zipfs mount $z //zipfs:/ns; set r [lsort [zipfs list -glob //zipfs:/ns/*]]; zipfs unmount //zipfs:/ns; file delete -force $z; file delete -force $d; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "//zipfs:/ns/tmp //zipfs:/ns/tmp/rtcl-zipfs-nostrip //zipfs:/ns/tmp/rtcl-zipfs-nostrip/a.txt"
+    -- probe: 2026-11-28 tclsh9.1; doc/zipfs.n "mkzip" caution
+}
+
+rule ZipfsInfoReportsArchiveAndSize {
+    -- info returns {archive size compressedSize offset}; the archive path
+    -- and decompressed size are pinned, while compressedSize/offset are
+    -- omitted as zlib-dependent. Querying the mount point itself yields
+    -- the archive with zero sizes and offset (the zip data start).
+    when: Evaluates("set d /tmp/rtcl-zipfs-info; file delete -force $d; file mkdir $d; set f [open $d/a.txt w]; puts -nonewline $f ALPHA; close $f; set z /tmp/rtcl-zipfs-info.zip; file delete -force $z; zipfs mkzip $z $d $d; zipfs mount $z //zipfs:/if; set r [list [lrange [zipfs info //zipfs:/if/a.txt] 0 1] [zipfs info //zipfs:/if]]; zipfs unmount //zipfs:/if; file delete -force $z; file delete -force $d; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "{/tmp/rtcl-zipfs-info.zip 5} {/tmp/rtcl-zipfs-info.zip 0 0 0}"
+    -- probe: 2026-11-28 tclsh9.1; doc/zipfs.n "info"
+}
+
+rule ZipfsMkzipWrongArgs {
+    -- The arity message is stable for both too-few arguments and a
+    -- missing input directory; the latter is reported as an empty archive
+    -- and leaves no output file.
+    when: Evaluates("list [catch {zipfs mkzip} m1] $m1 [catch {zipfs mkzip /tmp/rtcl-zipfs-err.zip} m2] $m2 [catch {zipfs mkzip /tmp/rtcl-zipfs-err.zip /tmp/rtcl-zipfs-nodir} m3] $m3")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {wrong # args: should be \"zipfs mkzip outfile indir ?strip? ?password?\"} 1 {wrong # args: should be \"zipfs mkzip outfile indir ?strip? ?password?\"} 1 {empty archive}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── mountdata ────────────────────────────────────────────────────
+
+rule ZipfsMountdataRoundTrip {
+    -- read archive bytes back and mountdata them; the archive is reported
+    -- under the literal name "Memory Buffer", and unmount removes it.
+    when: Evaluates("set d /tmp/rtcl-zipfs-md; file delete -force $d; file mkdir $d; set f [open $d/a.txt w]; puts -nonewline $f ALPHA; close $f; set z /tmp/rtcl-zipfs-md.zip; file delete -force $z; zipfs mkzip $z $d $d; set fh [open $z rb]; set data [read $fh]; close $fh; set r [list [zipfs mountdata $data //zipfs:/md] [zipfs exists //zipfs:/md/a.txt] [lrange [zipfs info //zipfs:/md/a.txt] 0 1] [zipfs unmount //zipfs:/md] [zipfs exists //zipfs:/md/a.txt]]; file delete -force $z; file delete -force $d; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "//zipfs:/md 1 {{Memory Buffer} 5} {} 0"
+    -- probe: 2026-11-28 tclsh9.1; doc/zipfs.n "mountdata"
+}
+
+rule ZipfsMountdataRejectsGarbage {
+    -- Non-archive data is rejected as an illegal file size, and the
+    -- subcommand takes exactly data and mountpoint.
+    when: Evaluates("list [catch {zipfs mountdata notazip //zipfs:/bad} m] $m [catch {zipfs mountdata data} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {illegal file size} 1 {wrong # args: should be \"zipfs mountdata data mountpoint\"}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── encrypted archives ───────────────────────────────────────────
+
+rule ZipfsMountPasswordGate {
+    -- Mounting an encrypted archive always succeeds; decryption is checked
+    -- on first read: no password and a wrong password produce distinct
+    -- stable errors, the right password yields the content.
+    when: Evaluates("set d /tmp/rtcl-zipfs-pw; file delete -force $d; file mkdir $d; set f [open $d/a.txt w]; puts -nonewline $f SECRET; close $f; set z /tmp/rtcl-zipfs-pw.zip; file delete -force $z; zipfs mkzip $z $d $d hunter2; set r [list [zipfs mount $z //zipfs:/p1] [catch {set fh [open //zipfs:/p1/a.txt r]; read $fh} m1] $m1 [zipfs mount $z //zipfs:/p2 wrongpass] [catch {set fh [open //zipfs:/p2/a.txt r]; read $fh} m2] $m2 [zipfs mount $z //zipfs:/p3 hunter2] [set fh [open //zipfs:/p3/a.txt r]; set c [read $fh]; close $fh; set c]]; catch {zipfs unmount //zipfs:/p1}; catch {zipfs unmount //zipfs:/p2}; zipfs unmount //zipfs:/p3; file delete -force $z; file delete -force $d; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "//zipfs:/p1 1 {decryption failed - no password provided} //zipfs:/p2 1 {invalid password} //zipfs:/p3 SECRET"
+    -- probe: 2026-11-28 tclsh9.1; doc/zipfs.n "mkzip" password, "mount"
+}
+
+-- ── lmkzip / mkimg / lmkimg ──────────────────────────────────────
+
+rule ZipfsLmkzipRoundTrip {
+    -- lmkzip builds an archive from an explicit {source archiveName} list,
+    -- and the names are used verbatim inside the mount.
+    when: Evaluates("set a /tmp/rtcl-zipfs-la.txt; set b /tmp/rtcl-zipfs-lb.txt; set f [open $a w]; puts -nonewline $f ALPHA; close $f; set f [open $b w]; puts -nonewline $f BETA; close $f; set z /tmp/rtcl-zipfs-lz.zip; file delete -force $z; set r [list [zipfs lmkzip $z [list $a x/a.txt $b x/b.txt]] [file exists $z] [zipfs mount $z //zipfs:/lz] [lsort [zipfs list -glob //zipfs:/lz/*]] [zipfs exists //zipfs:/lz/x/a.txt] [zipfs unmount //zipfs:/lz]]; file delete -force $a; file delete -force $b; file delete -force $z; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 1 //zipfs:/lz {//zipfs:/lz/x //zipfs:/lz/x/a.txt //zipfs:/lz/x/b.txt} 1 {}"
+    -- probe: 2026-11-28 tclsh9.1; doc/zipfs.n "lmkzip"
+}
+
+rule ZipfsLmkzipMissingSource {
+    -- A source file that cannot be opened aborts the build with the OS
+    -- reason, but the partially created output file remains.
+    when: Evaluates("set z /tmp/rtcl-zipfs-lmiss.zip; file delete -force $z; set r [list [catch {zipfs lmkzip $z [list /nonexistent/nope.txt z.txt]} m] $m [file exists $z]]; file delete -force $z; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {couldn't open \"/nonexistent/nope.txt\": no such file or directory} 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ZipfsLmkzipArity {
+    when: Evaluates("catch {zipfs lmkzip} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"zipfs lmkzip outfile inlist ?password?\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ZipfsMkimgWithInfile {
+    -- mkimg prepends the given infile verbatim, appends the ZIP chunk,
+    -- and the resulting file mounts like an archive.
+    when: Evaluates("set d /tmp/rtcl-zipfs-img; file delete -force $d; file mkdir $d; set f [open $d/main.tcl w]; puts -nonewline $f {set ok 1}; close $f; set h /tmp/rtcl-zipfs-img.hdr; set f [open $h w]; puts -nonewline $f HEADER; close $f; set img /tmp/rtcl-zipfs-img.bin; file delete -force $img; set r [list [zipfs mkimg $img $d $d {} $h] [file exists $img] [set fh [open $img rb]; set head [read $fh 6]; close $fh; set head] [zipfs mount $img //zipfs:/img] [zipfs exists //zipfs:/img/main.tcl] [zipfs unmount //zipfs:/img]]; file delete -force $img; file delete -force $h; file delete -force $d; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 1 HEADER //zipfs:/img 1 {}"
+    -- probe: 2026-11-28 tclsh9.1; doc/zipfs.n "mkimg"
+}
+
+rule ZipfsMkimgMissingDir {
+    -- An empty input directory yields the same "empty archive" error as
+    -- mkzip and leaves no output file.
+    when: Evaluates("set img /tmp/rtcl-zipfs-miss.bin; file delete -force $img; set r [list [catch {zipfs mkimg $img /tmp/rtcl-zipfs-nodir} m] $m [file exists $img]]; file delete -force $img; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {empty archive} 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ZipfsLmkimgWithInfile {
+    -- lmkimg is the inlist form of mkimg: infile prefix, archive chunk,
+    -- mountable result.
+    when: Evaluates("set d /tmp/rtcl-zipfs-li; file delete -force $d; file mkdir $d; set f [open $d/main.tcl w]; puts -nonewline $f {set ok 1}; close $f; set h /tmp/rtcl-zipfs-li.hdr; set f [open $h w]; puts -nonewline $f HEADER; close $f; set img /tmp/rtcl-zipfs-li.bin; file delete -force $img; set r [list [zipfs lmkimg $img [list $d/main.tcl m.tcl] {} $h] [file exists $img] [set fh [open $img rb]; set head [read $fh 6]; close $fh; set head] [zipfs mount $img //zipfs:/li] [zipfs exists //zipfs:/li/m.tcl] [zipfs unmount //zipfs:/li]]; file delete -force $img; file delete -force $h; file delete -force $d; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 1 HEADER //zipfs:/li 1 {}"
+    -- probe: 2026-11-28 tclsh9.1; doc/zipfs.n "lmkimg"
+}
+
+rule ZipfsLmkimgMissingSource {
+    -- A missing input file aborts lmkimg with the OS reason after the
+    -- output image has already been created.
+    when: Evaluates("set img /tmp/rtcl-zipfs-lmiss.bin; file delete -force $img; set r [list [catch {zipfs lmkimg $img [list /nonexistent/x.txt y.txt]} m] $m [file exists $img]]; file delete -force $img; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {couldn't open \"/nonexistent/x.txt\": no such file or directory} 1"
+    -- probe: 2026-11-28 tclsh9.1
+}

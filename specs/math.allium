@@ -1,0 +1,627 @@
+-- allium: 3
+-- math.allium
+-- Behaviour spec: the mathematical command surface — the
+-- tcl::mathfunc::* function commands, the tcl::mathop::* operator
+-- commands, the 9.1 native commands (divmod, frexp, modf, remquo,
+-- fpclassify), and numeric edge semantics not owned by expr.allium.
+-- Oracle: tclsh 9.1.0 (core-9-1-0).
+--
+-- Scope: direct command invocation of the math namespaces (expr's
+-- operator and function-call forms are expr.allium's), the native
+-- decomposition/classification commands, and numeric boundary and
+-- string-form rules.
+--
+-- Excludes (already specified elsewhere, not repeated here):
+--   * expr operators and math-call syntax (expr.allium):
+--     ExprMathFunctionsC99Core, ExprMathFunctionsPredicates,
+--     ExprNewNumericCommands, ExprMathopStringComparisons,
+--     ExprIntConvertsFloatToBignum, ExprIntegersAreArbitraryPrecision,
+--     ExprDivisionByZeroErrors, ExprFloatNaNIsDomainError.
+--   * info functions / info cmdtype inventories (info.allium):
+--     InfoFunctionsInventory, InfoFunctionsPatternAndUserDefinitions,
+--     InfoCmdtypeClassifiesCommands.
+--   * mathop lt/le/gt/ge (ExprMathopStringComparisons); only the
+--     numeric-vs-string equality contrast is new below.
+--
+-- Probes: 2026-11-28 tclsh9.1, plus doc/mathfunc.n, doc/mathop.n,
+-- doc/divmod.n, doc/frexp.n, doc/modf.n, doc/remquo.n, doc/fpclassify.n.
+-- Every rule below is self-contained and was run against the oracle.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── namespace surface ─────────────────────────────────────────────
+
+rule MathfuncNamespaceCommandsAreNative {
+    -- The math functions are native commands in ::tcl::mathfunc, and the
+    -- operator commands are native commands in ::tcl::mathop; neither is
+    -- a Tcl proc.
+    when: Evaluates("list [info cmdtype ::tcl::mathfunc::sqrt] [info cmdtype ::tcl::mathfunc::abs] [info cmdtype ::tcl::mathfunc::max] [info cmdtype ::tcl::mathop::+]")
+    ensures: completion.code = ok
+    ensures: completion.value = "native native native native"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncNamesAreNotGloballyImported {
+    -- The function commands live only in their namespace; bare abs/sin
+    -- do not exist at the global level.
+    when: Evaluates("list [info commands abs] [info commands sin] [catch {abs 1} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {} 1 {invalid command name \"abs\"}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncNamespacePathEnablesCall {
+    -- Putting the two namespaces on a namespace path makes the functions
+    -- and operators callable unqualified, with normal return types.
+    when: Evaluates("namespace eval ::mprobe {namespace path {::tcl::mathfunc ::tcl::mathop}; list [sqrt 16] [+ 1 2]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "4.0 3"
+    -- probe: 2026-11-28 tclsh9.1 (doc/mathop.n EXAMPLES)
+}
+
+rule MathfuncBuiltinIsOverridableThroughNamespace {
+    -- expr resolves a math function by name in ::tcl::mathfunc at call
+    -- time: replacing sqrt changes sqrt() inside expr, and restoring the
+    -- original command restores the builtin.
+    when: Evaluates("rename ::tcl::mathfunc::sqrt ::tcl::mathfunc::sqrt0; proc ::tcl::mathfunc::sqrt {x} {return 42}; set r [expr {sqrt(9)}]; rename ::tcl::mathfunc::sqrt {}; rename ::tcl::mathfunc::sqrt0 ::tcl::mathfunc::sqrt; list $r [expr {sqrt(9)}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "42 3.0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── mathfunc numeric behaviour ───────────────────────────────────
+
+rule MathfuncAbsPreservesForm {
+    -- abs keeps the argument's numeric form: an integer stays an integer
+    -- (widening past i64), a float stays a float.
+    when: Evaluates("list [::tcl::mathfunc::abs -3] [::tcl::mathfunc::abs -7.5] [::tcl::mathfunc::abs [expr {-9223372036854775807-1}]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 7.5 9223372036854775808"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncRoundingFamily {
+    -- floor/ceil/trunc always return floats; round returns an integer and
+    -- rounds halves away from zero; an integral argument is returned as
+    -- is.
+    when: Evaluates("list [::tcl::mathfunc::floor 2.9] [::tcl::mathfunc::ceil 2.1] [::tcl::mathfunc::trunc -2.9] [::tcl::mathfunc::round 2.5] [::tcl::mathfunc::round -2.5] [::tcl::mathfunc::round 3] [::tcl::mathfunc::round 0.5] [::tcl::mathfunc::round -0.5]")
+    ensures: completion.code = ok
+    ensures: completion.value = "2.0 3.0 -2.0 3 -3 3 1 -1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncIntAndEntierAreUnlimited {
+    -- 9.1 int and entier both truncate toward zero to arbitrary precision;
+    -- int no longer keeps only the low machine word (doc/mathfunc.n is
+    -- stale on this point), so values past i64 survive intact.
+    when: Evaluates("list [::tcl::mathfunc::int -2.9] [::tcl::mathfunc::entier -2.9] [::tcl::mathfunc::int 1e22] [::tcl::mathfunc::entier 1e22] [::tcl::mathfunc::int 9223372036854775808] [::tcl::mathfunc::int -9223372036854775809]")
+    ensures: completion.code = ok
+    ensures: completion.value = "-2 -2 10000000000000000000000 10000000000000000000000 9223372036854775808 -9223372036854775809"
+    -- probe: 2026-11-28 tclsh9.1 (doc conflict noted in HANDOFF §7 style)
+}
+
+rule MathfuncWideTruncatesToMachineWord {
+    -- wide is the 64-bit truncating conversion: it wraps modulo 2^64 and
+    -- interprets the result as signed.
+    when: Evaluates("list [::tcl::mathfunc::wide 42] [::tcl::mathfunc::wide 1e22] [::tcl::mathfunc::wide 9223372036854775808] [::tcl::mathfunc::wide -9223372036854775809]")
+    ensures: completion.code = ok
+    ensures: completion.value = "42 1864712049423024128 -9223372036854775808 9223372036854775807"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncDoublePromotesToFloat {
+    -- double converts any numeric value to a float and stringifies it in
+    -- the normal float form.
+    when: Evaluates("list [::tcl::mathfunc::double 7] [::tcl::mathfunc::double 10000000000000000000000000]")
+    ensures: completion.code = ok
+    ensures: completion.value = "7.0 1e+25"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncMinMaxAreVariadicAndPromote {
+    -- max/min take one or more numeric arguments and return the winning
+    -- argument with its own type; mixing in a float promotes the result.
+    when: Evaluates("list [::tcl::mathfunc::max 2 3.5 1] [::tcl::mathfunc::min 2 3.5 1] [::tcl::mathfunc::max 7] [::tcl::mathfunc::min -1 -2]")
+    ensures: completion.code = ok
+    ensures: completion.value = "3.5 1 7 -2"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncBooleanAcceptsNumbersAndNames {
+    -- bool maps boolean names and numeric values to 0/1; any nonzero
+    -- number (including a negative float) is true.
+    when: Evaluates("list [::tcl::mathfunc::bool true] [::tcl::mathfunc::bool on] [::tcl::mathfunc::bool off] [::tcl::mathfunc::bool 0] [::tcl::mathfunc::bool -2.5]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 0 0 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncBooleanRejectsNonBoolean {
+    -- A non-boolean string is an error naming the value.
+    when: Evaluates("catch {::tcl::mathfunc::bool abc} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "expected boolean value but got \"abc\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncIsqrtArbitraryPrecision {
+    -- isqrt truncates the square root and keeps arbitrary precision where
+    -- sqrt would lose low bits.
+    when: Evaluates("list [::tcl::mathfunc::isqrt 10000000000000000000000000000000000000000] [::tcl::mathfunc::isqrt 10]")
+    ensures: completion.code = ok
+    ensures: completion.value = "100000000000000000000 3"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncSrandIsDeterministic {
+    -- srand returns the first value of its sequence; reseeding repeats the
+    -- sequence exactly (per-interpreter generator).
+    when: Evaluates("list [::tcl::mathfunc::srand 1] [::tcl::mathfunc::srand 1] [::tcl::mathfunc::rand] [::tcl::mathfunc::srand 1] [::tcl::mathfunc::rand]")
+    ensures: completion.code = ok
+    ensures: completion.value = "7.826369259425611e-6 7.826369259425611e-6 0.13153778814316625 7.826369259425611e-6 0.13153778814316625"
+    -- probe: 2026-11-28 tclsh9.1 (doc/mathfunc.n: LCG, not secure)
+}
+
+rule MathfuncRandStaysInUnitInterval {
+    -- rand is strictly inside (0,1): never 0.0 and never 1.0.
+    when: Evaluates("expr {[::tcl::mathfunc::rand] > 0.0 && [::tcl::mathfunc::rand] < 1.0}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncTrigFamily {
+    -- The circular functions and their inverse at zero, plus atan2(1,1).
+    when: Evaluates("list [::tcl::mathfunc::sin 0] [::tcl::mathfunc::cos 0] [::tcl::mathfunc::tan 0] [::tcl::mathfunc::asin 0] [::tcl::mathfunc::atan 0] [::tcl::mathfunc::atan2 1 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0.0 1.0 0.0 0.0 0.0 0.7853981633974483"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncHyperbolicFamily {
+    -- The hyperbolic functions and their inverses at their identity
+    -- points.
+    when: Evaluates("list [::tcl::mathfunc::sinh 0] [::tcl::mathfunc::cosh 0] [::tcl::mathfunc::tanh 0] [::tcl::mathfunc::asinh 0] [::tcl::mathfunc::acosh 1] [::tcl::mathfunc::atanh 0]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0.0 1.0 0.0 0.0 0.0 0.0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncExpLogFamily {
+    -- The exponential/logarithm family, including the 9.0 TIP 745
+    -- additions exp2/expm1/log1p/log2.
+    when: Evaluates("list [::tcl::mathfunc::exp 0] [::tcl::mathfunc::log 1] [::tcl::mathfunc::log10 100] [::tcl::mathfunc::log2 32] [::tcl::mathfunc::exp2 4] [::tcl::mathfunc::log1p 0] [::tcl::mathfunc::expm1 0]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1.0 0.0 2.0 5.0 16.0 0.0 0.0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncRootPowerAndSignFamily {
+    -- Roots, powers, hypotenuse and copysign, all returning floats.
+    when: Evaluates("list [::tcl::mathfunc::sqrt 9] [::tcl::mathfunc::cbrt 8] [::tcl::mathfunc::cbrt -8] [::tcl::mathfunc::pow 2 10] [::tcl::mathfunc::hypot 5 12] [::tcl::mathfunc::copysign 3 -0.0]")
+    ensures: completion.code = ok
+    ensures: completion.value = "3.0 2.0 -2.0 1024.0 13.0 -3.0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncDimLdexpLogb {
+    -- dim is max(0,x-y); ldexp scales by 2**y; logb reports the unbiased
+    -- exponent as a float.
+    when: Evaluates("list [::tcl::mathfunc::dim 7 3] [::tcl::mathfunc::dim 3 7] [::tcl::mathfunc::ldexp 0.5 4] [::tcl::mathfunc::logb 8]")
+    ensures: completion.code = ok
+    ensures: completion.value = "4.0 0.0 8.0 3.0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncFmaRemainderNextafter {
+    -- fma, the IEEE remainder (nearest-even quotient), nextafter and the
+    -- C-style fmod (truncated quotient) are all distinct.
+    when: Evaluates("list [::tcl::mathfunc::fma 3 4 5] [::tcl::mathfunc::remainder 7 3] [::tcl::mathfunc::remainder 8 3] [::tcl::mathfunc::nextafter 1 2] [::tcl::mathfunc::fmod 7 3]")
+    ensures: completion.code = ok
+    ensures: completion.value = "17.0 1.0 -1.0 1.0000000000000002 1.0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncSpecialFunctions {
+    -- erf/erfc at zero and the gamma family at 5.
+    when: Evaluates("list [::tcl::mathfunc::erf 0] [::tcl::mathfunc::erfc 0] [::tcl::mathfunc::gamma 5] [::tcl::mathfunc::lgamma 5]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0.0 1.0 24.0 3.1780538303479458"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncClassPredicates {
+    -- The TIP 521/TIP 745 predicates return 0/1 integers; signbit sees
+    -- the sign of negative zero.
+    when: Evaluates("list [::tcl::mathfunc::isfinite 1.0] [::tcl::mathfunc::isinf Inf] [::tcl::mathfunc::isnan NaN] [::tcl::mathfunc::isnormal 1.0] [::tcl::mathfunc::issubnormal 1e-320] [::tcl::mathfunc::isunordered NaN 1] [::tcl::mathfunc::signbit -0.0] [::tcl::mathfunc::signbit 0.0]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 1 1 1 1 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── mathfunc domain / NaN / Inf edges ────────────────────────────
+
+rule MathfuncSqrtNegativeReturnsNaN {
+    -- Surprise: the *command* sqrt of a negative number returns the NaN
+    -- float (glibc's negative NaN spelling) instead of raising a domain
+    -- error; sqrt(-Inf) does the same.
+    when: Evaluates("list [::tcl::mathfunc::sqrt -1] [::tcl::mathfunc::sqrt -1.0] [::tcl::mathfunc::sqrt -Inf]")
+    ensures: completion.code = ok
+    ensures: completion.value = "-NaN -NaN -NaN"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncExprSqrtNegativeIsDomainError {
+    -- The expr call form is stricter than the command: expr validates the
+    -- sqrt result and raises a domain error. Both faces must be modelled.
+    when: Evaluates("catch {expr {sqrt(-1)}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "domain error: argument not in valid range"
+    -- probe: 2026-11-28 tclsh9.1 (contrast with MathfuncSqrtNegativeReturnsNaN)
+}
+
+rule MathfuncLogZeroIsNegativeInf {
+    -- log(0) is a pole, not a domain error: all three logarithms return
+    -- -Inf (expr {log(0)} agrees).
+    when: Evaluates("list [::tcl::mathfunc::log 0] [::tcl::mathfunc::log10 0.0] [::tcl::mathfunc::log2 0]")
+    ensures: completion.code = ok
+    ensures: completion.value = "-Inf -Inf -Inf"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncDomainErrorsRejected {
+    -- Out-of-range arguments raise the generic domain error, both from
+    -- the command and from expr: asin/acos outside [-1,1], log of a
+    -- negative, fmod by zero, and a fractional power of a negative.
+    when: Evaluates("list [catch {::tcl::mathfunc::asin 2} m1] $m1 [catch {::tcl::mathfunc::acos 2} m2] $m2 [catch {::tcl::mathfunc::log -1} m3] $m3 [catch {::tcl::mathfunc::fmod 1 0} m4] $m4 [catch {::tcl::mathfunc::pow -1 0.5} m5] $m5")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {domain error: argument not in valid range} 1 {domain error: argument not in valid range} 1 {domain error: argument not in valid range} 1 {domain error: argument not in valid range} 1 {domain error: argument not in valid range}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncOverflowSaturatesToInfinity {
+    -- Surprise: overflow saturates to Inf instead of erroring, contrary to
+    -- doc/mathfunc.n wording for exp/cosh/gamma/lgamma.
+    when: Evaluates("list [::tcl::mathfunc::exp 1000] [::tcl::mathfunc::cosh 1000] [::tcl::mathfunc::gamma 0] [::tcl::mathfunc::lgamma 0]")
+    ensures: completion.code = ok
+    ensures: completion.value = "Inf Inf Inf Inf"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncInfiniteInputs {
+    -- Inf is accepted by sqrt/log/exp and propagates; sin(Inf) is a
+    -- domain error.
+    when: Evaluates("list [::tcl::mathfunc::sqrt Inf] [::tcl::mathfunc::log Inf] [::tcl::mathfunc::exp Inf] [catch {::tcl::mathfunc::sin Inf} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "Inf Inf Inf 1 {domain error: argument not in valid range}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncAtan2ZeroZeroIsZero {
+    -- Surprise: although the page says x and y cannot both be zero,
+    -- atan2(0,0) returns 0.0 rather than erroring.
+    when: Evaluates("::tcl::mathfunc::atan2 0 0")
+    ensures: completion.code = ok
+    ensures: completion.value = "0.0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncArityErrors {
+    -- Wrong arity for a math function is reported as a math-function
+    -- error, not a generic wrong-#-args error.
+    when: Evaluates("list [catch {::tcl::mathfunc::sqrt} m1] $m1 [catch {::tcl::mathfunc::sqrt 1 2} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {not enough arguments for math function \"sqrt\"} 1 {too many arguments for math function \"sqrt\"}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathfuncRejectsNonNumeric {
+    -- A non-numeric argument to a float-only function is a
+    -- floating-point conversion error naming the value.
+    when: Evaluates("catch {::tcl::mathfunc::sqrt abc} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "expected floating-point number but got \"abc\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── mathop operator commands ─────────────────────────────────────
+
+rule MathopEmptyIdentities {
+    -- Zero-argument forms of the variadic operators return their
+    -- identities; & with no arguments is minus one.
+    when: Evaluates("list [::tcl::mathop::+] [::tcl::mathop::*] [::tcl::mathop::&] [::tcl::mathop::|] [::tcl::mathop::^] [::tcl::mathop::**]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 1 -1 0 0 1"
+    -- probe: 2026-11-28 tclsh9.1 (doc/mathop.n)
+}
+
+rule MathopUnaryForms {
+    -- A single argument makes - negation, / the floating reciprocal, **
+    -- identity, and ~ bit-wise complement.
+    when: Evaluates("list [::tcl::mathop::- 5] [::tcl::mathop::/ 4] [::tcl::mathop::** 3] [::tcl::mathop::~ 0]")
+    ensures: completion.code = ok
+    ensures: completion.value = "-5 0.25 3 -1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathopLeftFoldAndIntegerDivision {
+    -- Multi-argument - and / fold left to right; leading integer
+    -- divisions floor, and an all-integer / stays an integer.
+    when: Evaluates("list [::tcl::mathop::- 10 3 2] [::tcl::mathop::/ 100 5 2] [::tcl::mathop::/ 7 2] [::tcl::mathop::/ 7 2.0]")
+    ensures: completion.code = ok
+    ensures: completion.value = "5 10 3 3.5"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathopPowerRightAssociative {
+    -- ** processes its arguments right to left: 2**(3**2).
+    when: Evaluates("::tcl::mathop::** 2 3 2")
+    ensures: completion.code = ok
+    ensures: completion.value = "512"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathopModuloTakesDivisorSign {
+    -- % follows floor division, so the residue carries the divisor's
+    -- sign.
+    when: Evaluates("list [::tcl::mathop::% -7 3] [::tcl::mathop::% 7 -3] [::tcl::mathop::% -7 -3]")
+    ensures: completion.code = ok
+    ensures: completion.value = "2 -2 -1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathopModuloByZeroErrors {
+    when: Evaluates("catch {::tcl::mathop::% 1 0} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "divide by zero"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathopBitwiseOperators {
+    -- Bit-wise and/or/xor/complement and both shifts on integers.
+    when: Evaluates("list [::tcl::mathop::& 12 10] [::tcl::mathop::| 12 10] [::tcl::mathop::^ 12 10] [::tcl::mathop::~ -1] [::tcl::mathop::<< 1 10] [::tcl::mathop::>> -8 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "8 14 6 0 1024 -4"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathopBignumWidening {
+    -- The operator commands use the same arbitrary-precision integers as
+    -- expr: addition and left shift widen, and ~ of 2^63 is a bignum.
+    when: Evaluates("list [::tcl::mathop::+ 9223372036854775807 1] [::tcl::mathop::<< 1 100] [::tcl::mathop::~ 9223372036854775808]")
+    ensures: completion.code = ok
+    ensures: completion.value = "9223372036854775808 1267650600228229401496703205376 -9223372036854775809"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathopNumericVsStringEquality {
+    -- == compares numerically when possible, while eq/ne always compare
+    -- the strings exactly.
+    when: Evaluates("list [::tcl::mathop::== 1.0 1] [::tcl::mathop::eq 1.0 1] [::tcl::mathop::ne 1.0 1] [::tcl::mathop::ne abc abd]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 1 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathopChainedNumericComparisons {
+    -- < <= > >= accept any number of arguments and require the whole
+    -- sequence to be ordered; numeric comparison takes precedence.
+    when: Evaluates("list [::tcl::mathop::< 1 2 3] [::tcl::mathop::< 1 3 2] [::tcl::mathop::<= 1 1 2] [::tcl::mathop::> 3 2 1] [::tcl::mathop::>= 3 3 2]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 1 1 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathopShortComparisonsAreTrue {
+    -- With fewer than two arguments the comparison commands vacuously
+    -- return true.
+    when: Evaluates("list [::tcl::mathop::== 5] [::tcl::mathop::< 5] [::tcl::mathop::eq 5]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1"
+    -- probe: 2026-11-28 tclsh9.1 (doc/mathop.n)
+}
+
+rule MathopListMembership {
+    -- in/ni use exact string membership of the first argument in a list.
+    when: Evaluates("list [::tcl::mathop::in 3 {1 2 3}] [::tcl::mathop::in 4 {1 2 3}] [::tcl::mathop::ni 4 {1 2 3}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathopBooleanNot {
+    -- ! negates any boolean value, including names and nonzero floats.
+    when: Evaluates("list [::tcl::mathop::! 0] [::tcl::mathop::! true] [::tcl::mathop::! 2.5]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathopArityMessages {
+    -- Fixed-arity operators report the operator's own usage string;
+    -- subtraction without arguments is an error.
+    when: Evaluates("list [catch {::tcl::mathop::% 1} m1] $m1 [catch {::tcl::mathop::!= 1 2 3} m2] $m2 [catch {::tcl::mathop::<< 1} m3] $m3 [catch {::tcl::mathop::-} m4] $m4")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {wrong # args: should be \"::tcl::mathop::% integer integer\"} 1 {wrong # args: should be \"::tcl::mathop::!= value value\"} 1 {wrong # args: should be \"::tcl::mathop::<< integer shift\"} 1 {wrong # args: should be \"::tcl::mathop::- value ?value ...?\"}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathopNonNumericOperandMessage {
+    -- Arithmetic operators name the offending value and its operand side.
+    when: Evaluates("catch {::tcl::mathop::+ 1 foo} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "cannot use non-numeric string \"foo\" as right operand of \"+\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathopNegativeShiftErrors {
+    when: Evaluates("catch {::tcl::mathop::<< 1 -1} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "negative shift argument"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathopFloatBitwiseRejected {
+    -- Bit-wise and modulo operators reject a float even when it is
+    -- integral, naming the value and operand side.
+    when: Evaluates("catch {::tcl::mathop::% 7.0 3} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "cannot use floating-point value \"7.0\" as left operand of \"%\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── 9.1 native commands (not math functions) ─────────────────────
+
+rule MathDivmodQuotientRemainder {
+    -- divmod returns {quotient remainder} using the same floor rules as
+    -- / and %, so the remainder carries the divisor's sign.
+    when: Evaluates("list [divmod 123 50] [divmod -7 3] [divmod 7 -3] [divmod 0 5]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{2 23} {-3 2} {-3 -2} {0 0}"
+    -- probe: 2026-11-28 tclsh9.1 (doc/divmod.n)
+}
+
+rule MathDivmodWidensThroughBignum {
+    -- divmod works on arbitrary-precision integers.
+    when: Evaluates("list [divmod 100000000000000000000 3] [divmod -100000000000000000000 3]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{33333333333333333333 1} {-33333333333333333334 2}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathDivmodErrors {
+    -- divmod rejects a zero divisor, non-integer operands (naming which
+    -- operand) and non-numeric text, and has its own usage string.
+    when: Evaluates("list [catch {divmod 5 0} m1] $m1 [catch {divmod 7.5 2} m2] $m2 [catch {divmod 7 2.5} m3] $m3 [catch {divmod abc 2} m4] $m4 [catch {divmod 1} m5] $m5")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {divide by zero} 1 {dividend must be an integer} 1 {divisor must be an integer} 1 {expected number but got \"abc\"} 1 {wrong # args: should be \"divmod dividend divisor\"}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathFrexpDecomposition {
+    -- frexp returns {fraction exponent} with |fraction| in [0.5,1), or
+    -- {0.0 0} for zero.
+    when: Evaluates("list [frexp 0] [frexp 0.75] [frexp 8] [frexp -8] [frexp 1] [frexp 16]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{0.0 0} {0.75 0} {0.5 4} {-0.5 4} {0.5 1} {0.5 5}"
+    -- probe: 2026-11-28 tclsh9.1 (doc/frexp.n)
+}
+
+rule MathFrexpInfinityAndNaN {
+    -- An infinite value keeps its infinity as the fraction with exponent
+    -- 0; NaN is rejected.
+    when: Evaluates("list [frexp Inf] [frexp -Inf] [catch {frexp NaN} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "{Inf 0} {-Inf 0} 1 {floating point value is Not a Number}"
+    -- probe: 2026-11-28 tclsh9.1 (doc/frexp.n)
+}
+
+rule MathModfSplitsWithSign {
+    -- modf returns {integral fractional} as floats, preserving the sign
+    -- of the input in both parts (including signed zero and infinity).
+    when: Evaluates("list [modf 3.25] [modf -3.25] [modf 0.0] [modf -0.0] [modf Inf] [modf 5]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{3.0 0.25} {-3.0 -0.25} {0.0 0.0} {-0.0 -0.0} {Inf 0.0} {5.0 0.0}"
+    -- probe: 2026-11-28 tclsh9.1 (doc/modf.n)
+}
+
+rule MathModfRejectsNaN {
+    when: Evaluates("catch {modf NaN} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "floating point value is Not a Number"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathRemquoRemainderAndQuotient {
+    -- remquo returns {remainder quotient} with the IEEE remainder and the
+    -- nearest-integer quotient (doc/remquo.n: sign and low bits identify
+    -- the octant).
+    when: Evaluates("list [remquo 7 3] [remquo 12.3 3.89] [remquo -7 3] [remquo 8 3] [remquo 8 -3]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{1.0 2} {0.6300000000000003 3} {-1.0 -2} {-1.0 3} {-1.0 -3}"
+    -- probe: 2026-11-28 tclsh9.1 (quotient is only 3-bit defined in C;
+    -- pinned to this oracle build, doc/remquo.n)
+}
+
+rule MathFpclassifyClasses {
+    -- fpclassify names all five IEEE classes; signed zero is still zero
+    -- and the largest finite double is normal.
+    when: Evaluates("list [fpclassify 0] [fpclassify -0.0] [fpclassify 1e-320] [fpclassify 1.0] [fpclassify 1.7976931348623157e308] [fpclassify Inf] [fpclassify -Inf] [fpclassify NaN]")
+    ensures: completion.code = ok
+    ensures: completion.value = "zero zero subnormal normal normal infinite infinite nan"
+    -- probe: 2026-11-28 tclsh9.1 (doc/fpclassify.n)
+}
+
+rule MathFpclassifyErrors {
+    -- Non-numeric input and wrong arity both error, with distinct
+    -- messages.
+    when: Evaluates("list [catch {fpclassify abc} m1] $m1 [catch {fpclassify} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {expected number but got \"abc\"} 1 {wrong # args: should be \"fpclassify floatValue\"}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathNativeCommandsAreNotExprFunctions {
+    -- The 9.1 decomposers are commands only: there is no
+    -- ::tcl::mathfunc::divmod, so the expr call form fails.
+    when: Evaluates("catch {expr {divmod(7,3)}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "invalid command name \"tcl::mathfunc::divmod\""
+    -- probe: 2026-11-28 tclsh9.1; doc/mathfunc.n SEE ALSO lists them as
+    -- separate commands
+}
+
+-- ── numeric boundary and string-form edges ──────────────────────
+
+rule MathIntegerDivisionWidensAtMin {
+    -- The i64 minimum divided by -1 overflows to a bignum instead of
+    -- trapping; its modulo is 0, and large operands keep full precision.
+    when: Evaluates("list [expr {(-9223372036854775807-1) / -1}] [expr {(-9223372036854775807-1) % -1}] [expr {100000000000000000000 / 3}] [expr {-100000000000000000000 % 3}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "9223372036854775808 0 33333333333333333333 2"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathFloatFormattingShortestRoundTrip {
+    -- A float string is the shortest decimal that round-trips; integral
+    -- floats keep a ".0" suffix, negative zero keeps its sign, and the
+    -- exponent form kicks in at >=1e17 and <1e-4 (5e-324 is the minimum
+    -- subnormal).
+    when: Evaluates("list [expr {1.0/3}] [expr {0.1+0.2}] [expr {2.0}] [expr {-0.0}] [expr {1e15}] [expr {1e16}] [expr {1e20}] [expr {1e-5}] [expr {0.0001}] [expr {5e-324}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0.3333333333333333 0.30000000000000004 2.0 -0.0 1000000000000000.0 10000000000000000.0 1e+20 1e-5 0.0001 5e-324"
+    -- probe: 2026-11-28 tclsh9.1 (the 1e16/1e20 pair brackets the fixed
+    -- vs exponent threshold; doc/expr.n names %g but 9.1 emits the
+    -- shortest round-trip form)
+}
+
+rule MathInfinitySpellingsAndDivision {
+    -- Inf and Infinity, with either sign, are float operands; float
+    -- division by zero yields the signed infinity (integer division by
+    -- zero is still an error, see expr.allium).
+    when: Evaluates("list [expr {Inf}] [expr {Infinity}] [expr {-Inf}] [expr {1.0/0.0}] [expr {-1.0/0.0}] [expr {1/0.0}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "Inf Inf -Inf Inf -Inf Inf"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathNaNTokenIsDomainError {
+    -- A bare NaN operand is a domain error, not a NaN value.
+    when: Evaluates("catch {expr {NaN}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "domain error: argument not in valid range"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule MathRoundSpecialValuesError {
+    -- round cannot represent infinity (overflow message) and rejects NaN,
+    -- unlike floor/ceil which pass them through as floats.
+    when: Evaluates("list [catch {expr {round(Inf)}} m1] $m1 [catch {expr {round(NaN)}} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {integer value too large to represent} 1 {floating point value is Not a Number}"
+    -- probe: 2026-11-28 tclsh9.1
+}

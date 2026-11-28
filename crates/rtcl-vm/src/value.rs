@@ -205,6 +205,114 @@ impl SeriesRep {
 
 const SERIES_MATERIALIZE_MAX: i64 = 536_870_909;
 
+/// One piece of a lazy concatenation: an arithmetic series or a literal
+/// value run (used by linsert/lreplace on huge series).
+#[derive(Debug, Clone)]
+pub enum ListSegment {
+    Series(SeriesRep),
+    Values(Vec<Value>),
+}
+
+impl ListSegment {
+    fn len(&self) -> usize {
+        match self {
+            ListSegment::Series(s) => usize::try_from(s.len.max(0)).unwrap_or(usize::MAX),
+            ListSegment::Values(v) => v.len(),
+        }
+    }
+
+    fn get(&self, i: usize) -> Option<Value> {
+        match self {
+            ListSegment::Series(s) => {
+                let i = i as i64;
+                if i < s.len { Some(s.element(i)) } else { None }
+            }
+            ListSegment::Values(v) => v.get(i).cloned(),
+        }
+    }
+
+    fn values(&self) -> Vec<Value> {
+        match self {
+            ListSegment::Series(s) => series_values(s),
+            ListSegment::Values(v) => v.clone(),
+        }
+    }
+}
+
+/// A lazy concatenation of segments (prefix + inserted/replacement run +
+/// suffix).  Used only when the result is too large to materialize.
+#[derive(Debug)]
+pub struct ConcatRep {
+    pub segs: Vec<ListSegment>,
+    pub len: usize,
+}
+
+impl ConcatRep {
+    pub fn get(&self, mut i: usize) -> Option<Value> {
+        for seg in &self.segs {
+            let n = seg.len();
+            if i < n {
+                return seg.get(i);
+            }
+            i -= n;
+        }
+        None
+    }
+
+    pub fn to_values(&self) -> Vec<Value> {
+        let mut out = Vec::with_capacity(self.len);
+        for seg in &self.segs {
+            out.extend(seg.values());
+        }
+        out
+    }
+
+    /// Slice `first..=last` (clamped) into a new ConcatRep.
+    pub fn slice(&self, first: usize, last: usize) -> ConcatRep {
+        let end = (last + 1).min(self.len);
+        let mut out: Vec<ListSegment> = Vec::new();
+        let mut pos = 0usize;
+        for seg in &self.segs {
+            let n = seg.len();
+            let lo = first.max(pos);
+            let hi = end.min(pos + n);
+            if lo < hi {
+                let a = lo - pos;
+                let b = hi - pos;
+                match seg {
+                    ListSegment::Series(s) => {
+                        out.push(ListSegment::Series(s.slice(a as i64, b as i64 - 1)));
+                    }
+                    ListSegment::Values(v) => {
+                        out.push(ListSegment::Values(v[a..b].to_vec()));
+                    }
+                }
+            }
+            pos += n;
+            if pos >= end {
+                break;
+            }
+        }
+        let len = end.saturating_sub(first);
+        ConcatRep { segs: out, len }
+    }
+
+    pub fn reverse(&self) -> ConcatRep {
+        let mut segs: Vec<ListSegment> = Vec::new();
+        for seg in self.segs.iter().rev() {
+            match seg {
+                ListSegment::Series(s) => segs.push(ListSegment::Series(s.reverse())),
+                ListSegment::Values(v) => {
+                    let mut r = v.clone();
+                    r.reverse();
+                    segs.push(ListSegment::Values(r));
+                }
+            }
+        }
+        ConcatRep { segs, len: self.len }
+    }
+}
+
 fn series_values(s: &SeriesRep) -> Vec<Value> {
     let n = s.len.max(0) as usize;
     let mut out = Vec::with_capacity(n);
@@ -245,6 +353,8 @@ pub enum InternalRep {
     HostStr(u32),
     /// 9.1 lazy arithmetic series (see [`SeriesRep`]).
     Series(SeriesRep),
+    /// Lazy concatenation of series/value runs (linsert/lreplace).
+    Concat(Rc<ConcatRep>),
     /// No internal representation yet
     None,
 }
@@ -260,6 +370,7 @@ impl Clone for InternalRep {
             InternalRep::List(v) => InternalRep::List(v.clone()),
             InternalRep::Dict(m) => InternalRep::Dict(m.clone()),
             InternalRep::Series(s) => InternalRep::Series(*s),
+            InternalRep::Concat(c) => InternalRep::Concat(Rc::clone(c)),
             InternalRep::None => InternalRep::None,
             InternalRep::HostStr(idx) => {
                 // COW 深拷贝：两个 ValueInner 即将引用同一池槽位——加池引
@@ -1174,6 +1285,65 @@ impl Value {
         }
     }
 
+    /// Build a lazy concatenation of segments.
+    pub fn from_concat(segs: Vec<ListSegment>) -> Self {
+        let len = segs.iter().map(ListSegment::len).sum();
+        Value::from_vptr(VPtr::new(ValueInner {
+            string: StringRep::new(),
+            rep: InternalRep::Concat(Rc::new(ConcatRep { segs, len })),
+            rc: Cell::new(1),
+        }))
+    }
+
+    /// Borrow the lazy concat representation, if present.
+    pub fn concat_rep(&self) -> Option<&ConcatRep> {
+        if self.is_imm() || self.is_unset() {
+            return None;
+        }
+        let inner = unsafe { self.heap_inner() };
+        match &inner.rep {
+            InternalRep::Concat(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Length of a lazy list view (series or concat), if this value has one.
+    pub fn lazy_len(&self) -> Option<usize> {
+        if let Some(s) = self.series() {
+            return Some(usize::try_from(s.len.max(0)).unwrap_or(usize::MAX));
+        }
+        self.concat_rep().map(|c| c.len)
+    }
+
+    /// Indexed read from a lazy list view.
+    pub fn lazy_get(&self, i: usize) -> Option<Value> {
+        if let Some(s) = self.series() {
+            let i = i as i64;
+            return if i < s.len { Some(s.element(i)) } else { None };
+        }
+        self.concat_rep().and_then(|c| c.get(i))
+    }
+
+    /// Slice a lazy view into concat segments (`first..=last`).
+    pub fn lazy_slice_segs(&self, first: usize, last: usize) -> Option<Vec<ListSegment>> {
+        if let Some(s) = self.series() {
+            let last = last.min(usize::try_from(s.len.max(0)).unwrap_or(usize::MAX).saturating_sub(1));
+            if first > last {
+                return Some(Vec::new());
+            }
+            return Some(vec![ListSegment::Series(s.slice(first as i64, last as i64))]);
+        }
+        self.concat_rep().map(|c| c.slice(first, last).segs)
+    }
+
+    /// Reversed segments of a lazy view.
+    pub fn lazy_reverse_segs(&self) -> Option<Vec<ListSegment>> {
+        if let Some(s) = self.series() {
+            return Some(vec![ListSegment::Series(s.reverse())]);
+        }
+        self.concat_rep().map(|c| c.reverse().segs)
+    }
+
     // ── lazy-string（§6）：宿主字符串池三态 ─────────────────────
 
     /// JsOnly 构造（lazy-string §6）：包一个宿主字符串池句柄为值。
@@ -1278,6 +1448,11 @@ impl Value {
                 }
                 InternalRep::Series(s) => {
                     let items = series_values(s);
+                    materialize_below(items.iter());
+                    SmallVec::from_slice(serialize_list(&items).as_bytes())
+                }
+                InternalRep::Concat(c) => {
+                    let items = c.to_values();
                     materialize_below(items.iter());
                     SmallVec::from_slice(serialize_list(&items).as_bytes())
                 }
@@ -1519,6 +1694,7 @@ impl Value {
                     None
                 }
             }
+            InternalRep::Concat(c) => Some(c.to_values()),
             _ => {
                 let s = self.to_str();
                 parse_list(&s)
@@ -1549,6 +1725,7 @@ impl Value {
                     })
                 }
             }
+            InternalRep::Concat(c) => Ok(c.to_values()),
             _ => {
                 let s = self.to_str();
                 parse_list_full(&s)
@@ -1795,6 +1972,7 @@ impl Value {
             InternalRep::List(_) => "list",
             InternalRep::Dict(_) => "dict",
             InternalRep::Series(_) => "list",
+            InternalRep::Concat(_) => "list",
         }
     }
 

@@ -4,15 +4,16 @@ use std::borrow::Cow;
 
 use crate::error::{Error, Result};
 use crate::interp::Interp;
-use crate::value::{SeriesRep, Value};
+use crate::value::{ConcatRep, SeriesRep, Value};
 
 use super::list::{set_error_code, strict_list, strict_list_cow, tcl_err};
 
-/// Foreach/lmap/lfilter source: an ordinary list slice or a lazy `lseq`
-/// series (never materialized just to iterate).
+/// Foreach/lmap/lfilter source: an ordinary list slice, a lazy `lseq`
+/// series, or a lazy concat (linsert/lreplace result).
 pub(crate) enum ListData<'a> {
     Slice(Cow<'a, [Value]>),
     Series(SeriesRep),
+    Concat(&'a ConcatRep),
 }
 
 impl ListData<'_> {
@@ -20,6 +21,7 @@ impl ListData<'_> {
         match self {
             ListData::Slice(s) => s.len(),
             ListData::Series(s) => usize::try_from(s.len.max(0)).unwrap_or(usize::MAX),
+            ListData::Concat(c) => c.len,
         }
     }
 
@@ -34,6 +36,7 @@ impl ListData<'_> {
                     None
                 }
             }
+            ListData::Concat(c) => c.get(i),
         }
     }
 }
@@ -41,6 +44,8 @@ impl ListData<'_> {
 pub(crate) fn list_data<'a>(interp: &mut Interp, v: &'a Value) -> Result<ListData<'a>> {
     if let Some(s) = v.series() {
         Ok(ListData::Series(s))
+    } else if let Some(c) = v.concat_rep() {
+        Ok(ListData::Concat(c))
     } else {
         Ok(ListData::Slice(strict_list_cow(interp, v)?))
     }

@@ -48,12 +48,14 @@ pub fn cmd_lsearch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     enum SearchList {
         Vec(Vec<Value>),
         Series(SeriesRep),
+        Concat(Value),
     }
     impl SearchList {
         fn len(&self) -> usize {
             match self {
                 SearchList::Vec(v) => v.len(),
                 SearchList::Series(s) => usize::try_from(s.len.max(0)).unwrap_or(usize::MAX),
+                SearchList::Concat(v) => v.concat_rep().map_or(0, |c| c.len),
             }
         }
         fn get(&self, i: usize) -> Value {
@@ -66,6 +68,10 @@ pub fn cmd_lsearch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
                         Value::empty()
                     }
                 }
+                SearchList::Concat(v) => v
+                    .concat_rep()
+                    .and_then(|c| c.get(i))
+                    .unwrap_or_else(Value::empty),
             }
         }
         fn range(&self, a: usize, b: usize) -> Vec<Value> {
@@ -293,6 +299,8 @@ pub fn cmd_lsearch(interp: &mut Interp, args: &[Value]) -> Result<Value> {
 
     let list = if let Some(s) = args[args.len() - 2].series() {
         SearchList::Series(s)
+    } else if args[args.len() - 2].concat_rep().is_some() {
+        SearchList::Concat(args[args.len() - 2].clone())
     } else {
         SearchList::Vec(strict_list(interp, &args[args.len() - 2])?)
     };

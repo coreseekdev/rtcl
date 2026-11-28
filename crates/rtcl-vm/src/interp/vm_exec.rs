@@ -172,6 +172,7 @@ enum ForeachList {
     Rep(Value),
     Owned(Vec<Value>),
     Series(crate::value::SeriesRep),
+    Concat(Value),
 }
 
 impl ForeachList {
@@ -180,6 +181,7 @@ impl ForeachList {
             ForeachList::Rep(v) => v.as_list_ref().map_or(0, <[Value]>::len),
             ForeachList::Owned(v) => v.len(),
             ForeachList::Series(s) => usize::try_from(s.len.max(0)).unwrap_or(usize::MAX),
+            ForeachList::Concat(v) => v.concat_rep().map_or(0, |c| c.len),
         }
     }
 
@@ -191,6 +193,7 @@ impl ForeachList {
                 let i = i as i64;
                 if i < s.len { Some(s.element(i)) } else { None }
             }
+            ForeachList::Concat(v) => v.concat_rep().and_then(|c| c.get(i)),
         }
     }
 }
@@ -2972,6 +2975,8 @@ fn op_foreach_start(
         let v = st.pop_val();
         if let Some(s) = v.series() {
             lists.push(ForeachList::Series(s));
+        } else if v.concat_rep().is_some() {
+            lists.push(ForeachList::Concat(v));
         } else if v.as_list_ref().is_some() {
             lists.push(ForeachList::Rep(v));
         } else {

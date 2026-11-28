@@ -324,8 +324,8 @@ pub fn cmd_llength(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         set_error_code(interp, "TCL WRONGARGS");
         return Err(wrong_args("llength", "list"));
     }
-    if let Some(s) = args[1].series() {
-        return Ok(Value::from_int(s.len));
+    if let Some(n) = args[1].lazy_len() {
+        return Ok(Value::from_int(n as i64));
     }
     let list = strict_list_cow(interp, &args[1])?;
     Ok(Value::from_int(list.len() as i64))
@@ -354,10 +354,12 @@ pub fn cmd_lindex(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     };
     for idx_val in &indices {
         let next = {
-            if let Some(s) = current.series() {
+            if let Some(n) = current.lazy_len() {
                 let idx_str = idx_val.as_str();
-                match parse_tcl_index(idx_str, s.len.max(0) as usize) {
-                    Some(raw) if raw >= 0 && (raw as i64) < s.len => s.element(raw as i64),
+                match parse_tcl_index(idx_str, n) {
+                    Some(raw) if raw >= 0 && (raw as usize) < n => {
+                        current.lazy_get(raw as usize).unwrap_or_else(Value::empty)
+                    }
                     Some(_) => return Ok(Value::empty()),
                     None => return Err(bad_index(interp, idx_str)),
                 }
@@ -425,8 +427,7 @@ pub fn cmd_lrange(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     }
     // Lazy lseq series: resolve the requested window without materializing
     // the whole (possibly 2^31-1 element) list.
-    if let Some(s) = args[1].series() {
-        let len = usize::try_from(s.len.max(0)).unwrap_or(usize::MAX);
+    if let Some(len) = args[1].lazy_len() {
         let first_raw = match parse_tcl_index(args[2].as_str(), len) {
             Some(r) => r,
             None => return Err(bad_index(interp, args[2].as_str())),
@@ -440,14 +441,15 @@ pub fn cmd_lrange(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         if first <= last && (first as usize) < len {
             let count = last - first + 1;
             if count <= SERIES_EAGER_MAX {
-                // Non-lazy version for ordinary-sized windows.
                 let mut out = Vec::with_capacity(count as usize);
                 for i in first..=last {
-                    out.push(s.element(i));
+                    out.push(args[1].lazy_get(i as usize).unwrap_or_else(Value::empty));
                 }
                 return Ok(Value::from_list(&out));
             }
-            return Ok(Value::from_series(s.slice(first, last)));
+            return Ok(Value::from_concat(
+                args[1].lazy_slice_segs(first as usize, last as usize).unwrap_or_default(),
+            ));
         }
         return Ok(Value::empty());
     }
@@ -479,6 +481,30 @@ pub fn cmd_linsert(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         set_error_code(interp, "TCL WRONGARGS");
         return Err(wrong_args("linsert", "list index ?element ...?"));
     }
+    if let Some(len) = args[1].lazy_len() {
+        let raw = match parse_tcl_index(args[2].as_str(), len + 1) {
+            Some(r) => r,
+            None => return Err(bad_index(interp, args[2].as_str())),
+        };
+        let index = raw.clamp(0, len as i64) as usize;
+        let insert: Vec<Value> = args[3..].to_vec();
+        let total = len + insert.len();
+        let mut segs = Vec::new();
+        if index > 0 {
+            segs.extend(args[1].lazy_slice_segs(0, index - 1).unwrap_or_default());
+        }
+        if !insert.is_empty() {
+            segs.push(crate::value::ListSegment::Values(insert));
+        }
+        if index < len {
+            segs.extend(args[1].lazy_slice_segs(index, len - 1).unwrap_or_default());
+        }
+        let v = Value::from_concat(segs);
+        if total as i64 <= SERIES_EAGER_MAX {
+            return Ok(Value::from_list(&v.as_list().unwrap_or_default()));
+        }
+        return Ok(v);
+    }
     let list = strict_list(interp, &args[1])?;
     let len = list.len();
     // Tcl resolves the index against len+1 (`end` means "after the last
@@ -500,6 +526,36 @@ pub fn cmd_lreplace(interp: &mut Interp, args: &[Value]) -> Result<Value> {
     if args.len() < 4 {
         set_error_code(interp, "TCL WRONGARGS");
         return Err(wrong_args("lreplace", "list first last ?element ...?"));
+    }
+    if let Some(len) = args[1].lazy_len() {
+        let first_raw = match parse_tcl_index(args[2].as_str(), len) {
+            Some(r) => r,
+            None => return Err(bad_index(interp, args[2].as_str())),
+        };
+        let last_raw = match parse_tcl_index(args[3].as_str(), len) {
+            Some(r) => r,
+            None => return Err(bad_index(interp, args[3].as_str())),
+        };
+        let first = first_raw.clamp(0, len as i64) as usize;
+        let last = last_raw.min(len as i64 - 1);
+        let replacement: Vec<Value> = args[4..].to_vec();
+        let suffix_start = if last >= first as i64 { (last + 1) as usize } else { first };
+        let total = first + replacement.len() + len.saturating_sub(suffix_start);
+        let mut segs = Vec::new();
+        if first > 0 {
+            segs.extend(args[1].lazy_slice_segs(0, first - 1).unwrap_or_default());
+        }
+        if !replacement.is_empty() {
+            segs.push(crate::value::ListSegment::Values(replacement));
+        }
+        if suffix_start < len {
+            segs.extend(args[1].lazy_slice_segs(suffix_start, len - 1).unwrap_or_default());
+        }
+        let v = Value::from_concat(segs);
+        if total as i64 <= SERIES_EAGER_MAX {
+            return Ok(Value::from_list(&v.as_list().unwrap_or_default()));
+        }
+        return Ok(v);
     }
     let list = strict_list(interp, &args[1])?;
     let len = list.len();
@@ -533,27 +589,28 @@ pub fn cmd_lassign(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         set_error_code(interp, "TCL WRONGARGS");
         return Err(wrong_args("lassign", "list ?varName ...?"));
     }
-    if let Some(s) = args[1].series() {
+    if let Some(len) = args[1].lazy_len() {
         let vars: Vec<&str> = args[2..].iter().map(|v| v.as_str()).collect();
-        let len = s.len.max(0);
         for (i, var) in vars.iter().enumerate() {
-            let value = if (i as i64) < len {
-                s.element(i as i64)
+            let value = if i < len {
+                args[1].lazy_get(i).unwrap_or_else(Value::empty)
             } else {
                 Value::empty()
             };
             interp.set_var(var, value)?;
         }
-        if len > vars.len() as i64 {
-            let rest = len - vars.len() as i64;
-            if rest <= SERIES_EAGER_MAX {
-                let mut out = Vec::with_capacity(rest as usize);
-                for i in vars.len() as i64..len {
-                    out.push(s.element(i));
+        if len > vars.len() {
+            let rest = len - vars.len();
+            if rest as i64 <= SERIES_EAGER_MAX {
+                let mut out = Vec::with_capacity(rest);
+                for i in vars.len()..len {
+                    out.push(args[1].lazy_get(i).unwrap_or_else(Value::empty));
                 }
                 return Ok(Value::from_list(&out));
             }
-            return Ok(Value::from_series(s.slice(vars.len() as i64, len - 1)));
+            return Ok(Value::from_concat(
+                args[1].lazy_slice_segs(vars.len(), len - 1).unwrap_or_default(),
+            ));
         }
         return Ok(Value::empty());
     }
@@ -625,16 +682,17 @@ pub fn cmd_lreverse(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         set_error_code(interp, "TCL WRONGARGS");
         return Err(wrong_args("lreverse", "list"));
     }
-    if let Some(s) = args[1].series() {
-        if s.len <= SERIES_EAGER_MAX {
-            // Non-lazy version for ordinary-sized series.
-            let mut out = Vec::with_capacity(s.len.max(0) as usize);
-            for i in (0..s.len).rev() {
-                out.push(s.element(i));
+    if let Some(len) = args[1].lazy_len() {
+        if len as i64 <= SERIES_EAGER_MAX {
+            let mut out = Vec::with_capacity(len);
+            for i in (0..len).rev() {
+                out.push(args[1].lazy_get(i).unwrap_or_else(Value::empty));
             }
             return Ok(Value::from_list(&out));
         }
-        return Ok(Value::from_series(s.reverse()));
+        return Ok(Value::from_concat(
+            args[1].lazy_reverse_segs().unwrap_or_default(),
+        ));
     }
     let mut list = strict_list(interp, &args[1])?;
     list.reverse();
@@ -1928,8 +1986,7 @@ mod tests {
     }
 
     #[test]
-    fn test_series_lazy_and_eager_paths_agree() {
-        let mut interp = Interp::new();
+    fn test_series_lazy_and_eager_paths_agree() {        let mut interp = Interp::new();
         // Small series: operations take the eager (non-lazy) path.
         let small = series(0, 2, 10);
         assert_eq!(
@@ -1955,6 +2012,43 @@ mod tests {
         assert_eq!(
             interp.eval("list [lindex [lreverse $b] 0] [llength [lreverse $b]]").unwrap().as_str(),
             "99999 100000"
+        );
+    }
+
+    #[test]
+    fn test_lazy_concat_insert_replace() {
+        let mut interp = Interp::new();
+        interp.set_var("s", series(0, 1, 100_000)).unwrap();
+        assert_eq!(
+            interp.eval("set a [linsert $s 2 X]; list [llength $a] [lrange $a 0 3] [lindex $a 3]").unwrap().as_str(),
+            "100001 {0 1 X 2} 2"
+        );
+        assert_eq!(interp.eval("lsearch $a X").unwrap().as_str(), "2");
+        assert_eq!(interp.eval("lsearch -exact $a 2").unwrap().as_str(), "3");
+        assert_eq!(
+            interp.eval("lmap x $a {if {$x eq {X}} break; set x}").unwrap().as_str(),
+            "0 1"
+        );
+        assert_eq!(
+            interp.eval("foreach x $a {break}; set x").unwrap().as_str(),
+            "0"
+        );
+        assert_eq!(
+            interp.eval("list [lindex [lreverse $a] 0] [llength [lreverse $a]]").unwrap().as_str(),
+            "99999 100001"
+        );
+
+        assert_eq!(
+            interp.eval("set b [lreplace $s 1 2 X Y]; list [llength $b] [lrange $b 0 4] [lindex $b end]").unwrap().as_str(),
+            "100000 {0 X Y 3 4} 99999"
+        );
+        assert_eq!(
+            interp.eval("set c [linsert $s end Z]; lindex $c end").unwrap().as_str(),
+            "Z"
+        );
+        assert_eq!(
+            interp.eval("set d [lreplace $s 0 0]; list [llength $d] [lindex $d 0]").unwrap().as_str(),
+            "99999 1"
         );
     }
 }

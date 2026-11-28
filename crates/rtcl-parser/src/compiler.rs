@@ -91,8 +91,11 @@ pub struct Compiler {
     /// dispatch 运行时解析活绑定）。proc 体编译时由解释器传入当前
     /// 被遮蔽的 Tier1 叶名：折叠 op 绕过分派，遮蔽体不可见；体编译
     /// 时代的 epoch 戳只保证「编译后无新遮蔽」，不回溯既有遮蔽。
-    /// 顶层/eval 单元恒空单——它们只在 epoch 0（遮蔽从未发生的世界）
-    /// 通过消费门（gate: code.epoch == tier1_epoch）。
+    /// D3 F3 起 eval/顶层单元同样传入（`compile_unit_skipping`/
+    /// `compile_unit_toplevel_skipping`）——epoch > 0 时新编译/失配
+    /// 重编译的单元按当前遮蔽面折叠，消费门（gate: code.epoch ==
+    /// tier1_epoch）对重编译产物即刻放行；epoch 0 传入空单，产物与
+    /// 旧 `compile_unit`/`compile_unit_toplevel` 逐字节同形。
     skip_folds: Vec<String>,
     /// 单元源码的前缀行号索引（编译入口一次 O(n)）：内联体的
     /// `line_base` 重算从 O(off) 逐体重扫降到 O(log 行数) 查表。
@@ -199,6 +202,28 @@ impl Compiler {
     ///（ByteCode.toplevel_slots）。
     pub fn compile_unit_toplevel(source: Rc<str>, commands: &[Command]) -> ByteCode {
         Self::compile_impl(source, commands, true, &[], true, &[])
+    }
+
+    /// [`Self::compile_unit`] + M3 遮蔽感知折叠。D3 F3 后 eval/顶层单元
+    /// 的编译与失配重编译共用入口：epoch > 0 的世界里单元不再「恒空单
+    /// + 恒 epoch 0」——当前被遮蔽的折叠名分派活绑定（编译产物与树遍历
+    /// 逐字节同语义），epoch 戳由调用方（解释器）盖章为当前代。
+    pub fn compile_unit_skipping(
+        source: Rc<str>,
+        commands: &[Command],
+        skip_folds: &[String],
+    ) -> ByteCode {
+        Self::compile_impl(source, commands, false, &[], false, skip_folds)
+    }
+
+    /// [`Self::compile_unit_toplevel`] + M3 遮蔽感知折叠（见
+    /// [`Self::compile_unit_skipping`]）。
+    pub fn compile_unit_toplevel_skipping(
+        source: Rc<str>,
+        commands: &[Command],
+        skip_folds: &[String],
+    ) -> ByteCode {
+        Self::compile_impl(source, commands, true, &[], true, skip_folds)
     }
 
     /// [`Self::compile_unit`] for a procedure body: `param_names` seed the

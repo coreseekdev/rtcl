@@ -23,11 +23,12 @@ pub(crate) fn tcl_log_excerpt(text: &str) -> String {
     }
 }
 
-/// 大单元回落门（TREE-FALLBACK F5，码表第二步后的唯一回落门）：
-/// 超过该长度的顶层 eval 不走 parse-cache/bytecode 快路径。默认 1MiB
-/// （256KB 旧值是 C55 的触发门）；env `RTCL_PARSE_CACHE_MAX_SCRIPT`
-/// 显式字节值优先（OnceLock 一次读——进程内 env 语义不变，同
-/// RTCL_NO_BYTECODE 口径）。
+/// 大单元直编译门（TREE-FALLBACK F5）：超过该长度的顶层 eval 不走
+/// parse-cache/bytecode **缓存**快路径，改为按请求编译执行（F5 后
+/// 不再落树；D3 前这里就是大单元的落树点）。默认 1MiB（256KB 旧值
+/// 是 C55 的触发门）；env `RTCL_PARSE_CACHE_MAX_SCRIPT` 显式字节值
+/// 优先（OnceLock 一次读——进程内 env 语义不变，同 RTCL_NO_BYTECODE
+/// 口径）。
 fn parse_cache_max_script() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -40,6 +41,33 @@ fn parse_cache_max_script() -> usize {
 }
 
 impl Interp {
+    /// eval 单元编译的唯一形状决策（首次编译与 D3 F3 失配重编译、F5
+    /// 按请求编译共用）。顶层 slot 形 = 最外层 eval（深度 1）且顶层无
+    /// foreach/lmap（C1）；M3 遮蔽感知折叠——当前被遮蔽的折叠名分派
+    /// 活绑定（产物与树遍历逐字节同语义，judge/sweep 双门钉）；epoch
+    /// 戳 = 当前 tier1_epoch。F3 前 eval 单元恒 epoch 0：任何一次 Tier1
+    /// 遮蔽 bump 后整个 eval 字节码快路径被消费门永久拒绝（每单元落
+    /// 树）；盖章后新单元与重编译产物即刻过门。
+    fn compile_eval_unit(
+        interp: &Interp,
+        source: &Rc<str>,
+        commands: &[Command],
+    ) -> rtcl_parser::ByteCode {
+        let shadows = interp.shadowed_tier1_folds();
+        let has_foreach = commands.iter().any(|c| {
+            c.words.first().map(|w| {
+                matches!(w, rtcl_parser::Word::Literal(n) if n == "foreach" || n == "lmap")
+            }) == Some(true)
+        });
+        let mut code = if interp.eval_depth == 1 && !has_foreach {
+            Compiler::compile_unit_toplevel_skipping(Rc::clone(source), commands, &shadows)
+        } else {
+            Compiler::compile_unit_skipping(Rc::clone(source), commands, &shadows)
+        };
+        code.epoch = interp.tier1_epoch;
+        code
+    }
+
     pub fn eval(&mut self, script: &str) -> Result<Value> {
         self.eval_depth += 1;
         let r = self.eval_impl(script);
@@ -164,10 +192,11 @@ impl Interp {
         // Entries are bounded: wasm32 is a target and one-shot scripts
         // (source files, trace callbacks) must not grow it unboundedly.
         const PARSE_CACHE_MAX: usize = 1024;
-        // D2 第二步：大单元回落门（F5）从 256KB 提到 1MiB（256KB 是
-        // C55 的触发门：big-unit 12000-loop ≈ 528KB 单元整段落树），
-        // env `RTCL_PARSE_CACHE_MAX_SCRIPT` 可配（字节）。F1 的 u16 操
-        // 作数上限已由宽操作数关闭，这是唯一的回落门。
+        // D2 第二步：大单元门（F5）从 256KB 提到 1MiB（256KB 是 C55 的
+        // 触发门：big-unit 12000-loop ≈ 528KB 单元整段落树），env
+        // `RTCL_PARSE_CACHE_MAX_SCRIPT` 可配（字节）。F1 的 u16 操作数
+        // 上限已由宽操作数关闭；F5 落地后超门单元按请求编译，这里只剩
+        // 「是否进缓存」的语义。
         let parse_cache_max_script = parse_cache_max_script();
         let cached = self.parse_cache.get(script).cloned();
         let unit = match cached {
@@ -217,31 +246,15 @@ impl Interp {
                     // with non-whitelisted ops carry `fallback` and are
                     // cached anyway (the check is per call — a Tier1 shadow
                     // bump must keep taking effect on cached code).
-                                        // 顶层 slot 编译（C1）：仅最外层 eval（深度 0）——
-                    // 嵌套体 eval（dict update/with、eval 命令）的变量
-                    // 链接语义依赖非 slot 编译。
-                    // foreach/lmap 排除：内联 foreach 的 bind 写帧槽，
-                    // 顶层无帧背衬（C2 tslots 落地前 defer）。
-                    // 顶层 slot 编译（C1）：仅最外层 eval（深度 0）——
-                    // 嵌套体 eval（dict update/with、eval 命令）的变量
-                    // 链接语义依赖非 slot 编译。foreach/lmap/catch 保持
-                    // 顶层分派语义（compile_unit_toplevel）。
-                    // foreach/lmap 排除：其分派语义面（bind 写帧/体作
-                    // 用域）在顶层 slot 单元未覆盖 → 非 slot 编译（classic
-                    // 或解释器路径，正确性优先）。
-                    let has_foreach = rc.commands.iter().any(|c| {
-                        c.words.first().map(|w| {
-                            matches!(w, rtcl_parser::Word::Literal(n) if n == "foreach" || n == "lmap")
-                        }) == Some(true)
-                    });
-                    let code = if self.eval_depth == 1 && !has_foreach {
-                        Rc::new(Compiler::compile_unit_toplevel(
-                            Rc::clone(&rc.source),
-                            &rc.commands,
-                        ))
-                    } else {
-                        Rc::new(Compiler::compile_unit(Rc::clone(&rc.source), &rc.commands))
-                    };
+                    //
+                    // 顶层 slot 形（C1）：仅最外层 eval（深度 1）——嵌套体
+                    // eval（dict update/with、eval 命令）的变量链接语义依
+                    // 赖非 slot 编译。foreach/lmap/catch 保持顶层分派语义
+                    // （其分派语义面——bind 写帧/体作用域——在顶层 slot 单
+                    // 元未覆盖 → 非 slot 编译，正确性优先）。形状决策与 M3
+                    // 遮蔽面、epoch 戳统一收在 [`Self::compile_eval_unit`]
+                    // （F3 失配重编译 / F5 按请求编译共用同一入口）。
+                    let code = Rc::new(Self::compile_eval_unit(self, &rc.source, &rc.commands));
                     let byte_cost = code.estimated_heap_size();
                     if self.bytecode_cache_bytes + byte_cost
                         > BYTECODE_CACHE_BYTE_BUDGET
@@ -258,25 +271,67 @@ impl Interp {
             }
         };
         // Bytecode fast path — the same gate as proc bodies (Site A).
+        // D3 F3：epoch 失配的缓存单元重编译（同一 parse 单元 + 同一形状
+        // 决策 + 当前遮蔽面，epoch 戳对齐），换入 bytecode_cache 取代失效
+        // 条目——不再落树。重编译是每单元每世代一次（换入后后续 eval 走
+        // 缓存）；fallback / trace / 手动关断照旧落树。
         if script.len() <= parse_cache_max_script {
-            if let Some(code) = self.bytecode_cache.get(script) {
-                if !code.fallback
-                    && code.epoch == self.tier1_epoch
-                    && super::vm_exec::bytecode_applicable(self)
-                {
-                    let code = Rc::clone(code);
-                    // exec_bytecode clears the lexical flag for the unit's
-                    // DynCalls and restores this unit's context itself
-                    // (and re-establishes the proc-context signal per its
-                    // own locals_mode).
-                    let r = super::vm_exec::exec_bytecode(self, &code);
+            let cached = self.bytecode_cache.get(script).map(Rc::clone);
+            let code = match cached {
+                Some(code) if !code.fallback && super::vm_exec::bytecode_applicable(self) => {
+                    if code.epoch == self.tier1_epoch {
+                        Some(code)
+                    } else {
+                        crate::interp::dbgtrace::event("recompile_eval", "");
+                        let fresh =
+                            Rc::new(Self::compile_eval_unit(self, &unit.source, &unit.commands));
+                        let byte_cost = fresh.estimated_heap_size();
+                        self.bytecode_cache_bytes = self
+                            .bytecode_cache_bytes
+                            .saturating_sub(code.estimated_heap_size())
+                            + byte_cost;
+                        self.const_pool_insert(&fresh);
+                        self.bytecode_cache
+                            .insert(Rc::clone(&unit.source), Rc::clone(&fresh));
+                        Some(fresh)
+                    }
+                }
+                _ => None,
+            };
+            if let Some(code) = code {
+                // exec_bytecode clears the lexical flag for the unit's
+                // DynCalls and restores this unit's context itself
+                // (and re-establishes the proc-context signal per its
+                // own locals_mode).
+                let r = super::vm_exec::exec_bytecode(self, &code);
+                self.lexical_body = saved_lexical;
+                self.in_locals_unit = saved_inl;
+                self.in_file_script = saved_file_ctx;
+                return r;
+            }
+        }
+        // F5：大单元直接编译入口——超 parse-cache 门的顶层 eval 不再落
+        // 树：按请求编译（同一形状决策 + 当前遮蔽面 + 当前 epoch 戳），
+        // **绕过 parse-cache 键/存入**（不进 parse_cache/bytecode_cache/
+        // const_pool——单次执行的大单元缓存即驻留税），执行后即弃。其余
+        // 门照旧：fallback 白名单外 / trace / 手动关断仍落树（tf_big）。
+        if script.len() > parse_cache_max_script {
+            if super::vm_exec::bytecode_applicable(self) {
+                let code = Self::compile_eval_unit(self, &unit.source, &unit.commands);
+                if !code.fallback {
+                    let r = super::vm_exec::exec_bytecode(self, &Rc::new(code));
                     self.lexical_body = saved_lexical;
                     self.in_locals_unit = saved_inl;
                     self.in_file_script = saved_file_ctx;
                     return r;
                 }
             }
+            crate::interp::dbgtrace::event("tf_big", "");
         }
+        // 树遍历回落点（诊断写点）：走到这里 = 门未过——fallback /
+        // trace / 手动关断（小单元），或大单元按请求编译拒绝（tf_big
+        // 已盖）。常规全字节码面（F3/F5/F6 落地后）零事件。
+        crate::interp::dbgtrace::event("tf_eval", "");
         let r = self.eval_commands(&unit);
         self.lexical_body = saved_lexical;
         self.in_locals_unit = saved_inl;
@@ -301,10 +356,11 @@ impl Interp {
         let saved_file_ctx = self.in_file_script;
         self.in_file_script = false;
         const PARSE_CACHE_MAX: usize = 1024;
-        // D2 第二步：大单元回落门（F5）从 256KB 提到 1MiB（256KB 是
-        // C55 的触发门：big-unit 12000-loop ≈ 528KB 单元整段落树），
-        // env `RTCL_PARSE_CACHE_MAX_SCRIPT` 可配（字节）。F1 的 u16 操
-        // 作数上限已由宽操作数关闭，这是唯一的回落门。
+        // D2 第二步：大单元门（F5）从 256KB 提到 1MiB（256KB 是 C55 的
+        // 触发门：big-unit 12000-loop ≈ 528KB 单元整段落树），env
+        // `RTCL_PARSE_CACHE_MAX_SCRIPT` 可配（字节）。F1 的 u16 操作数
+        // 上限已由宽操作数关闭；F5 落地后超门单元按请求编译，这里只剩
+        // 「是否进缓存」的语义。
         let parse_cache_max_script = parse_cache_max_script();
         let cached = self.parse_cache.get(script).cloned();
         let unit = match cached {
@@ -360,8 +416,12 @@ impl Interp {
     /// bodies inline into the surrounding bytecode and pays nothing per
     /// iteration).  A miss runs plain `eval` and memoizes the bytecode
     /// that eval seeded for this text; the hit path re-checks `eval`'s
-    /// bytecode gates every iteration, so a Tier1 epoch bump or a
-    /// registered exec trace falls straight back to `eval`.
+    /// applicability gates every iteration, so a registered exec trace
+    /// falls straight back to `eval`.  A Tier1 epoch bump used to pin the
+    /// body to the tree-walk — D3 F3/F6: the miss path recompiles the
+    /// stale unit through `eval`'s gate (per epoch generation), so
+    /// eviction/staleness never tree-falls a body; only fallback ops,
+    /// traces and the manual switch do.
     pub(crate) fn eval_body_value(&mut self, body: &Value) -> Result<Value> {
         // A caller that armed the "same unit" request (cmd_while/cmd_for —
         // the constructs whose bodies the compiler inlines when the gates
@@ -373,8 +433,15 @@ impl Interp {
         // script with the proc-unit context (the tree-walk twin of the
         // compiler inlining the body into the surrounding unit).
         let armed = std::mem::take(&mut self.next_eval_lexical);
-        // Pointer-identity scan of the resident bodies (FIFO, bounded):
-        // body/next of one `for` plus one nested loop's bodies all fit.
+        // Pointer-identity scan of the resident bodies (FIFO, bounded).
+        // D3 F6：容量 4→32。旧 4 槽 = 单层 for 的驻留形状（body + next
+        // + 一层嵌套的 body/next）；三层以上嵌套循环的驻留集互相挤出，
+        // 被挤出的体每次迭代退回 eval 的双哈希查取。32 覆盖 ~10 层嵌
+        // 套的驻集上界，超出仍走 FIFO 淘汰（有界驻留，wasm32 目标）。
+        // 淘汰永不落树（F3/F5 后的不变式）：miss 路径走 eval → 缓存门
+        // ——epoch 失配即重编译、超门即按请求编译、缓存被预算清掉即重
+        // 解析重编译，全部回到字节码；落树只剩 fallback / trace / 手动
+        // 关断。即「挤出后下次遇到同 body 重新编译」，不再因挤出回落。
         let hit = self
             .body_memo
             .iter()
@@ -390,7 +457,7 @@ impl Interp {
         let r = self.eval(text);
         if r.is_ok() {
             if let Some(code) = self.bytecode_cache.get(text) {
-                const BODY_MEMO_MAX: usize = 4;
+                const BODY_MEMO_MAX: usize = 32;
                 if self.body_memo.len() == BODY_MEMO_MAX {
                     self.body_memo.remove(0);
                 }

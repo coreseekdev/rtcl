@@ -59,6 +59,52 @@ pub(crate) fn compile_proc_body(
     Some(Rc::new(code))
 }
 
+/// F3：epoch 失配缓存体的重编译（失效 + 再编译，不再落树）。
+///
+/// 消费门（`code.epoch == tier1_epoch`）拒绝一个已编译体时，同一源文本
+/// 按 [`compile_proc_body`] 重走编译（当前遮蔽面 + 当前 epoch 戳），产物
+/// memo 进 [`Interp::stale_recompiles`]：键 = 失配单元的 `Rc` 身份（stale
+/// 副本被条目钉住，键不悬垂；体重定义后旧键随 FIFO 有界驻留）——同一
+/// 失配体每个 epoch 世代只重编译一次，成本在编译期一次，不在执行期。
+///
+/// `None` = 同文本重解析失败（理论不达：原编译成功过，parse 是文本的
+/// 纯函数）；调用方落树 = 旧行为兜底。**绝不把 stale 体交回执行**——
+/// 它的折叠面可能对当前世界是错的（失效的原因）。
+pub(crate) fn recompile_stale_body(
+    interp: &mut Interp,
+    stale: &Rc<ByteCode>,
+    params: &[(String, Option<String>)],
+    body: &str,
+) -> Option<Rc<ByteCode>> {
+    const STALE_RECOMPILE_MAX: usize = 32;
+    if let Some((_, fresh)) = interp
+        .stale_recompiles
+        .iter()
+        .find(|(s, _)| Rc::ptr_eq(s, stale))
+    {
+        if fresh.epoch == interp.tier1_epoch {
+            return Some(Rc::clone(fresh));
+        }
+    }
+    let shadows = interp.shadowed_tier1_folds();
+    let fresh = compile_proc_body(params, body, interp.tier1_epoch, &shadows)?;
+    crate::interp::dbgtrace::event("recompile_body", "");
+    match interp
+        .stale_recompiles
+        .iter_mut()
+        .find(|(s, _)| Rc::ptr_eq(s, stale))
+    {
+        Some(slot) => slot.1 = Rc::clone(&fresh),
+        None => {
+            if interp.stale_recompiles.len() >= STALE_RECOMPILE_MAX {
+                interp.stale_recompiles.remove(0);
+            }
+            interp.stale_recompiles.push((Rc::clone(stale), Rc::clone(&fresh)));
+        }
+    }
+    Some(fresh)
+}
+
 /// Bump [`Interp::tier1_epoch`] when `key`'s leaf name matches one of the
 /// inline-folded Tier1 commands.  Only these names can be shadowed out
 /// from under a compiled body — everything else in the bytecode goes
@@ -4611,11 +4657,166 @@ mod slot_locals_tests {
         // is name-keyed (slot gate consults the same epoch) and the body's
         // slot ops take their name fallbacks.  The shadow forwards to the
         // renamed builtin, so the observable result is unchanged.
+        // D3 F3: the stale body is now RECOMPILED at the call gate (same
+        // source text, live binding surface) and runs bytecode — the
+        // tree-walk below is only the recompile-refused backstop.
         let script = "proc p {a} { set b [expr {$a + 1}]; return $b }; \
 rename set myset; \
 proc set {args} { uplevel 1 [linsert $args 0 myset] }; \
 p 1";
         assert_eq!(ev(script), "2");
+    }
+
+    #[test]
+    fn test_f3_stale_proc_body_recompiles() {
+        // D3 F3：定义后遮蔽 Tier1 折叠名的 proc 体不再落树——失配体在
+        // 消费门重编译（memo 键 = 失配单元，重编译产物 epoch 对齐当前
+        // 代），遮蔽体经分派活绑定可见。memo 在席 = 走了重编译 →
+        // exec_bytecode（它只在 F3 门填充）。
+        let mut interp = Interp::new();
+        interp.eval("proc p {a} { incr a 10; return $a }").unwrap();
+        assert_eq!(interp.tier1_epoch, 0);
+        // `incr` 遮蔽（rename away + 重定义，Tier1 折叠名）→ bump。
+        interp.eval("rename incr myincr").unwrap();
+        interp
+            .eval("proc incr {args} { uplevel 1 [linsert $args 0 myincr] }")
+            .unwrap_or_else(|e| panic!("shadow proc must define: {e}"));
+        assert!(interp.tier1_epoch > 0, "redefining a Tier1 leaf must bump");
+        let r = interp.eval("p 5").unwrap();
+        assert_eq!(r.as_str(), "15");
+        assert!(
+            !interp.stale_recompiles.is_empty(),
+            "stale body must be recompiled (F3), not tree-walked"
+        );
+        // 每世代一次：同体同代重复调用不再重编译（memo 命中，条目数不变）。
+        let memo_len = interp.stale_recompiles.len();
+        assert_eq!(interp.eval("p 6").unwrap().as_str(), "16");
+        assert_eq!(interp.stale_recompiles.len(), memo_len);
+    }
+
+    #[test]
+    fn test_f3_stale_eval_unit_recompiles() {
+        // D3 F3：eval 单元失配重编译并换入 bytecode_cache——同文本再次
+        // eval 走字节码（条目 epoch 对齐当前代），不再整单元落树。
+        let mut interp = Interp::new();
+        interp.eval("incr x 3").unwrap();
+        assert_eq!(interp.eval("set x").unwrap().as_str(), "3");
+        let before_epoch = interp.tier1_epoch;
+        // rename away `incr`（Tier1 折叠名）→ bump；同文本 eval 的是缓存
+        // 单元——重编译后分派活绑定（incr 不存在 → 报错形状与树遍历同）。
+        interp.eval("rename incr gone_incr").unwrap();
+        assert!(interp.tier1_epoch > before_epoch);
+        // 失配重编译只换条目不新增：eval 前后缓存条目数不变（同键换值）。
+        let units_before_recomp = interp.bytecode_cache.len();
+        let err = interp.eval("incr x 3").unwrap_err();
+        assert!(
+            format!("{err:?}").contains("\"incr\""),
+            "stale fold must not fire, dispatch must: {err:?}"
+        );
+        assert_eq!(interp.bytecode_cache.len(), units_before_recomp);
+        // 字节可见形状与树遍历/tclsh 同形（catch 文本）。
+        let m = interp.eval("catch {incr x 3} m; set m").unwrap();
+        assert_eq!(m.as_str(), "invalid command name \"incr\"");
+        // 缓存条目已被重编译产物换入（epoch 对齐当前代）。
+        let recompiled = interp
+            .bytecode_cache
+            .get("incr x 3")
+            .expect("unit stays cached");
+        assert_eq!(recompiled.epoch, interp.tier1_epoch);
+        // rename 回来（另一个 bump）→ 同文本再次重编译，字节码恢复原语义。
+        interp.eval("rename gone_incr incr").unwrap();
+        assert_eq!(interp.eval("incr x 4").unwrap().as_str(), "7");
+        assert_eq!(interp.eval("set x").unwrap().as_str(), "7");
+    }
+
+    #[test]
+    fn test_f3_shadowed_at_compile_time_runs_bytecode() {
+        // D3 F3：epoch > 0 的世界里新编译的 eval 单元按当前遮蔽面折叠
+        // （遮蔽名分派），epoch 戳对齐消费门——快路径不再「一次遮蔽全
+        // 灭」。遮蔽体经分派可见（树遍历同语义）。
+        let mut interp = Interp::new();
+        interp.eval("rename incr myincr").unwrap();
+        interp
+            .eval("proc incr {args} { uplevel 1 [linsert $args 0 myincr] }")
+            .unwrap();
+        let epoch = interp.tier1_epoch;
+        assert!(epoch > 0);
+        assert_eq!(interp.eval("set y 0; incr y 5; set y").unwrap().as_str(), "5");
+        let unit = interp
+            .bytecode_cache
+            .get("set y 0; incr y 5; set y")
+            .expect("eval unit cached");
+        assert_eq!(unit.epoch, epoch, "fresh unit stamped with current epoch");
+    }
+
+    #[test]
+    fn test_f5_big_script_compiles_per_request() {
+        // D3 F5：超 parse-cache 门（默认 1MiB）的顶层 eval 按请求编译
+        // 执行——不再落树；按请求单元不进 parse_cache/bytecode_cache。
+        let mut interp = Interp::new();
+        let mut big = String::from("set acc {}\n");
+        let line = "lappend acc [expr {2 ** 3}]\n";
+        while big.len() <= 1_048_576 {
+            big.push_str(line);
+        }
+        big.push_str("llength $acc");
+        let big_len = big.len();
+        assert!(big_len > 1_048_576);
+        let r = interp.eval(&big).unwrap();
+        // 列表项数 = lappend 行数——结果正确即全单元执行完毕。
+        let n = big.matches(line).count();
+        assert_eq!(r.as_str(), n.to_string());
+        // 按请求单元不缓存（F5 门绕过键/存入）。
+        assert!(
+            !interp.parse_cache.contains_key(big.as_str()),
+            "big text must not enter parse_cache"
+        );
+        assert!(
+            !interp.bytecode_cache.contains_key(big.as_str()),
+            "big text must not enter bytecode_cache"
+        );
+        // 错误路径的字节一致形（>1MiB errorInfo 与小单元逐字节一致）由
+        // judge/audit-cases/f5-bigscript.sh 在 CLI 层验证（error_report
+        // 的文件语境帧归属），进程内不重复。
+    }
+
+    #[test]
+    fn test_f6_body_memo_capacity_nested_loops() {
+        // D3 F6：深嵌套 + 多互异动态体（非 braced 字面量才进
+        // eval_body_value/memo——braced 体被编译器内联进外层单元）。
+        // 驻集 10（5 体 + 5 next）> 旧 4 槽：容量 32 覆盖深嵌套驻集；
+        // 淘汰永不落树（F3/F5 不变式：miss 经 eval 缓存门回字节码）。
+        let mut interp = Interp::new();
+        interp
+            .eval(
+                r#"
+set acc 0
+set b1 {incr acc 1}
+set b2 {incr acc 2}
+set b3 {incr acc 3}
+set b4 {incr acc 4}
+set b5 {incr acc 5}
+for {set i 0} {$i < 2} {incr i} {
+    for {set j 0} {$j < 1} {incr j} $b1
+    for {set j 0} {$j < 1} {incr j} $b2
+    for {set j 0} {$j < 1} {incr j} $b3
+    for {set j 0} {$j < 1} {incr j} $b4
+    for {set j 0} {$j < 1} {incr j} $b5
+}
+set acc
+"#,
+            )
+            .unwrap();
+        // 2 × (1+2+3+4+5) = 30——全部动态体/next 执行完毕且语义正确。
+        assert_eq!(interp.eval("set acc").unwrap().as_str(), "30");
+        assert!(
+            interp.body_memo.len() > 4,
+            "nested-loop resident set must exceed the old 4-slot capacity, got {}",
+            interp.body_memo.len()
+        );
+        // 淘汰路径的语义面：挤出后同体仍字节码执行（结果一致）——此处
+        // 靠 10+ 驻集循环的正确性间接钉住；tf 事件由 f6-bodymemo.sh 在
+        // dbg 构建下钉 0。
     }
 
     #[test]
@@ -4751,6 +4952,49 @@ impl Interp {
         // the fold would keep `set` working after `interp hide … set`.
         for k in self.hidden_cmds.keys() {
             shadowed(k, false);
+        }
+        // F3 配套（rename-away 面）：折叠名单内、当前语境裸名解析链
+        // 解析不到内建本体的叶名也一律分派。名字整体消失（`rename incr
+        // gone`）时上面的表键在席扫描看不见它——编译照折叠发射，折叠
+        // op 运行期绕过分派静默执行内建，而树遍历/tclsh 报 invalid
+        // command（旧世界里这类单元靠 epoch-0 戳被消费门整体拒绝才没
+        // 跑错；F3 盖章/重编译后单元会真跑，缺口必须在此闭合）。缺失
+        // 名走分派 = 错误形状与树遍历逐字节同形。
+        for leaf in rtcl_parser::compiler::TIER1_FOLD_LEAVES {
+            if out.iter().any(|s| s == leaf) {
+                continue;
+            }
+            let missing = match cur {
+                Some(_) => {
+                    match crate::interp::commands::proc::resolve_command_key(self, leaf) {
+                        // 解析到的键不是内建本体（proc/alias/ensemble/
+                        // hidden 在席）即活遮蔽——与扫描判定同基准。
+                        Some(key) => {
+                            self.procs.contains_key(&key)
+                                || self.aliases.contains_key(&key)
+                                || self.import_aliases.contains_key(&key)
+                                || self.ensembles.contains_key(&key)
+                                || self.hidden_cmds.contains_key(&key)
+                                || self.commands.get(&key).copied()
+                                    != self.canonical_builtin_fn(&key)
+                        }
+                        None => true,
+                    }
+                }
+                // any-ns 口径：任意命名空间都无此叶名键 → 解析必然失败。
+                None => !self
+                    .procs
+                    .keys()
+                    .chain(self.commands.keys())
+                    .chain(self.aliases.keys())
+                    .chain(self.import_aliases.keys())
+                    .chain(self.ensembles.keys())
+                    .chain(self.hidden_cmds.keys())
+                    .any(|k| k.rsplit("::").next() == Some(*leaf)),
+            };
+            if missing {
+                out.push((*leaf).to_string());
+            }
         }
         out
     }

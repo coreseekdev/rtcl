@@ -14,6 +14,11 @@
 //! - `dispatch` —— dispatch_site 咽喉（每次编译内分派）
 //! - `eval_expr` / `eval` —— Interp::eval_expr / Interp::eval 入口
 //! - `unit` —— exec_bytecode 单元进入（重编译/重进循环放大器）
+//! - `recompile_body` / `recompile_eval` —— F3 失配重编译（proc 体 /
+//!   eval 单元）发生点（每单元每世代一次）
+//! - `tf_proc` / `tf_eval` / `tf_big` —— 树遍历回落点（call_proc 体 /
+//!   eval_impl 单元 / eval_impl 大单元按请求编译拒绝；F3/F5/F6 落地后
+//!   常规脚本应零事件）
 //! - `get_var` / `set_var` / `read_top` —— 名路径读写面（vars.rs）
 //! - `sub_end` / `foreach_next` / `for_next` —— 区域/迭代标记
 

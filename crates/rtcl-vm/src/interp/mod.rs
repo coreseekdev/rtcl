@@ -694,12 +694,20 @@ pub struct Interp {
     /// Loop-body memo: recent body `Value`s handed to
     /// [`Interp::eval_body_value`] plus their compiled forms — a pointer
     /// compare replaces `eval`'s two full-text cache hashes on every hit
-    /// (while/for/foreach bodies, `time` scripts).  A few slots, not one:
-    /// `for` alternates body and next scripts every iteration, and one
-    /// loop nested inside another needs both its own body and the outer
-    /// body/next resident (tclsh instead compiles loop bodies inline into
-    /// the surrounding bytecode and pays nothing per iteration).
+    /// (while/for/foreach bodies, `time` scripts).  32 slots, not one
+    /// (D3 F6：三层以上嵌套循环的驻留集不再互相挤出): `for` alternates
+    /// body and next scripts every iteration, and each nesting level
+    /// keeps its own body/next resident (tclsh instead compiles loop
+    /// bodies inline into the surrounding bytecode and pays nothing per
+    /// iteration).  Eviction never tree-falls (F3/F5 invariant): the
+    /// miss path recompiles through `eval`'s cache gates.
     pub(crate) body_memo: Vec<(Value, Rc<rtcl_parser::ByteCode>)>,
+    /// F3：epoch 失配体的重编译 memo（键 = 失配单元的 `Rc` 身份——
+    /// stale 副本被条目钉住所以键不悬垂；体重定义后旧键随 FIFO 有界
+    /// 驻留，上限 [`crate::interp::vm_exec`] 侧 `STALE_RECOMPILE_MAX`）。
+    /// 值 = 当前世代的重编译产物（epoch 戳对齐消费门，跨代即废）。
+    pub(crate) stale_recompiles:
+        Vec<(Rc<rtcl_parser::ByteCode>, Rc<rtcl_parser::ByteCode>)>,
     /// Compiled lambda bodies keyed by the apply term string — the term
     /// IS the lambda's identity, so params/body/bytecode are pure
     /// functions of it (tclsh caches the compiled form on the lambda
@@ -1283,6 +1291,7 @@ impl Interp {
             lambda_code_cache_bytes: 0,
             expr_check_cache_bytes: 0,
             body_memo: Vec::new(),
+            stale_recompiles: Vec::new(),
             lambda_code_cache: HashMap::new(),
             const_pool: HashMap::default(),
             in_locals_unit: false,

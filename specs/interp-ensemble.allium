@@ -1,0 +1,985 @@
+-- allium: 3
+-- interp-ensemble.allium
+-- Behaviour spec: the `interp` ensemble — the parent command and the child
+-- command it creates: interpreter creation/deletion, `eval` isolation,
+-- cross-interpreter variables (`interp set`) and channels (share/transfer),
+-- aliases and hidden commands, safe interpreters, resource limits
+-- (limit/recursionlimit/cancel), target/marktrusted/debug, background error
+-- handlers, and the dispatch menus.
+-- Oracle: tclsh 9.1.0 (core-9-1-0). Probed 2026-11-28 on this host.
+--
+-- Scope: interp alias, aliases, bgerror, cancel, children, create, debug,
+-- delete, eval, exists, expose, hide, hidden, issafe, invokehidden, limit,
+-- marktrusted, recursionlimit, set, share, target, transfer — plus the child
+-- command (`$child subcommand ...`).
+-- Excludes: build-info/pkgconfig/timerate/zipfs-root/assemble (interp.allium);
+-- aliases to coroutine commands (coroutine.allium); channel I/O semantics
+-- themselves (channel.allium) — share/transfer here only pin cross-interpreter
+-- visibility.
+-- Trigger scripts avoid the audit tool's double-dash setup marker.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── dispatch menus and arity ─────────────────────────────────────
+
+rule I2DispatchMenu {
+    -- An unknown subcommand names the full 22-face menu, alphabetically.
+    when: Evaluates("catch {interp -bogus} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"-bogus\": must be alias, aliases, bgerror, cancel, children, create, debug, delete, eval, exists, expose, hide, hidden, issafe, invokehidden, limit, marktrusted, recursionlimit, set, share, target, or transfer"
+}
+
+rule I2NoArgs {
+    when: Evaluates("catch {interp} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"interp cmd ?arg ...?\""
+}
+
+rule I2ChildCommandMenu {
+    -- The child command has its own menu; it has no cancel/share/transfer/
+    -- target and no children/delete/exists/create.
+    when: Evaluates("interp create c; catch {c gorp} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"gorp\": must be alias, aliases, bgerror, debug, eval, expose, hide, hidden, issafe, invokehidden, limit, marktrusted, recursionlimit, or set"
+}
+
+rule I2ChildCommandArity {
+    when: Evaluates("interp create c; catch {c} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"c cmd ?arg ...?\""
+}
+
+-- ── create / children / exists / delete ──────────────────────────
+
+rule I2CreateAnonymousNames {
+    -- Anonymous children are named interp0, interp1, ... in creation order.
+    when: Evaluates("list [interp create] [interp create] [interp create]")
+    ensures: completion.code = ok
+    ensures: completion.value = "interp0 interp1 interp2"
+}
+
+rule I2CreateNamedAndListed {
+    when: Evaluates("interp create foo; list [interp children] [interp exists foo]")
+    ensures: completion.code = ok
+    ensures: completion.value = "foo 1"
+}
+
+rule I2CreateDuplicateNameError {
+    when: Evaluates("interp create dup; catch {interp create dup} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "interpreter named \"dup\" already exists, cannot create"
+}
+
+rule I2CreateBadOptionMenu {
+    when: Evaluates("catch {interp create -bogus} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"-bogus\": must be -safe or --"
+}
+
+rule I2CreateTooManyArgs {
+    when: Evaluates("catch {interp create a b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"interp create ?-safe? ?--? ?path?\""
+}
+
+rule I2CreateNestedPath {
+    -- A path with several words nests the new interpreter under an existing
+    -- child; the last word is the child command name.
+    when: Evaluates("interp create a; a eval {interp create b}; list [a eval {interp children}] [interp exists {a b}] [interp eval {a b} {expr 6*7}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "b 1 42"
+}
+
+rule I2ChildrenMissingPathError {
+    when: Evaluates("catch {interp children nosuch} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "could not find interpreter \"nosuch\""
+}
+
+rule I2ExistsSelfAndNested {
+    -- The empty path (and an omitted path) denotes the invoking interpreter.
+    when: Evaluates("interp create a; a eval {interp create b}; list [interp exists] [interp exists {}] [interp exists {a b}] [interp exists {a c}] [interp exists nosuch]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 0 0"
+}
+
+rule I2DeleteRemovesDescendants {
+    when: Evaluates("interp create a; a eval {interp create b}; set r [interp delete a]; list $r [interp exists a] [interp exists {a b}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 0 0"
+}
+
+rule I2DeleteMissingInterpreterError {
+    when: Evaluates("catch {interp delete nosuch} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "could not find interpreter \"nosuch\""
+}
+
+rule I2DeleteParentThenChildError {
+    -- Paths are processed left to right; deleting the parent also removes the
+    -- nested child, so a later path into it no longer resolves.
+    when: Evaluates("interp create a; a eval {interp create b}; catch {interp delete a b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "could not find interpreter \"b\""
+}
+
+rule I2DeleteNoArgsIsNoop {
+    -- `interp delete` with no path deletes nothing and succeeds.
+    when: Evaluates("interp create a; list [interp delete] [interp children]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} a"
+}
+
+-- ── eval: isolation and completion propagation ───────────────────
+
+rule I2EvalReturnsChildResult {
+    when: Evaluates("interp create c; list [interp eval c {expr 2+3}] [interp eval c set z 9] [interp eval c {set z}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "5 9 9"
+}
+
+rule I2EvalConcatenatesArgs {
+    -- Multiple script arguments are concatenated like `concat` before eval.
+    when: Evaluates("interp create c; interp eval c {set a} 1")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}
+
+rule I2EvalIsolatedVariables {
+    -- Parent variables are not visible in the child and vice versa.
+    when: Evaluates("set g 1; interp create c; list [interp eval c {info exists g}] [catch {interp eval c {set g}} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 1 {can't read \"g\": no such variable}"
+}
+
+rule I2EvalIsolatedCommands {
+    when: Evaluates("interp create c; interp eval c {proc only {} {return H}}; list [info commands only] [interp eval c {info commands only}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} only"
+}
+
+rule I2EvalPropagatesErrorCode {
+    -- Error options set in the child survive the boundary intact.
+    when: Evaluates("interp create c; catch {interp eval c {error boom {} {MY CODE}}} m o; list $m [dict get $o -errorcode] [dict get $o -code]")
+    ensures: completion.code = ok
+    ensures: completion.value = "boom {MY CODE} 1"
+}
+
+rule I2EvalPropagatesErrorInfo {
+    when: Evaluates("interp create c; catch {interp eval c {proc q {} {error deep}; q}} m o; list [dict get $o -code] [dict get $o -level] [string match {*deep*} [dict get $o -errorinfo]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 1"
+}
+
+rule I2EvalBreakContinueCodes {
+    -- Non-ok, non-error completions cross as their own catch codes.
+    when: Evaluates("interp create c; list [catch {interp eval c {break}} m] $m [catch {interp eval c {continue}} n] $n")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 {} 4 {}"
+}
+
+rule I2EvalTopLevelReturnIsOk {
+    -- A top-level `return` in the child is a normal result of `interp eval`.
+    when: Evaluates("interp create c; list [catch {interp eval c {return hi}} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 hi"
+}
+
+rule I2EvalCustomReturnCode {
+    when: Evaluates("interp create c; list [catch {interp eval c {return -code 7 hi}} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "7 hi"
+}
+
+rule I2EvalRunsInChildCurrentFrame {
+    -- The script runs in the child's current frame, so a parent alias invoked
+    -- from a child proc observes the child's frame level.
+    when: Evaluates("interp create c; proc probe {args} {interp eval c {info level}}; interp alias c pf {} probe; interp eval c {proc g {} {pf}; g}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}
+
+rule I2EvalSeesChildLocals {
+    when: Evaluates("interp create c; proc probe {args} {interp eval c {list [info exists loc] $loc}}; interp alias c pf {} probe; interp eval c {proc g {} {set loc L; pf}; g}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 L"
+}
+
+rule I2EvalMissingInterpreter {
+    when: Evaluates("catch {interp eval nosuch {set a 1}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "could not find interpreter \"nosuch\""
+}
+
+rule I2EvalNoArgs {
+    when: Evaluates("catch {interp eval} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"interp eval path arg ?arg ...?\""
+}
+
+-- ── set: cross-interpreter variables (9.1, TIP 728) ──────────────
+
+rule I2SetReadsWrites {
+    -- `interp set` writes and returns the value; with no value it reads.
+    when: Evaluates("interp create c; list [interp set c v 5] [interp set c v] [interp eval c {set v}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "5 5 5"
+}
+
+rule I2SetMissingVariable {
+    when: Evaluates("interp create c; catch {interp set c nope} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "can't read \"nope\": no such variable"
+}
+
+rule I2SetArrayElement {
+    when: Evaluates("interp create c; interp set c arr(k) 3; list [interp eval c {set arr(k)}] [interp eval c {array names arr}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 k"
+}
+
+rule I2SetHonoursWriteTrace {
+    -- Traces installed in the child fire for `interp set`, like `set`.
+    when: Evaluates("interp create c; interp eval c {trace add variable w write {apply {{a b o} {set ::tr 1}}}}; interp set c w 5; list [interp eval c {set w}] [interp eval c {info exists ::tr}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "5 1"
+}
+
+rule I2SetReadTraceChangesValue {
+    -- A read trace may change the value `interp set` returns.
+    when: Evaluates("interp create c; interp eval c {set r 1; trace add variable r read {apply {{a b o} {upvar 1 $a v; set v 99}}}}; interp set c r")
+    ensures: completion.code = ok
+    ensures: completion.value = "99"
+}
+
+rule I2SetIsolatedFromParent {
+    when: Evaluates("interp create c; interp set c only 1; list [interp set c only] [info exists only]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+}
+
+rule I2SetChildCommand {
+    when: Evaluates("interp create c; list [c set v 3] [c set v]")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 3"
+}
+
+-- ── aliases: creation, listing, deletion, target rules ───────────
+
+rule I2AliasCreateAndInvoke {
+    -- The create form returns the source token; args given at creation are
+    -- prepended before the invocation arguments.
+    when: Evaluates("interp create c; set t [interp alias c foo {} list X]; list $t [interp eval c {foo Y}] [interp aliases c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "foo {X Y} foo"
+}
+
+rule I2AliasGetForm {
+    when: Evaluates("interp create c; interp alias c foo {} list A B; list [interp alias c foo] [c alias foo]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{list A B} {list A B}"
+}
+
+rule I2AliasMissingGetIsEmpty {
+    -- Reading an alias that does not exist is not an error; it is empty.
+    when: Evaluates("interp create c; interp alias c nope")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+}
+
+rule I2AliasDelete {
+    -- The empty-target form deletes the alias; the command disappears.
+    when: Evaluates("interp create c; interp alias c foo {} list; list [interp alias c foo {}] [interp aliases c] [interp eval c {info commands foo}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {} {}"
+}
+
+rule I2AliasDeleteMissingError {
+    when: Evaluates("interp create c; catch {interp alias c nope {}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "alias \"nope\" not found"
+}
+
+rule I2AliasTargetArgsNotSubstituted {
+    -- Words passed at creation are stored literally; the child cannot make the
+    -- parent substitute them when invoking the alias.
+    when: Evaluates("interp create c; set ::x 5; interp alias c foo {} list {$::x}; interp eval c {foo}")
+    ensures: completion.code = ok
+    ensures: completion.value = "{$::x}"
+}
+
+rule I2AliasSourceArgsSubstituted {
+    -- Arguments at the call site are substituted once, in the source interp.
+    when: Evaluates("interp create c; interp alias c foo {} list; interp eval c {set v V; foo $v}")
+    ensures: completion.code = ok
+    ensures: completion.value = "V"
+}
+
+rule I2AliasToDeletedTarget {
+    -- The target is resolved at invocation time, not at creation time.
+    when: Evaluates("interp create c; interp alias c foo {} nosuchcmd; catch {interp eval c {foo}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "invalid command name \"nosuchcmd\""
+}
+
+rule I2AliasTokenStableAcrossRename {
+    -- The token identifies the source command even after it is renamed.
+    when: Evaluates("interp create c; set t [interp alias c foo {} list]; interp eval c {rename foo bar}; list [interp aliases c] [interp eval c {bar X}] [catch {interp eval c {foo}} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "foo X 1 {invalid command name \"foo\"}"
+}
+
+rule I2AliasDeleteByTokenAfterRename {
+    when: Evaluates("interp create c; set t [interp alias c foo {} list]; interp eval c {rename foo bar}; interp alias c $t {}; interp eval c {info commands bar}")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+}
+
+rule I2AliasCanTargetInvokehidden {
+    -- An alias may invoke a hidden command through `interp invokehidden`; the
+    -- hidden name stays unavailable to ordinary child scripts.
+    when: Evaluates("interp create c; interp hide c set; interp alias c foo {} interp invokehidden c set; interp eval c {foo q 8}")
+    ensures: completion.code = ok
+    ensures: completion.value = "8"
+}
+
+rule I2AliasCrossInterpreter {
+    -- The target path may be a different child; the alias is created in the
+    -- source child and invokes in the target child.
+    when: Evaluates("interp create a; interp create b; interp alias b call a list; list [b eval {call Z}] [interp target b call]")
+    ensures: completion.code = ok
+    ensures: completion.value = "Z a"
+}
+
+rule I2AliasParentInvisibleInChild {
+    when: Evaluates("interp alias {} pa {} list; interp create c; list [c eval {info commands pa}] [catch {c eval {pa X}} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 1 {invalid command name \"pa\"}"
+}
+
+rule I2AliasReplacesExistingCommand {
+    -- Creating an alias over an existing child command replaces it.
+    when: Evaluates("interp create c; interp eval c {proc foo {} {return P}}; interp alias c foo {} list; interp eval c {foo X}")
+    ensures: completion.code = ok
+    ensures: completion.value = "X"
+}
+
+rule I2AliasReloadReplacesTarget {
+    when: Evaluates("interp create c; interp alias c foo {} list A; interp alias c foo {} list B; interp eval c {foo C}")
+    ensures: completion.code = ok
+    ensures: completion.value = "B C"
+}
+
+rule I2AliasPathOnlyArity {
+    when: Evaluates("interp create a; catch {interp alias a} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"interp alias childPath childCmd ?parentPath parentCmd? ?arg ...?\""
+}
+
+rule I2AliasMissingInterpreter {
+    when: Evaluates("catch {interp alias nosuch foo {} list} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "could not find interpreter \"nosuch\""
+}
+
+rule I2AliasesChildCommand {
+    -- The child command's `aliases`/`alias` forms agree with the parent view.
+    when: Evaluates("interp create c; interp alias c foo {} list; list [c aliases] [c alias foo]")
+    ensures: completion.code = ok
+    ensures: completion.value = "foo list"
+}
+
+rule I2ChildAliasCreate {
+    -- `child alias name target ?arg...?` always targets the parent.
+    when: Evaluates("interp create c; c alias foo list A; interp eval c {foo B}")
+    ensures: completion.code = ok
+    ensures: completion.value = "A B"
+}
+
+rule I2ChildAliasDelete {
+    when: Evaluates("interp create c; c alias foo list; c alias foo {}; list [c aliases] [interp eval c {info commands foo}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {}"
+}
+
+-- ── target ───────────────────────────────────────────────────────
+
+rule I2TargetSelfIsEmpty {
+    -- An alias whose target is the invoking interpreter has the empty path.
+    when: Evaluates("interp alias {} ta {} list; interp target {} ta")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+}
+
+rule I2TargetChildPath {
+    when: Evaluates("interp create a; interp alias {} cross a list; list [interp target {} cross] [cross X]")
+    ensures: completion.code = ok
+    ensures: completion.value = "a X"
+}
+
+rule I2TargetNestedPath {
+    when: Evaluates("interp create a; a eval {interp create b}; interp alias {} deep {a b} list; list [interp target {} deep] [deep W]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a b} W"
+}
+
+rule I2TargetMissingAlias {
+    when: Evaluates("catch {interp target {} nosuch} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "alias \"nosuch\" in path \"\" not found"
+}
+
+rule I2TargetArity {
+    when: Evaluates("interp create i; catch {interp target i} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"interp target path alias\""
+}
+
+-- ── hide / expose / hidden / invokehidden ────────────────────────
+
+rule I2HideMakesCommandUnavailable {
+    -- Hiding moves a command to a separate hidden namespace: plain child
+    -- scripts no longer see it, `interp invokehidden` still reaches it.
+    when: Evaluates("interp create c; interp eval c {proc h {} {return H}}; interp hide c h; list [interp hidden c] [catch {interp eval c {h}} m] $m [interp invokehidden c h]")
+    ensures: completion.code = ok
+    ensures: completion.value = "h 1 {invalid command name \"h\"} H"
+}
+
+rule I2HideRename {
+    when: Evaluates("interp create c; interp eval c {proc h {} {return H}}; interp hide c h hh; list [interp hidden c] [interp invokehidden c hh]")
+    ensures: completion.code = ok
+    ensures: completion.value = "hh H"
+}
+
+rule I2HideDuplicateHiddenError {
+    when: Evaluates("interp create c; interp hide c set s1; interp eval c {proc set {} {}}; catch {interp hide c set s1} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "hidden command named \"s1\" already exists"
+}
+
+rule I2HideUnknownCommandError {
+    when: Evaluates("interp create c; catch {interp hide c nosuch} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown command \"nosuch\""
+}
+
+rule I2HideRejectsNamespaceQualifier {
+    when: Evaluates("interp create c; catch {interp hide c ::set} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "cannot use namespace qualifiers in hidden command token (rename)"
+}
+
+rule I2ExposeRestores {
+    when: Evaluates("interp create c; interp eval c {proc h {} {return H}}; interp hide c h; interp expose c h; list [interp hidden c] [interp eval c {h}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} H"
+}
+
+rule I2ExposeRename {
+    when: Evaluates("interp create c; interp hide c set; interp expose c set put; list [interp eval c {put k 3}] [interp eval c {info commands put}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 put"
+}
+
+rule I2ExposeExistingNameError {
+    when: Evaluates("interp create c; interp hide c set; interp eval c {proc put {} {return P}}; catch {interp expose c set put} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "exposed command \"put\" already exists"
+}
+
+rule I2ExposeUnknownHiddenError {
+    when: Evaluates("interp create c; catch {interp expose c nosuch} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown hidden command \"nosuch\""
+}
+
+rule I2ExposeRejectsNamespace {
+    when: Evaluates("interp create c; interp hide c set; catch {interp expose c set ::set} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "cannot expose to a namespace (use expose to toplevel, then rename)"
+}
+
+rule I2HiddenEmpty {
+    when: Evaluates("interp create c; interp hidden c")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+}
+
+rule I2HiddenNestedPath {
+    when: Evaluates("interp create a; a eval {interp create b}; interp eval {a b} {proc h {} {return H}}; interp hide {a b} h; list [interp hidden {a b}] [interp eval {a b} {info commands h}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "h {}"
+}
+
+rule I2InvokehiddenNoSubstitution {
+    -- Arguments are passed verbatim: no substitution or evaluation happens.
+    when: Evaluates("interp create c; interp eval c {proc echo {args} {return $args}}; interp hide c echo; interp invokehidden c echo {$::tcl_version}")
+    ensures: completion.code = ok
+    ensures: completion.value = "{$::tcl_version}"
+}
+
+rule I2InvokehiddenExposedNameRejected {
+    -- `invokehidden` only reaches the hidden namespace; an exposed command is
+    -- not a hidden command.
+    when: Evaluates("interp create c; catch {interp invokehidden c set x 1} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "invalid hidden command name \"set\""
+}
+
+rule I2InvokehiddenArity {
+    when: Evaluates("interp create c; catch {interp invokehidden c} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"interp invokehidden path ?-namespace ns? ?-global? ?--? cmd ?arg ..?\""
+}
+
+rule I2InvokehiddenNamespaceAndGlobal {
+    -- Both selection options are accepted; the command runs and returns.
+    when: Evaluates("interp create c; interp eval c {namespace eval ns {}; proc h {} {return H}}; interp hide c h; list [interp invokehidden c -global h] [interp invokehidden c -namespace ::ns h]")
+    ensures: completion.code = ok
+    ensures: completion.value = "H H"
+}
+
+rule I2InvokehiddenFromChildFrame {
+    -- Invoking from inside a child proc adds that proc's frame to the hidden
+    -- command's level.
+    when: Evaluates("interp create c; interp eval c {proc h {} {info level}; proc g {} {interp invokehidden {} h}}; interp hide c h; interp eval c {g}")
+    ensures: completion.code = ok
+    ensures: completion.value = "2"
+}
+
+-- ── safe interpreters ────────────────────────────────────────────
+
+rule I2SafeIssafeFlags {
+    when: Evaluates("interp create -safe s1; interp create s2; list [interp issafe s1] [interp issafe s2] [interp issafe]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 0"
+}
+
+rule I2SafeHidesDangerousCommands {
+    -- A safe interpreter hides (rather than deletes) the dangerous commands.
+    when: Evaluates("interp create -safe s; list [expr {[lsearch -exact [interp hidden s] open]>=0}] [interp eval s {info commands open}] [catch {interp eval s {open /etc/passwd}} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {} 1 {invalid command name \"open\"}"
+}
+
+rule I2SafeHasFewerCommands {
+    -- A safe child exposes fewer commands than a trusted one.
+    when: Evaluates("interp create -safe s; expr {[llength [interp eval s {info commands}]] < [llength [info commands]]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}
+
+rule I2SafeNoEnvironment {
+    -- The environment array is not created in a safe interpreter.
+    when: Evaluates("interp create -safe s; list [interp eval s {array exists env}] [catch {interp eval s {set env(HOME)}} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 1 {can't read \"env(HOME)\": no such variable}"
+}
+
+rule I2SafeHasCoreCommands {
+    when: Evaluates("interp create -safe s; list [interp eval s {expr 2+3}] [interp eval s {set x 4}] [interp eval s {proc p {} {return P}; p}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "5 4 P"
+}
+
+rule I2SafeChildOfSafeIsSafe {
+    -- `-safe` is inherited: a child created by a safe interpreter is safe.
+    when: Evaluates("interp create -safe s; interp eval s {interp create t}; list [interp issafe {s t}] [interp children s]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 t"
+}
+
+rule I2SafeCannotHideOrExpose {
+    when: Evaluates("interp create -safe s; list [catch {interp eval s {interp hide {} open}} m1] $m1 [catch {interp eval s {interp expose {} open}} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {permission denied: safe interpreter cannot hide commands} 1 {permission denied: safe interpreter cannot expose commands}"
+}
+
+rule I2SafeCannotMarkTrusted {
+    when: Evaluates("interp create -safe s; catch {interp eval s {interp marktrusted {}}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "permission denied: safe interpreter cannot mark trusted"
+}
+
+rule I2SafeCannotInvokeHidden {
+    when: Evaluates("interp create -safe s; catch {interp eval s {interp invokehidden {} open /etc/passwd}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "not allowed to invoke hidden commands from safe interpreter"
+}
+
+rule I2SafeAliasToParentCommand {
+    -- The supported escape hatch: the trusted parent shares one command by
+    -- alias; the child cannot reach anything else.
+    when: Evaluates("interp create -safe s; interp alias s add {} expr {2+3}; s eval {add}")
+    ensures: completion.code = ok
+    ensures: completion.value = "5"
+}
+
+-- ── marktrusted ──────────────────────────────────────────────────
+
+rule I2MarktrustedFlipsIssafe {
+    when: Evaluates("interp create -safe s; list [interp marktrusted s] [interp issafe s]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 0"
+}
+
+rule I2MarktrustedDoesNotExpose {
+    -- Trusting an interpreter does not move its hidden commands back out.
+    when: Evaluates("interp create -safe s; interp marktrusted s; list [catch {interp eval s {open /etc/passwd}} m] $m [interp eval s {info commands open}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {invalid command name \"open\"} {}"
+}
+
+rule I2MarktrustedAllowsInvokehidden {
+    when: Evaluates("interp create -safe s; interp hide s set; interp marktrusted s; list [interp eval s {interp invokehidden {} set q 9}] [interp eval s {info exists q}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "9 1"
+}
+
+-- ── debug ────────────────────────────────────────────────────────
+
+rule I2DebugGetDefault {
+    when: Evaluates("interp create c; list [interp debug c] [interp debug c -frame]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{-frame 0} 0"
+}
+
+rule I2DebugSetOn {
+    when: Evaluates("interp create c; list [interp debug c -frame 1] [interp debug c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {-frame 1}"
+}
+
+rule I2DebugCannotTurnOff {
+    -- Once frame debugging is on it cannot be switched back off; the attempt
+    -- is silently ignored.
+    when: Evaluates("interp create c; interp debug c -frame 1; list [interp debug c -frame 0] [interp debug c -frame]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+}
+
+rule I2DebugBadOption {
+    when: Evaluates("interp create c; catch {interp debug c -bogus} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad debug option \"-bogus\": must be -frame"
+}
+
+rule I2DebugChildCommand {
+    when: Evaluates("interp create c; list [c debug] [c debug -frame 1] [c debug -frame]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{-frame 0} 1 1"
+}
+
+-- ── bgerror ──────────────────────────────────────────────────────
+
+rule I2BgerrorDefault {
+    -- The default background-exception handler is ::tcl::Bgerror.
+    when: Evaluates("interp create c; interp bgerror c")
+    ensures: completion.code = ok
+    ensures: completion.value = "::tcl::Bgerror"
+}
+
+rule I2BgerrorSetAndGet {
+    when: Evaluates("interp create c; list [interp bgerror c {myhandler pre}] [interp bgerror c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{myhandler pre} {myhandler pre}"
+}
+
+rule I2BgerrorEmptyPrefixRejected {
+    -- A handler is a non-empty command prefix, not an empty list.
+    when: Evaluates("interp create c; catch {interp bgerror c {}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "cmdPrefix must be list of length >= 1"
+}
+
+rule I2BgerrorChildCommand {
+    when: Evaluates("interp create c; list [c bgerror] [c bgerror h] [c bgerror]")
+    ensures: completion.code = ok
+    ensures: completion.value = "::tcl::Bgerror h h"
+}
+
+-- ── resource limits: limit ───────────────────────────────────────
+
+rule I2LimitCommandConfig {
+    when: Evaluates("interp create c; interp limit c command")
+    ensures: completion.code = ok
+    ensures: completion.value = "-command {} -granularity 1 -value {}"
+}
+
+rule I2LimitTimeConfig {
+    when: Evaluates("interp create c; interp limit c time")
+    ensures: completion.code = ok
+    ensures: completion.value = "-command {} -granularity 10 -milliseconds {} -seconds {}"
+}
+
+rule I2LimitGetSingleOption {
+    when: Evaluates("interp create c; list [interp limit c command -value] [interp limit c command -granularity] [interp limit c command -command]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 1 {}"
+}
+
+rule I2LimitSetPairs {
+    -- Several option/value pairs may be set in one call; setting returns empty.
+    when: Evaluates("interp create c; list [interp limit c command -granularity 5 -value 50] [interp limit c command]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {-command {} -granularity 5 -value 50}"
+}
+
+rule I2LimitClearValue {
+    -- The empty value removes the limit.
+    when: Evaluates("interp create c; interp limit c command -value 100; list [interp limit c command -value {}] [interp limit c command -value]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {}"
+}
+
+rule I2LimitPluralAlias {
+    -- The menu spells the type `commands`; `command` is the accepted prefix.
+    when: Evaluates("interp create c; list [interp limit c commands -value 42] [interp limit c command -value]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 42"
+}
+
+rule I2LimitBadTypeMenu {
+    when: Evaluates("interp create c; catch {interp limit c bogus} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad limit type \"bogus\": must be commands or time"
+}
+
+rule I2LimitBadOptionMenu {
+    when: Evaluates("interp create c; catch {interp limit c command -bogus 1} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"-bogus\": must be -command, -granularity, or -value"
+}
+
+rule I2LimitCommandExceeded {
+    -- Exceeding the command budget is an error with errorCode TCL LIMIT
+    -- COMMANDS; catch in the child cannot stop it.
+    when: Evaluates("interp create c; interp limit c command -value 10; catch {interp eval c {for {set i 0} {$i<100} {incr i} {}}} m o; list $m [dict get $o -errorcode]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{command count limit exceeded} {TCL LIMIT COMMANDS}"
+}
+
+rule I2LimitTimeExceeded {
+    -- A time limit in the past fires at the first check point once
+    -- granularity 1 is selected; errorCode is TCL LIMIT TIME.
+    when: Evaluates("interp create c; interp limit c time -seconds 1 -granularity 1; catch {interp eval c {for {set i 0} {$i<100} {incr i} {}}} m o; list $m [dict get $o -errorcode]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{time limit exceeded} {TCL LIMIT TIME}"
+}
+
+rule I2LimitCallbackCanRelax {
+    -- The -command script runs when the limit is hit; if it raises the limit
+    -- the child keeps going and no error escapes.
+    when: Evaluates("interp create c; interp limit c command -command {interp limit c command -value 1000} -value 1; list [catch {interp eval c {expr 1+1}} m] $m [interp limit c command -value]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 2 1000"
+}
+
+rule I2LimitCallbackRunsInParentGlobal {
+    -- The callback script executes in the reading interpreter's global
+    -- namespace, not in the limited child.
+    when: Evaluates("interp create c; interp limit c command -command {set ::callee [namespace current]} -value 1; catch {interp eval c {expr 1+1}} m; list $::callee $m")
+    ensures: completion.code = ok
+    ensures: completion.value = ":: {command count limit exceeded}"
+}
+
+rule I2LimitBadInteger {
+    when: Evaluates("interp create c; catch {interp limit c command -value abc} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "expected integer but got \"abc\""
+}
+
+rule I2LimitNegativeSeconds {
+    when: Evaluates("interp create c; catch {interp limit c time -seconds -5} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "seconds must be non-negative"
+}
+
+rule I2LimitArity {
+    when: Evaluates("interp create c; catch {interp limit c} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"interp limit path limitType ?-option value ...?\""
+}
+
+rule I2LimitChildCommand {
+    when: Evaluates("interp create c; list [c limit command -value 7] [c limit command -value]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 7"
+}
+
+-- ── resource limits: recursionlimit ──────────────────────────────
+
+rule I2RecursionLimitDefault {
+    when: Evaluates("interp create c; interp recursionlimit c")
+    ensures: completion.code = ok
+    ensures: completion.value = "1000"
+}
+
+rule I2RecursionLimitSet {
+    when: Evaluates("interp create c; list [interp recursionlimit c 100] [interp recursionlimit c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "100 100"
+}
+
+rule I2RecursionLimitEnforced {
+    when: Evaluates("interp create c; interp recursionlimit c 30; interp eval c {proc f {} {f}; catch {f} m; set m}")
+    ensures: completion.code = ok
+    ensures: completion.value = "too many nested evaluations (infinite loop?)"
+}
+
+rule I2RecursionLimitInherited {
+    -- A new child starts with its parent's current recursion limit.
+    when: Evaluates("interp recursionlimit {} 500; interp create c; interp recursionlimit c")
+    ensures: completion.code = ok
+    ensures: completion.value = "500"
+}
+
+rule I2RecursionLimitPositive {
+    when: Evaluates("interp create c; catch {interp recursionlimit c 0} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "recursion limit must be > 0"
+}
+
+rule I2RecursionLimitArity {
+    when: Evaluates("interp create c; catch {interp recursionlimit c 1 2} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"interp recursionlimit path ?newlimit?\""
+}
+
+rule I2RecursionLimitChildCommand {
+    when: Evaluates("interp create c; list [c recursionlimit 77] [interp recursionlimit c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "77 77"
+}
+
+-- ── cancel ───────────────────────────────────────────────────────
+
+rule I2CancelIdleIsNoop {
+    -- Cancelling an interpreter that is not evaluating succeeds silently.
+    when: Evaluates("interp create c; list [interp cancel c] [interp cancel -unwind c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {}"
+}
+
+rule I2CancelDefaultMessage {
+    when: Evaluates("interp create c; proc k {args} {interp cancel c}; interp alias c stop {} k; catch {interp eval c {stop}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "eval canceled"
+}
+
+rule I2CancelCustomResult {
+    when: Evaluates("interp create c; proc k {args} {interp cancel c {custom msg}}; interp alias c stop {} k; catch {interp eval c {stop}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "custom msg"
+}
+
+rule I2CancelCatchIntercepts {
+    -- Without -unwind the cancellation stops at the child's enclosing catch.
+    when: Evaluates("interp create c; proc k {args} {interp cancel c CMSG}; interp alias c stop {} k; interp eval c {catch {stop} m; set m}")
+    ensures: completion.code = ok
+    ensures: completion.value = "CMSG"
+}
+
+rule I2CancelUnwindBypassesCatch {
+    -- With -unwind the child's catch is bypassed; the error reaches the
+    -- parent's interp eval.
+    when: Evaluates("interp create c; proc k {args} {interp cancel -unwind c CMSG}; interp alias c stop {} k; list [catch {interp eval c {catch {stop} m; set m}} e] $e")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 CMSG"
+}
+
+rule I2CancelBadOptionMenu {
+    when: Evaluates("interp create c; catch {interp cancel -bogus c} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"-bogus\": must be -unwind or --"
+}
+
+-- ── channel sharing: share / transfer ────────────────────────────
+
+rule I2ShareMakesChannelVisible {
+    -- A shared channel is open in both interpreters.
+    when: Evaluates("interp create c; set f [open /tmp/rtcl-i2-share-vis.txt w]; interp share {} $f c; set has [expr {[lsearch -exact [interp eval c {file channels}] $f] >= 0}]; interp eval c [list close $f]; close $f; file delete /tmp/rtcl-i2-share-vis.txt; set has")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}
+
+rule I2ShareWritesThrough {
+    -- Data written in the child lands in the parent's file once both close.
+    when: Evaluates("interp create c; set f [open /tmp/rtcl-i2-share-write.txt w]; interp share {} $f c; interp eval c [list chan puts -nonewline $f hello]; interp eval c [list close $f]; close $f; set n [file size /tmp/rtcl-i2-share-write.txt]; file delete /tmp/rtcl-i2-share-write.txt; set n")
+    ensures: completion.code = ok
+    ensures: completion.value = "5"
+}
+
+rule I2ShareParentCloseKeepsChild {
+    -- Each interpreter holds its own reference; the child can still use the
+    -- channel after the parent closes it.
+    when: Evaluates("interp create c; set f [open /tmp/rtcl-i2-share-keep.txt w]; interp share {} $f c; close $f; set r [list [catch {interp eval c [list chan puts -nonewline $f hi]} m] $m [expr {[lsearch -exact [interp eval c {file channels}] $f] >= 0}]]; interp eval c [list close $f]; file delete /tmp/rtcl-i2-share-keep.txt; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 {} 1"
+}
+
+rule I2ShareFromAnotherInterp {
+    -- srcPath need not be the invoking interpreter.
+    when: Evaluates("interp create a; interp create b; set f [open /tmp/rtcl-i2-share-src.txt w]; interp transfer {} $f a; interp share a $f b; set inb [expr {[lsearch -exact [interp eval b {file channels}] $f] >= 0}]; interp eval a [list close $f]; interp eval b [list close $f]; file delete /tmp/rtcl-i2-share-src.txt; set inb")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}
+
+rule I2ShareMissingChannel {
+    when: Evaluates("interp create c; catch {interp share {} nosuchchan c} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "can not find channel named \"nosuchchan\""
+}
+
+rule I2ShareMissingInterpreter {
+    when: Evaluates("set f [open /tmp/rtcl-i2-share-dest.txt w]; catch {interp share {} $f nosuchinterp} m; close $f; file delete /tmp/rtcl-i2-share-dest.txt; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "could not find interpreter \"nosuchinterp\""
+}
+
+rule I2ShareArity {
+    when: Evaluates("catch {interp share} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"interp share srcPath channel destPath\""
+}
+
+rule I2ShareNestedPath {
+    when: Evaluates("interp create a; a eval {interp create b}; set f [open /tmp/rtcl-i2-share-nest.txt w]; interp share {} $f {a b}; set has [expr {[lsearch -exact [interp eval {a b} {file channels}] $f] >= 0}]; interp eval {a b} [list close $f]; close $f; file delete /tmp/rtcl-i2-share-nest.txt; set has")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}
+
+rule I2TransferMovesChannel {
+    -- transfer removes the channel from the source and installs it in dest.
+    when: Evaluates("interp create c; set f [open /tmp/rtcl-i2-transfer.txt w]; interp transfer {} $f c; set p [expr {[lsearch -exact [file channels] $f] >= 0}]; set k [expr {[lsearch -exact [interp eval c {file channels}] $f] >= 0}]; interp eval c [list close $f]; file delete /tmp/rtcl-i2-transfer.txt; list $p $k")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 1"
+}
+
+rule I2TransferWritesThrough {
+    when: Evaluates("interp create c; set f [open /tmp/rtcl-i2-transfer-w.txt w]; interp transfer {} $f c; interp eval c [list chan puts -nonewline $f abc]; interp eval c [list close $f]; set n [file size /tmp/rtcl-i2-transfer-w.txt]; file delete /tmp/rtcl-i2-transfer-w.txt; set n")
+    ensures: completion.code = ok
+    ensures: completion.value = "3"
+}
+
+rule I2TransferFromAnotherInterp {
+    when: Evaluates("interp create a; interp create b; set f [open /tmp/rtcl-i2-transfer-src.txt w]; interp transfer {} $f a; interp transfer a $f b; set r [list [expr {[lsearch -exact [interp eval a {file channels}] $f] >= 0}] [expr {[lsearch -exact [interp eval b {file channels}] $f] >= 0}]]; interp eval b [list close $f]; file delete /tmp/rtcl-i2-transfer-src.txt; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 1"
+}
+
+rule I2TransferMissingChannel {
+    when: Evaluates("interp create c; catch {interp transfer {} nosuch c} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "can not find channel named \"nosuch\""
+}
+
+rule I2TransferArity {
+    when: Evaluates("catch {interp transfer} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"interp transfer srcPath channel destPath\""
+}

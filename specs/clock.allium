@@ -1,0 +1,376 @@
+-- allium: 3
+-- clock.allium
+-- Behaviour spec: the clock command — wall-clock and high-resolution
+-- readings, format groups, fixed and free-form scanning, time zones and
+-- locales, -validate, and calendar arithmetic.
+-- Oracle: tclsh 9.1.0 (core-9-1-0), probed 2026-11-28; every value here
+-- is fixed with -gmt 1, an explicit -timezone, or -base, so the host's
+-- local zone cannot leak in. The local-zone form, plain ISO scan, the
+-- -validate day-range rule and "add N weekdays" live in matching.allium.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── readings and subcommand shape ────────────────────────────────
+
+rule ClockSecondsAndHighResolutionAreIntegers {
+    -- seconds/milliseconds/microseconds/monotonic/clicks all return bare
+    -- integers.
+    when: Evaluates("list [string is integer -strict [clock seconds]] [string is integer -strict [clock milliseconds]] [string is integer -strict [clock microseconds]] [string is integer -strict [clock monotonic]] [string is integer -strict [clock clicks]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 1 1"
+    -- probe: 2026-11-28 tclsh9.1; doc/clock.n HIGH RESOLUTION TIMERS
+}
+
+rule ClockHighResolutionTracksEpoch {
+    -- milliseconds and microseconds are the same wall clock as seconds at
+    -- finer resolution (checked with a generous skew allowance).
+    when: Evaluates("list [expr {abs([clock milliseconds]-[clock seconds]*1000)<5000}] [expr {abs([clock microseconds]-[clock seconds]*1000000)<5000000}] [expr {abs([clock microseconds]-[clock milliseconds]*1000)<5000000}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockMonotonicNonDecreasing {
+    -- The monotonic clock never runs backwards between two reads.
+    when: Evaluates("set a [clock monotonic]; set b [clock monotonic]; expr {$b >= $a}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockClicksOptions {
+    -- clicks accepts only -milliseconds / -microseconds; both are integers
+    -- and the bad-option menu is fixed.
+    when: Evaluates("list [string is integer -strict [clock clicks -milliseconds]] [string is integer -strict [clock clicks -microseconds]] [catch {clock clicks -bogus} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 {bad option \"-bogus\": must be -milliseconds or -microseconds}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockUniquePrefixSubcommands {
+    -- Subcommands may be abbreviated when unique: c -> clicks. s is
+    -- ambiguous between scan and seconds and reports the full menu.
+    when: Evaluates("list [string is integer -strict [clock c]] [catch {clock s} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 {unknown or ambiguous subcommand \"s\": must be add, clicks, format, microseconds, milliseconds, monotonic, scan, or seconds}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockSubcommandMenu {
+    -- No subcommand is an arity error; an unknown one lists the 8-way menu
+    -- in alphabetical order.
+    when: Evaluates("list [catch {clock} m1] $m1 [catch {clock bogus} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {wrong # args: should be \"clock subcommand ?arg ...?\"} 1 {unknown or ambiguous subcommand \"bogus\": must be add, clicks, format, microseconds, milliseconds, monotonic, scan, or seconds}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── clock format: fixed epoch 2020-03-04T05:06:07Z ───────────────
+
+rule ClockFormatDefaultFormat {
+    -- The default format is %a %b %d %H:%M:%S %Z %Y; -gmt 1 renders UTC
+    -- with the zone abbreviation GMT (not UTC).
+    when: Evaluates("clock format 0 -gmt 1")
+    ensures: completion.code = ok
+    ensures: completion.value = "Thu Jan 01 00:00:00 GMT 1970"
+    -- probe: 2026-11-28 tclsh9.1; doc/clock.n -format default
+}
+
+rule ClockFormatDateFields {
+    -- Calendar date groups: %Y %y %C %m %N %d %e %j. %e and %N are
+    -- blank-padded one-or-two digit forms.
+    when: Evaluates("set T 1583298367; list [clock format $T -format %Y -gmt 1] [clock format $T -format %y -gmt 1] [clock format $T -format %C -gmt 1] [clock format $T -format %m -gmt 1] [clock format $T -format %N -gmt 1] [clock format $T -format %d -gmt 1] [clock format $T -format %e -gmt 1] [clock format $T -format %j -gmt 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "2020 20 20 03 { 3} 04 { 4} 064"
+    -- probe: 2026-11-28 tclsh9.1; 2020-03-04 was day 64
+}
+
+rule ClockFormatWeekdayAndMonthNames {
+    -- %a/%A are abbreviated/full weekday names, %b/%B/%h month names, in
+    -- the root locale (English).
+    when: Evaluates("set T 1583298367; list [clock format $T -format %a -gmt 1] [clock format $T -format %A -gmt 1] [clock format $T -format %b -gmt 1] [clock format $T -format %B -gmt 1] [clock format $T -format %h -gmt 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "Wed Wednesday Mar March Mar"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockFormatWeekNumbers {
+    -- %u is ISO weekday 1..7, %w is Sunday=0; %U/%W are Sunday/Monday week
+    -- numbers; %V/%G/%g are the ISO-8601 week and its year.
+    when: Evaluates("set T 1583298367; list [clock format $T -format %u -gmt 1] [clock format $T -format %w -gmt 1] [clock format $T -format %U -gmt 1] [clock format $T -format %W -gmt 1] [clock format $T -format %V -gmt 1] [clock format $T -format %G -gmt 1] [clock format $T -format %g -gmt 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 3 09 09 10 2020 20"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockFormatTimeFields {
+    -- 24-hour (%H/%k), 12-hour (%I/%l), minute, second, meridian (%p/%P),
+    -- and the composite %r/%R/%T/%X groups.
+    when: Evaluates("set T 1583298367; list [clock format $T -format %H -gmt 1] [clock format $T -format %I -gmt 1] [clock format $T -format %k -gmt 1] [clock format $T -format %l -gmt 1] [clock format $T -format %M -gmt 1] [clock format $T -format %S -gmt 1] [clock format $T -format %p -gmt 1] [clock format $T -format %P -gmt 1] [clock format $T -format %r -gmt 1] [clock format $T -format %R -gmt 1] [clock format $T -format %T -gmt 1] [clock format $T -format %X -gmt 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "05 05 { 5} { 5} 06 07 AM am {05:06:07 am} 05:06 05:06:07 05:06:07"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockFormatCompositeGroups {
+    -- %s echoes the epoch value; %c/%D/%x/%+ are locale composites; %% is
+    -- a literal percent; %t is a TAB (length 1, code point 9).
+    when: Evaluates("set T 1583298367; list [clock format $T -format %s -gmt 1] [clock format $T -format %c -gmt 1] [clock format $T -format %D -gmt 1] [clock format $T -format %x -gmt 1] [clock format $T -format %+ -gmt 1] [clock format $T -format %% -gmt 1] [string length [clock format $T -format %t -gmt 1]] [scan [clock format $T -format %t -gmt 1] %c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1583298367 {Wed Mar  4 05:06:07 2020} 03/04/2020 03/04/2020 {Wed Mar  4 05:06:07 GMT 2020} % 1 9"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockFormatTimezoneOffsets {
+    -- -timezone accepts :UTC, a signed hhmm offset, and a named zone;
+    -- %z/%Z reflect the chosen zone.
+    when: Evaluates("list [clock format 0 -format {%Y-%m-%d %H:%M:%S %z %Z} -timezone :UTC] [clock format 0 -format {%Y-%m-%d %H:%M:%S %z %Z} -timezone +0530] [clock format 0 -format {%Y-%m-%d %H:%M:%S %z %Z} -timezone -0400]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{1970-01-01 00:00:00 +0000 UTC} {1970-01-01 05:30:00 +0530 +0530} {1969-12-31 20:00:00 -0400 -0400}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockFormatIanaZonesAndDst {
+    -- Named IANA zones apply their historical DST rules: New York is EST
+    -- in March, Berlin is CET.
+    when: Evaluates("list [clock format 1583298367 -format {%Y-%m-%d %H:%M:%S %z %Z} -timezone :America/New_York] [clock format 1583298367 -format {%Y-%m-%d %H:%M:%S %z %Z} -timezone :Europe/Berlin]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{2020-03-04 00:06:07 -0500 EST} {2020-03-04 06:06:07 +0100 CET}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockFormatGmtAndUtcNames {
+    -- -gmt 1 is the obsolete spelling of -timezone :UTC but differs in
+    -- %Z: GMT for -gmt, UTC for the :UTC location name.
+    when: Evaluates("list [clock format 0 -format {%z %Z} -gmt 1] [clock format 0 -format {%z %Z} -timezone :UTC]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{+0000 GMT} {+0000 UTC}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockFormatLocaleNames {
+    -- -locale selects msgcat locale data for names: French and Spanish
+    -- weekday/month names differ from the root locale.
+    when: Evaluates("list [clock format 1583298367 -format {%a %A %b %B} -gmt 1 -locale fr_FR] [clock format 1583298367 -format {%a %A %b %B} -gmt 1 -locale es_ES]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{mer. mercredi mars mars} {mié miércoles mar marzo}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockFormatUnknownGroupsPassThrough {
+    -- Unknown conversion letters and a trailing bare % are copied
+    -- literally rather than raising an error.
+    when: Evaluates("list [clock format 0 -format %q -gmt 1] [clock format 0 -format % -gmt 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "%q %"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockFormatJulianDayNumbers {
+    -- %J is the integer Julian Day Number; %EJ is the calendar Julian Date
+    -- and %Ej the astronomical Julian Date, both with a time fraction.
+    when: Evaluates("list [clock format 1583298367 -format %J -gmt 1] [clock format 1583298367 -format %EJ -gmt 1] [clock format 1583298367 -format %Ej -gmt 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "2458913 2458913.21258102 2458912.71258102"
+    -- probe: 2026-11-28 tclsh9.1; doc/clock.n %J/%EJ/%Ej
+}
+
+rule ClockFormatNegativeAndNow {
+    -- Negative epoch values format before 1970; the literal now is
+    -- interpolated to the current time.
+    when: Evaluates("list [clock format -1 -format {%Y-%m-%d %H:%M:%S} -gmt 1] [string is integer -strict [clock format now -format %s -gmt 1]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{1969-12-31 23:59:59} 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockFormatOptionAndArityErrors {
+    -- Bad options, surplus positional words, a fractional clock value and
+    -- an unknown zone each have their own message.
+    when: Evaluates("list [catch {clock format 0 -bogus 1} m1] $m1 [catch {clock format 0 extra} m2] $m2 [catch {clock format 1.5 -gmt 1} m3] $m3 [catch {clock format 0 -timezone :No/Such_Zone} m4] $m4")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {bad option \"-bogus\": must be -format, -gmt, -locale, or -timezone} 1 {wrong # args: should be \"clock format clockval|now ?-format string? ?-gmt boolean? ?-locale LOCALE? ?-timezone ZONE?\"} 1 {bad seconds \"1.5\": must be now or integer} 1 {time zone \":No/Such_Zone\" not found}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── clock scan: fixed formats ────────────────────────────────────
+
+rule ClockScanFixedFormat {
+    -- A fixed -format parses date and time; a date alone means midnight; a
+    -- -timezone behaves like -gmt 1 for UTC.
+    when: Evaluates("list [clock scan {2020-03-04 05:06:07} -format {%Y-%m-%d %H:%M:%S} -gmt 1] [clock scan 2020-03-04 -format %Y-%m-%d -gmt 1] [clock scan {2020-03-04 05:06:07} -format {%Y-%m-%d %H:%M:%S} -timezone :UTC]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1583298367 1583280000 1583298367"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockScanNamedFields {
+    -- Month and weekday names are matched in full or abbreviated form.
+    when: Evaluates("list [clock scan {04 March 2020} -format {%d %B %Y} -gmt 1] [clock scan {Mar 4 2020} -format {%b %e %Y} -gmt 1] [clock scan {Wed 2020-03-04} -format {%a %Y-%m-%d} -gmt 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1583280000 1583280000 1583280000"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockScanTwelveHourClock {
+    -- %I needs %p or %P; AM/PM is accepted case-insensitively.
+    when: Evaluates("list [clock scan {05:06:07 PM} -format {%I:%M:%S %p} -gmt 1] [clock scan {05:06:07 pm} -format {%I:%M:%S %p} -gmt 1] [clock scan {05:06:07 PM} -format {%I:%M:%S %P} -gmt 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1795885567 1795885567 1795885567"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockScanEpochGroupWins {
+    -- %s in the input determines the whole instant and overrides other
+    -- date fields in the same format.
+    when: Evaluates("clock scan {1583298367 1999-01-01} -format {%s %Y-%m-%d} -gmt 1")
+    ensures: completion.code = ok
+    ensures: completion.value = "1583298367"
+    -- probe: 2026-11-28 tclsh9.1; doc/clock.n scanning precedence
+}
+
+rule ClockScanDayOfYearCenturyAndIsoWeek {
+    -- %j (with a year), %C+%y, %N and the ISO %G/%V/%u triple all resolve
+    -- the same calendar date.
+    when: Evaluates("list [clock scan {2020 064} -format {%Y %j} -gmt 1] [clock scan {20 20-03-04} -format {%C %y-%m-%d} -gmt 1] [clock scan {2020 3 4} -format {%Y %N %d} -gmt 1] [clock scan {2020 10 3} -format {%G %V %u} -gmt 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1583280000 1583280000 1583280000 1583280000"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockScanTwoDigitYearWindow {
+    -- %y maps into 1938..2037: 37 -> 2037, 38 -> 1938, 00 -> 2000,
+    -- 99 -> 1999.
+    when: Evaluates("list [clock scan 37-01-01 -format %y-%m-%d -gmt 1] [clock scan 38-01-01 -format %y-%m-%d -gmt 1] [clock scan 00-01-01 -format %y-%m-%d -gmt 1] [clock scan 99-01-01 -format %y-%m-%d -gmt 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "2114380800 -1009843200 946684800 915148800"
+    -- probe: 2026-11-28 tclsh9.1; doc/clock.n %y
+}
+
+rule ClockScanTimezoneInInput {
+    -- %z / %Z in the input override the command-level zone; +0530 means
+    -- five and a half hours east of UTC.
+    when: Evaluates("list [clock scan {2020-03-04 05:06:07 +0530} -format {%Y-%m-%d %H:%M:%S %z} -gmt 1] [clock scan {2020-03-04 05:06:07 EST} -format {%Y-%m-%d %H:%M:%S %Z} -gmt 1] [clock scan {2020-03-04 05:06:07 +0530} -format {%Y-%m-%d %H:%M:%S %z} -timezone :UTC]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1583278567 1583316367 1583278567"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockScanValidateNormalisesFields {
+    -- With -validate 0 out-of-range fields roll over instead of raising:
+    -- day 0 is the previous month's last day, day 32 is the next month,
+    -- hour 25 and minute 61 carry forward.
+    when: Evaluates("list [clock format [clock scan {2020-03-00} -format %Y-%m-%d -gmt 1 -validate 0] -format %Y-%m-%d -gmt 1] [clock format [clock scan {2020-01-32} -format %Y-%m-%d -gmt 1 -validate 0] -format %Y-%m-%d -gmt 1] [clock format [clock scan {2020-01-01 25:00:00} -format {%Y-%m-%d %H:%M:%S} -gmt 1 -validate 0] -format {%Y-%m-%d %H:%M:%S} -gmt 1] [clock format [clock scan {2020-01-01 00:61:00} -format {%Y-%m-%d %H:%M:%S} -gmt 1 -validate 0] -format {%Y-%m-%d %H:%M:%S} -gmt 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "2020-02-29 2020-02-01 {2020-01-02 01:00:00} {2020-01-01 01:01:00}"
+    -- probe: 2026-11-28 tclsh9.1; the invalid-day case is in matching.allium
+}
+
+rule ClockScanErrorMessages {
+    -- Range errors name the field; text that does not fit the format is a
+    -- match failure rather than a range failure.
+    when: Evaluates("list [catch {clock scan {2020-13-01} -format %Y-%m-%d -gmt 1} m1] $m1 [catch {clock scan {2020-01-01 25:00:00} -format {%Y-%m-%d %H:%M:%S} -gmt 1} m2] $m2 [catch {clock scan {hello} -format %Y-%m-%d -gmt 1} m3] $m3")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {unable to convert input string: invalid month} 1 {unable to convert input string: invalid time (hour)} 1 {input string does not match supplied format}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── clock scan: free-form (deprecated, still observable) ─────────
+
+rule ClockScanFreeFormIsoForms {
+    -- Without -format the four documented ISO point-in-time layouts, plus
+    -- mm/dd/yyyy and month-name dates, are accepted.
+    when: Evaluates("list [clock scan {19700102T030405} -gmt 1] [clock scan {19700102 030405} -gmt 1] [clock scan {19700102T03:04:05} -gmt 1] [clock scan {01/02/1970} -gmt 1] [clock scan {January 2, 1970} -gmt 1] [clock scan {2 January 1970} -gmt 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "97445 97445 97445 86400 86400 86400"
+    -- probe: 2026-11-28 tclsh9.1; doc/clock.n FREE FORM SCAN
+}
+
+rule ClockScanFreeFormRelative {
+    -- Relative words and number-unit phrases are applied to -base: the
+    -- time of day is dropped, then months are added for next month.
+    when: Evaluates("list [clock scan tomorrow -base 0 -gmt 1] [clock scan yesterday -base 0 -gmt 1] [clock scan today -base 0 -gmt 1] [clock scan now -base 0 -gmt 1] [clock scan {3 days} -base 0 -gmt 1] [clock scan {2 weeks ago} -base 0 -gmt 1] [clock scan {next month} -base 0 -gmt 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "86400 -86400 0 0 259200 -1209600 2678400"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockScanFreeFormWeekday {
+    -- A bare weekday means its next occurrence; next/last shift a week at
+    -- a time; this is a syntax error.
+    when: Evaluates("list [clock scan {next Friday} -base 0 -gmt 1] [clock scan {last Friday} -base 0 -gmt 1] [clock scan Friday -base 0 -gmt 1] [catch {clock scan {this Friday} -base 0 -gmt 1} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "691200 -518400 86400 1 {unable to convert date-time string \"this Friday\": syntax error (characters 0-3)}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockScanFreeFormOptionLimits {
+    -- Free-form scan still accepts -timezone (9.1 behaviour), but rejects
+    -- -locale because there is no format to localise.
+    when: Evaluates("list [catch {clock scan {1970-01-02} -locale en_US} m] $m [clock scan {1970-01-02} -timezone :UTC]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {legacy [clock scan] does not support -locale} 86400"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockScanArityAndBadOption {
+    -- Missing string or missing -format value is an arity error; the bad
+    -- option menu is fixed.
+    when: Evaluates("list [catch {clock scan} m1] $m1 [catch {clock scan abc -format} m2] $m2 [catch {clock scan {2020-01-01} -bogus 1 -format %Y-%m-%d} m3] $m3")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {wrong # args: should be \"clock scan string ?-base seconds? ?-format string? ?-gmt boolean? ?-locale LOCALE? ?-timezone ZONE? ?-validate boolean?\"} 1 {wrong # args: should be \"clock scan string ?-base seconds? ?-format string? ?-gmt boolean? ?-locale LOCALE? ?-timezone ZONE? ?-validate boolean?\"} 1 {bad option \"-bogus\": must be -base, -format, -gmt, -locale, -timezone or -validate}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── clock add: calendar arithmetic ───────────────────────────────
+
+rule ClockAddSimpleUnits {
+    -- seconds/minutes/hours add fixed elapsed time; days/weeks add the
+    -- same local time in the chosen zone.
+    when: Evaluates("list [clock add 0 30 seconds -gmt 1] [clock add 0 2 minutes -gmt 1] [clock add 0 3 hours -gmt 1] [clock add 0 2 days -gmt 1] [clock add 0 2 weeks -gmt 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "30 120 10800 172800 1209600"
+    -- probe: 2026-11-28 tclsh9.1; doc/clock.n CLOCK ARITHMETIC
+}
+
+rule ClockAddMonthsAndYearsClamp {
+    -- Adding months/years keeps the day where possible and clamps to the
+    -- last day of a shorter month: Jan 31 + 1 month in 2020/2019, and
+    -- Feb 29 + 1 year / + 4 years.
+    when: Evaluates("list [clock add 0 1 months -gmt 1] [clock add 0 1 years -gmt 1] [clock format [clock add [clock scan 2020-01-31 -format %Y-%m-%d -gmt 1] 1 months -gmt 1] -format %Y-%m-%d -gmt 1] [clock format [clock add [clock scan 2019-01-31 -format %Y-%m-%d -gmt 1] 1 months -gmt 1] -format %Y-%m-%d -gmt 1] [clock format [clock add [clock scan 2020-02-29 -format %Y-%m-%d -gmt 1] 1 years -gmt 1] -format %Y-%m-%d -gmt 1] [clock format [clock add [clock scan 2020-02-29 -format %Y-%m-%d -gmt 1] 4 years -gmt 1] -format %Y-%m-%d -gmt 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "2678400 31536000 2020-02-29 2019-02-28 2021-02-28 2024-02-29"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockAddMultiplePairsAndNegative {
+    -- Pairs apply left to right and counts may be negative; no pairs is
+    -- the identity.
+    when: Evaluates("list [clock add 0 1 day 2 hours 3 minutes 4 seconds -gmt 1] [clock add 0 -1 days -gmt 1] [clock add 0]")
+    ensures: completion.code = ok
+    ensures: completion.value = "93784 -86400 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ClockAddAcrossDstKeepsLocalTime {
+    -- 1 day across the US spring-forward keeps 12:00 local; 24 hours is
+    -- fixed elapsed time and lands at 13:00 local.
+    when: Evaluates("set t [clock scan {2020-03-07 12:00:00} -format {%Y-%m-%d %H:%M:%S} -timezone :America/New_York]; list [clock format [clock add $t 1 day -timezone :America/New_York] -format {%Y-%m-%d %H:%M:%S %z} -timezone :America/New_York] [clock format [clock add $t 24 hours -timezone :America/New_York] -format {%Y-%m-%d %H:%M:%S %z} -timezone :America/New_York]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{2020-03-08 12:00:00 -0400} {2020-03-08 13:00:00 -0400}"
+    -- probe: 2026-11-28 tclsh9.1; doc/clock.n DST notes
+}
+
+rule ClockAddUnitMenuAndErrors {
+    -- Unit spellings are the documented menu (week singular included); an
+    -- unknown unit, -format, a missing pair and a non-integer count each
+    -- have their own error.
+    when: Evaluates("list [catch {clock add 0 1 fortnights} m1] $m1 [catch {clock add 0 1 bogus} m2] $m2 [catch {clock add 0 -format %Y} m3] $m3 [catch {clock add 0 1} m4] $m4 [catch {clock add 0 x days} m5] $m5")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {bad unit \"fortnights\": must be years, months, week, weeks, days, weekdays, hours, minutes, or seconds} 1 {bad unit \"bogus\": must be years, months, week, weeks, days, weekdays, hours, minutes, or seconds} 1 {bad option \"-format\": must be -gmt, -locale, or -timezone} 1 {wrong # args: should be \"clock add clockval|now ?number units?...?-gmt boolean? ?-locale LOCALE? ?-timezone ZONE?\"} 1 {bad option \"x\": must be -gmt, -locale, or -timezone}"
+    -- probe: 2026-11-28 tclsh9.1
+}

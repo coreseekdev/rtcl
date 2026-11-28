@@ -123,33 +123,9 @@ rule TryHandlersMatchOnCompletionCode {
     -- finally scripts always run; an unmatched completion re-propagates
 }
 
--- ── 9.1 switch -integer / subst options / case removal (T4) ─────
+-- ── 9.1 subst options / case removal (T4) ───────────────────────
 -- Probes: switchint91, substopts91; re-run on tclsh 9.1.0.
-
-rule SwitchIntegerMatchesNumericValues {
-    -- -integer compares the subject and patterns by integer value, so 05,
-    -- 0x1 and 007 match 5, 01 and 7 respectively.
-    when: Evaluates("list [switch -integer 05 {5 {set r B}}] [switch -integer 0x1 01 {string cat ok}] [switch -integer 007 {7 {set r G}}]")
-    ensures: completion.code = ok
-    ensures: completion.value = "B ok G"
-    -- probe: switchint91
-}
-
-rule SwitchIntegerRejectsNonIntegers {
-    -- A non-integer subject is an error, not a string fallback.
-    when: Evaluates("catch {switch -integer 1.5 {1 {set E}}} m; set m")
-    ensures: completion.code = ok
-    ensures: completion.value = "expected integer but got \"1.5\""
-    -- probe: switchint91
-}
-
-rule SwitchIntegerExcludesGlobAndNocase {
-    -- -integer conflicts with the other match modes.
-    when: Evaluates("list [catch {switch -integer -glob Foo Foo {set r OK}} m1] $m1 [catch {switch -integer -nocase Foo Foo {set r OK}} m2] $m2")
-    ensures: completion.code = ok
-    ensures: completion.value = "1 {bad option \"-glob\": -integer option already found} 1 {-nocase option cannot be used with -integer option}"
-    -- probe: switchint91
-}
+-- switch now has its own spec (switch.allium).
 
 rule CaseCommandRemoved {
     -- The legacy case command is gone in 9.1 (switch covers it).

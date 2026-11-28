@@ -1,0 +1,112 @@
+-- allium: 3
+-- switch.allium
+-- Behaviour spec: the switch command — exact/glob/regexp/integer
+-- matching, -nocase, default, "-" fallthrough, -matchvar/-indexvar,
+-- option conflicts and error text.
+-- Oracle: tclsh 9.1.0 (core-9-1-0). T4 rules re-anchored 2026-11-27.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── matching modes ───────────────────────────────────────────────
+
+rule SwitchExactIsDefault {
+    -- Without a mode option, patterns compare exactly; a glob-looking
+    -- pattern is not expanded.
+    when: Evaluates("list [switch abc {abc {set r X}}] [switch abc {a* {set r X} default {set r D}}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "X D"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SwitchGlobMode {
+    when: Evaluates("switch -glob abc {a* {set r X}}")
+    ensures: completion.code = ok
+    ensures: completion.value = "X"
+}
+
+rule SwitchRegexpMode {
+    when: Evaluates("switch -regexp abc {^a {set r X}}")
+    ensures: completion.code = ok
+    ensures: completion.value = "X"
+}
+
+rule SwitchNocaseAppliesToModes {
+    -- -nocase folds exact/glob/regexp matching; it composes with -regexp.
+    when: Evaluates("list [switch -nocase ABC {abc {set r X}}] [switch -nocase -regexp ABC {abc {set r Y}}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "X Y"
+}
+
+-- ── default / fallthrough ────────────────────────────────────────
+
+rule SwitchLastPatternIsDefault {
+    -- A literal `default` pattern is the fallback (only its position is
+    -- conventional; it is matched like any other pattern when reached).
+    when: Evaluates("switch zz {a {set r A} default {set r D}}")
+    ensures: completion.code = ok
+    ensures: completion.value = "D"
+}
+
+rule SwitchNoMatchReturnsEmpty {
+    when: Evaluates("switch zz {a {set r A}}")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+}
+
+rule SwitchBodyDashFallsThrough {
+    -- A body of "-" falls through to the next body; the last pattern in a
+    -- chain owns the shared body.
+    when: Evaluates("list [switch x {x - y {set r Y} default {set r D}}] [switch a {a - b - c {set r C}}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "Y C"
+}
+
+-- ── integer mode (TIP 746-era 9.1 addition) ─────────────────────
+
+rule SwitchIntegerMatchesNumericValues {
+    -- -integer compares the subject and patterns by integer value, so 05,
+    -- 0x1 and 007 match 5, 01 and 7 respectively.
+    when: Evaluates("list [switch -integer 05 {5 {set r B}}] [switch -integer 0x1 01 {string cat ok}] [switch -integer 007 {7 {set r G}}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "B ok G"
+}
+
+rule SwitchIntegerRejectsNonIntegers {
+    when: Evaluates("catch {switch -integer 1.5 {1 {set E}}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "expected integer but got \"1.5\""
+}
+
+rule SwitchIntegerExcludesGlobAndNocase {
+    when: Evaluates("list [catch {switch -integer -glob Foo Foo {set r OK}} m1] $m1 [catch {switch -integer -nocase Foo Foo {set r OK}} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {bad option \"-glob\": -integer option already found} 1 {-nocase option cannot be used with -integer option}"
+}
+
+-- ── matchvar / indexvar (9.1) ───────────────────────────────────
+
+rule SwitchMatchvarIndexvar {
+    -- -matchvar binds the whole match plus capture groups; -indexvar
+    -- binds their {start end} character ranges.
+    when: Evaluates("switch -matchvar mv -indexvar iv -regexp abc {(a)(b)} {set r $mv}; list $r $mv $iv")
+    ensures: completion.code = ok
+    ensures: completion.value = "{ab a b} {ab a b} {{0 1} {0 0} {1 1}}"
+}
+
+rule SwitchOptionRestrictions {
+    -- -matchvar/-indexvar require -regexp; -glob and -regexp cannot be
+    -- combined.
+    when: Evaluates("list [catch {switch -matchvar mv -glob abc {a* {set r 1}}} m1] $m1 [catch {switch -glob -regexp abc {a* {set r 1}}} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {-matchvar option requires -regexp option} 1 {bad option \"-regexp\": -glob option already found}"
+}
+
+rule SwitchBadOptionMenu {
+    when: Evaluates("catch {switch -foo a b c} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"-foo\": must be -exact, -glob, -indexvar, -integer, -matchvar, -nocase, -regexp, or --"
+}

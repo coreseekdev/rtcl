@@ -124,8 +124,7 @@ pub(crate) const MAX_LIST_ELEMENTS: usize = 536870909;
 /// Small series windows/results keep the eager (materialized) path; only
 /// larger results stay lazy.  This gives both implementations and keeps
 /// ordinary-sized results indistinguishable from a normal list.
-const SERIES_EAGER_MAX: i64 = 4096;
-
+pub(crate) const SERIES_EAGER_MAX: i64 = 4096;
 /// tclsh 9.1.0（x86-64）的 `LIST_MAX`：tclInt.h 的
 /// `(TCL_SIZE_MAX - offsetof(ListStore, slots)) / sizeof(Tcl_Obj *)`，
 /// 实测 `lrepeat 9223372036854775807 x` 报

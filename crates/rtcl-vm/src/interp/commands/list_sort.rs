@@ -1176,6 +1176,53 @@ pub fn cmd_lsort(interp: &mut Interp, args: &[Value]) -> Result<Value> {
         None => String::new(),
     };
 
+    // Streaming fast path: a numeric arithmetic series is already sorted
+    // under -integer/-real; return it (or its reverse) without touching
+    // every element.  Only the option shapes whose order equals the
+    // sequence order are eligible; -ascii/-dictionary/-index/-stride/
+    // -command still need the general sort.
+    if !group && index_specs.is_empty() && command_value.is_none()
+        && matches!(mode, SortMode::Integer | SortMode::Real)
+    {
+        if let Some(s) = args[args.len() - 1].series() {
+            if s.len <= 0 {
+                return Ok(Value::from_list(&[]));
+            }
+            let asc = if s.is_double { s.dstep >= 0.0 } else { s.step >= 0 };
+            let want_asc = !decreasing;
+            let already = asc == want_asc;
+            let constant = if s.is_double { s.dstep == 0.0 } else { s.step == 0 };
+            if unique && constant {
+                if indices {
+                    return Ok(Value::from_int(0));
+                }
+                return Ok(s.element(0));
+            }
+            if indices {
+                if s.len <= super::list::SERIES_EAGER_MAX {
+                    let mut out = Vec::with_capacity(s.len as usize);
+                    for i in 0..s.len {
+                        out.push(Value::from_int(if already { i } else { s.len - 1 - i }));
+                    }
+                    return Ok(Value::from_list(&out));
+                }
+                return Ok(Value::from_series(crate::value::SeriesRep {
+                    is_double: false,
+                    start: if already { 0 } else { s.len - 1 },
+                    step: if already { 1 } else { -1 },
+                    dstart: 0.0,
+                    dstep: 1.0,
+                    len: s.len,
+                    precision: 0,
+                }));
+            }
+            if already {
+                return Ok(args[args.len() - 1].clone());
+            }
+            return Ok(Value::from_series(s.reverse()));
+        }
+    }
+
     let list = super::list::strict_list(interp, &args[args.len() - 1])?;
     if list.is_empty() {
         return Ok(Value::from_list(&[]));
@@ -1882,5 +1929,50 @@ mod tests {
             interp.eval("lsearch -stride 2 -index 1 [lseq 0x7ffffffe] 1").unwrap().as_str(),
             "0"
         );
+    }
+
+    #[test]
+    fn test_lsort_series_stream_fast_path() {
+        use crate::value::{SeriesRep, Value};
+        let mut interp = Interp::new();
+        let s = Value::from_series(SeriesRep {
+            is_double: false,
+            start: 0,
+            step: 1,
+            dstart: 0.0,
+            dstep: 1.0,
+            len: 100_000,
+            precision: 0,
+        });
+        interp.set_var("s", s).unwrap();
+        assert_eq!(
+            interp.eval("list [llength [lsort -integer $s]] [lindex [lsort -integer $s] 0] [lindex [lsort -integer $s] end]").unwrap().as_str(),
+            "100000 0 99999"
+        );
+        assert_eq!(
+            interp.eval("list [lindex [lsort -integer -decreasing $s] 0] [lindex [lsort -integer -decreasing $s] end]").unwrap().as_str(),
+            "99999 0"
+        );
+        assert_eq!(
+            interp.eval("list [lindex [lsort -integer -indices $s] 0] [lindex [lsort -integer -indices $s] end]").unwrap().as_str(),
+            "0 99999"
+        );
+        assert_eq!(
+            interp.eval("lindex [lsort -real -decreasing -indices $s] 0").unwrap().as_str(),
+            "99999"
+        );
+
+        let c = Value::from_series(SeriesRep {
+            is_double: false,
+            start: 2,
+            step: 0,
+            dstart: 0.0,
+            dstep: 1.0,
+            len: 100_000,
+            precision: 0,
+        });
+        interp.set_var("c", c).unwrap();
+        assert_eq!(interp.eval("lsort -integer -unique $c").unwrap().as_str(), "2");
+        assert_eq!(interp.eval("lsort -integer -unique -indices $c").unwrap().as_str(), "0");
     }
 }

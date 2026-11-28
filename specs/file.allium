@@ -1,0 +1,381 @@
+-- allium: 3
+-- file.allium
+-- Behaviour spec: the Tcl `file` command's observable surface — path
+-- manipulation (dirname/tail/extension/rootname/join/split/pathtype/
+-- normalize/nativename/separator), metadata (atime/mtime/size/type/stat/
+-- lstat/attributes/owned/readable/writable/executable/exists/isfile/
+-- isdirectory), mutation (mkdir/delete/copy/rename/link/readlink) and the
+-- 9.1 temporary-path surface (tempdir/tempfile/tildeexpand/volumes).
+-- Oracle: tclsh 9.1.0 (core-9-1-0).
+--
+-- Faces already pinned in io.allium are deliberately NOT repeated here:
+-- mtime setter, stat key set, copy-to-existing error, dirname /, tilde
+-- expansion through HOME, normalize keeping ~ literal, tempdir being a
+-- directory. Probes run 2026-11-28 against the 9.1.0 oracle; all rules use
+-- the fixed scratch directory /tmp/rtcl_spec_file_91 and are self-contained.
+-- rtcl divergence ledger: D-33 (file family packaging) and D-45 (POSIX
+-- error text, FIXED 2026-11-06; see DIVERGENCES.md).
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── atime / mtime / size ──────────────────────────────────────────
+
+rule FileAtimeGetterAndSetter {
+    -- The one-argument form reads atime; the two-argument form sets it and
+    -- returns the new value. A missing name fails with the shared
+    -- "could not read" text.
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; file mkdir /tmp/rtcl_spec_file_91; set fh [open /tmp/rtcl_spec_file_91/f.txt w]; close $fh; list [file atime /tmp/rtcl_spec_file_91/f.txt 1000000000] [file atime /tmp/rtcl_spec_file_91/f.txt] [catch {file atime /tmp/rtcl_spec_file_91/nope} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1000000000 1000000000 1 {could not read \"/tmp/rtcl_spec_file_91/nope\": no such file or directory}"
+    -- probe 2026-11-28 tclsh9.1 (setter is filesystem-visible)
+}
+
+rule FileMtimeGetterMatchesStat {
+    -- The one-argument mtime form is the stat mtime; missing names fail with
+    -- "could not read". (The setter form lives in io.allium.)
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; file mkdir /tmp/rtcl_spec_file_91; set fh [open /tmp/rtcl_spec_file_91/f.txt w]; close $fh; file stat /tmp/rtcl_spec_file_91/f.txt a; list [expr {[file mtime /tmp/rtcl_spec_file_91/f.txt] == $a(mtime)}] [catch {file mtime /tmp/rtcl_spec_file_91/nope} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 {could not read \"/tmp/rtcl_spec_file_91/nope\": no such file or directory}"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule FileSizeIsByteCount {
+    -- file size reports bytes, not characters; a missing name is an error.
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; file mkdir /tmp/rtcl_spec_file_91; set fh [open /tmp/rtcl_spec_file_91/f.txt w]; puts -nonewline $fh hello; close $fh; list [file size /tmp/rtcl_spec_file_91/f.txt] [catch {file size /tmp/rtcl_spec_file_91/nope} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "5 1 {could not read \"/tmp/rtcl_spec_file_91/nope\": no such file or directory}"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+-- ── attributes ────────────────────────────────────────────────────
+
+rule FileAttributesGetReturnsTriple {
+    -- The get form returns alternating option/value pairs in the fixed order
+    -- -group, -owner, -permissions; permissions are rendered with the 9.x
+    -- 0o octal prefix. Owner/group names are host-dependent, so the rule
+    -- only asserts their presence.
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; file mkdir /tmp/rtcl_spec_file_91; set fh [open /tmp/rtcl_spec_file_91/f.txt w]; close $fh; set a [file attributes /tmp/rtcl_spec_file_91/f.txt]; list [dict exists $a -owner] [dict exists $a -group] [dict exists $a -permissions] [string match 0o* [dict get $a -permissions]] [llength $a]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 1 6"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule FileAttributesSetPermissions {
+    -- Setting -permissions returns the empty string; the get form then shows
+    -- the 0o form and file executable follows the mode bits.
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; file mkdir /tmp/rtcl_spec_file_91; set fh [open /tmp/rtcl_spec_file_91/f.txt w]; close $fh; list [file attributes /tmp/rtcl_spec_file_91/f.txt -permissions 0600] [file attributes /tmp/rtcl_spec_file_91/f.txt -permissions] [file executable /tmp/rtcl_spec_file_91/f.txt]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 0o600 0"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule FileAttributesSetOwnerAndGroupRoundTrip {
+    -- -owner/-group accept the current names and return empty; reading back
+    -- yields the same names (retrieved dynamically, not hard-coded).
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; file mkdir /tmp/rtcl_spec_file_91; set fh [open /tmp/rtcl_spec_file_91/f.txt w]; close $fh; set o [file attributes /tmp/rtcl_spec_file_91/f.txt -owner]; set g [file attributes /tmp/rtcl_spec_file_91/f.txt -group]; list [file attributes /tmp/rtcl_spec_file_91/f.txt -owner $o] [file attributes /tmp/rtcl_spec_file_91/f.txt -group $g] [expr {[file attributes /tmp/rtcl_spec_file_91/f.txt -owner] eq $o}] [expr {[file attributes /tmp/rtcl_spec_file_91/f.txt -group] eq $g}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {} 1 1"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule FileAttributesBadOptionAndPermissionText {
+    -- The option menu is exactly -group/-owner/-permissions; a malformed
+    -- permission string has its own message.
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; file mkdir /tmp/rtcl_spec_file_91; set fh [open /tmp/rtcl_spec_file_91/f.txt w]; close $fh; list [catch {file attributes /tmp/rtcl_spec_file_91/f.txt -nosuch} m] $m [catch {file attributes /tmp/rtcl_spec_file_91/f.txt -permissions zzz} n] $n")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {bad option \"-nosuch\": must be -group, -owner, or -permissions} 1 {unknown permission string format \"zzz\"}"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+-- ── copy / delete / rename ────────────────────────────────────────
+
+rule FileCopyForceOverwrites {
+    -- Without -force an existing target is an error (io.allium); -force
+    -- replaces the contents and returns empty.
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; file mkdir /tmp/rtcl_spec_file_91; set fh [open /tmp/rtcl_spec_file_91/src.txt w]; puts -nonewline $fh hello; close $fh; set fh [open /tmp/rtcl_spec_file_91/dst.txt w]; puts -nonewline $fh old; close $fh; list [file copy -force /tmp/rtcl_spec_file_91/src.txt /tmp/rtcl_spec_file_91/dst.txt] [set fh [open /tmp/rtcl_spec_file_91/dst.txt r]; set s [read $fh]; close $fh; set s]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} hello"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule FileCopyDirectoriesRecursively {
+    -- Copying a directory recreates the tree; copying a file into an existing
+    -- directory keeps the basename.
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; file mkdir /tmp/rtcl_spec_file_91/src/inner /tmp/rtcl_spec_file_91/d2; set fh [open /tmp/rtcl_spec_file_91/f.txt w]; close $fh; set fh [open /tmp/rtcl_spec_file_91/src/inner/x w]; close $fh; file copy /tmp/rtcl_spec_file_91/f.txt /tmp/rtcl_spec_file_91/d2; list [file copy /tmp/rtcl_spec_file_91/src /tmp/rtcl_spec_file_91/dst] [file isdirectory /tmp/rtcl_spec_file_91/dst] [file exists /tmp/rtcl_spec_file_91/dst/inner/x] [file exists /tmp/rtcl_spec_file_91/d2/f.txt]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 1 1 1"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule FileCopyMissingSourceText {
+    -- A missing source names only the source in the message (no "to target").
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; file mkdir /tmp/rtcl_spec_file_91; catch {file copy /tmp/rtcl_spec_file_91/nope /tmp/rtcl_spec_file_91/x} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "error copying \"/tmp/rtcl_spec_file_91/nope\": no such file or directory"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule FileDeleteMissingIsSilent {
+    -- Deleting an absent name (with or without -force) succeeds with an
+    -- empty result; there is no "no such file" from delete.
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; list [file exists /tmp/rtcl_spec_file_91/none] [file delete /tmp/rtcl_spec_file_91/none] [file delete -force /tmp/rtcl_spec_file_91/none]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 {} {}"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule FileDeleteNonEmptyDirectoryNeedsForce {
+    -- A non-empty directory needs -force; without it the error is
+    -- "directory not empty" and nothing is removed.
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; file mkdir /tmp/rtcl_spec_file_91/rm/inner; list [catch {file delete /tmp/rtcl_spec_file_91/rm} m] $m [file delete -force /tmp/rtcl_spec_file_91/rm] [file exists /tmp/rtcl_spec_file_91/rm]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {error deleting \"/tmp/rtcl_spec_file_91/rm\": directory not empty} {} 0"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule FileRenameForceReplaces {
+    -- Renaming onto an existing name is an error without -force; -force
+    -- replaces the target, and the source disappears.
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; file mkdir /tmp/rtcl_spec_file_91; set fh [open /tmp/rtcl_spec_file_91/a w]; close $fh; set fh [open /tmp/rtcl_spec_file_91/b w]; close $fh; list [catch {file rename /tmp/rtcl_spec_file_91/a /tmp/rtcl_spec_file_91/b} m] $m [file rename -force /tmp/rtcl_spec_file_91/a /tmp/rtcl_spec_file_91/b] [file exists /tmp/rtcl_spec_file_91/a] [file exists /tmp/rtcl_spec_file_91/b]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {error renaming \"/tmp/rtcl_spec_file_91/a\" to \"/tmp/rtcl_spec_file_91/b\": file exists} {} 0 1"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+-- ── mkdir / link / readlink ───────────────────────────────────────
+
+rule FileMkdirCreatesParentsAndMultiple {
+    -- mkdir creates missing parents, accepts existing directories silently,
+    -- and takes multiple names.
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; list [file mkdir /tmp/rtcl_spec_file_91/a/b/c] [file isdirectory /tmp/rtcl_spec_file_91/a/b/c] [file mkdir /tmp/rtcl_spec_file_91/a/b/c] [file mkdir /tmp/rtcl_spec_file_91/m1 /tmp/rtcl_spec_file_91/m2] [file isdirectory /tmp/rtcl_spec_file_91/m1] [file isdirectory /tmp/rtcl_spec_file_91/m2]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 1 {} {} 1 1"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule FileLinkCreatesSymlinkAndHardlink {
+    -- A symbolic link returns and reports its target; -hard creates a real
+    -- second name whose file type is file.
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; file mkdir /tmp/rtcl_spec_file_91; set fh [open /tmp/rtcl_spec_file_91/f.txt w]; close $fh; list [file link /tmp/rtcl_spec_file_91/l /tmp/rtcl_spec_file_91/f.txt] [file link /tmp/rtcl_spec_file_91/l] [file link -hard /tmp/rtcl_spec_file_91/h /tmp/rtcl_spec_file_91/f.txt] [file type /tmp/rtcl_spec_file_91/h]")
+    ensures: completion.code = ok
+    ensures: completion.value = "/tmp/rtcl_spec_file_91/f.txt /tmp/rtcl_spec_file_91/f.txt /tmp/rtcl_spec_file_91/f.txt file"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule FileLinkGetRequiresSymlink {
+    -- The get form only reads symbolic links; a regular file is "invalid
+    -- argument", and the option menu is -symbolic/-hard.
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; file mkdir /tmp/rtcl_spec_file_91; set fh [open /tmp/rtcl_spec_file_91/f.txt w]; close $fh; list [catch {file link /tmp/rtcl_spec_file_91/f.txt} m] $m [catch {file link -bogus /tmp/rtcl_spec_file_91/l /tmp/rtcl_spec_file_91/f.txt} n] $n")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {could not read link \"/tmp/rtcl_spec_file_91/f.txt\": invalid argument} 1 {bad option \"-bogus\": must be -symbolic or -hard}"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule FileReadlinkReturnsSymlinkTarget {
+    -- readlink returns the stored target and refuses non-symlinks with the
+    -- same "could not read link" text as the link get form.
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; file mkdir /tmp/rtcl_spec_file_91; set fh [open /tmp/rtcl_spec_file_91/f.txt w]; close $fh; file link /tmp/rtcl_spec_file_91/l /tmp/rtcl_spec_file_91/f.txt; list [file readlink /tmp/rtcl_spec_file_91/l] [catch {file readlink /tmp/rtcl_spec_file_91/f.txt} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "/tmp/rtcl_spec_file_91/f.txt 1 {could not read link \"/tmp/rtcl_spec_file_91/f.txt\": invalid argument}"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+-- ── stat / lstat / type ───────────────────────────────────────────
+
+rule FileStatFollowsSymlinksLstatDoesNot {
+    -- stat follows a symlink and reports the target's type; lstat reports
+    -- link. The type values are file and directory for ordinary entries.
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; file mkdir /tmp/rtcl_spec_file_91; set fh [open /tmp/rtcl_spec_file_91/f.txt w]; close $fh; file link /tmp/rtcl_spec_file_91/l /tmp/rtcl_spec_file_91/f.txt; file stat /tmp/rtcl_spec_file_91/f.txt sa; file stat /tmp/rtcl_spec_file_91 sb; file stat /tmp/rtcl_spec_file_91/l sc; file lstat /tmp/rtcl_spec_file_91/l sd; list $sa(type) $sb(type) $sc(type) $sd(type)")
+    ensures: completion.code = ok
+    ensures: completion.value = "file directory file link"
+    -- probe 2026-11-28 tclsh9.1; stat key set is io.allium's rule
+}
+
+rule FileTypeDistinguishesKinds {
+    -- file type reports file/directory/link without following the link;
+    -- a missing name uses the shared "could not read" error.
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; file mkdir /tmp/rtcl_spec_file_91; set fh [open /tmp/rtcl_spec_file_91/f.txt w]; close $fh; file link /tmp/rtcl_spec_file_91/l /tmp/rtcl_spec_file_91/f.txt; list [file type /tmp/rtcl_spec_file_91/f.txt] [file type /tmp/rtcl_spec_file_91] [file type /tmp/rtcl_spec_file_91/l] [catch {file type /tmp/rtcl_spec_file_91/nope} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "file directory link 1 {could not read \"/tmp/rtcl_spec_file_91/nope\": no such file or directory}"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+-- ── predicates ────────────────────────────────────────────────────
+
+rule FileExistsDistinguishesKinds {
+    -- exists is true for both files and directories, false for a missing
+    -- name; it does not distinguish kind (isdirectory/isfile do).
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; file mkdir /tmp/rtcl_spec_file_91; set fh [open /tmp/rtcl_spec_file_91/f.txt w]; close $fh; list [file exists /tmp/rtcl_spec_file_91/f.txt] [file exists /tmp/rtcl_spec_file_91] [file exists /tmp/rtcl_spec_file_91/nope]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 0"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule FileIsDirectoryAndIsFile {
+    -- isdirectory and isfile partition ordinary existing entries.
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; file mkdir /tmp/rtcl_spec_file_91; set fh [open /tmp/rtcl_spec_file_91/f.txt w]; close $fh; list [file isdirectory /tmp/rtcl_spec_file_91] [file isdirectory /tmp/rtcl_spec_file_91/f.txt] [file isfile /tmp/rtcl_spec_file_91/f.txt] [file isfile /tmp/rtcl_spec_file_91]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 1 0"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule FileExecutableTracksMode {
+    -- executable follows the execute bits set through file attributes.
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; file mkdir /tmp/rtcl_spec_file_91; set fh [open /tmp/rtcl_spec_file_91/f.txt w]; close $fh; file attributes /tmp/rtcl_spec_file_91/f.txt -permissions 0755; set a [file executable /tmp/rtcl_spec_file_91/f.txt]; file attributes /tmp/rtcl_spec_file_91/f.txt -permissions 0644; list $a [file executable /tmp/rtcl_spec_file_91/f.txt]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule FileReadableAndWritable {
+    -- readable/writable are true for a file the current user just created and
+    -- false for an absent name.
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; file mkdir /tmp/rtcl_spec_file_91; set fh [open /tmp/rtcl_spec_file_91/f.txt w]; close $fh; list [file readable /tmp/rtcl_spec_file_91/f.txt] [file readable /tmp/rtcl_spec_file_91/nope] [file writable /tmp/rtcl_spec_file_91/f.txt] [file writable /tmp/rtcl_spec_file_91/nope]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 1 0"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule FileOwnedReflectsCurrentUser {
+    -- owned is true for an entry created by the current user and false for a
+    -- missing name (uid comparison, not mere readability).
+    when: Evaluates("file delete -force /tmp/rtcl_spec_file_91; file mkdir /tmp/rtcl_spec_file_91; set fh [open /tmp/rtcl_spec_file_91/f.txt w]; close $fh; list [file owned /tmp/rtcl_spec_file_91/f.txt] [file owned /tmp/rtcl_spec_file_91/nope]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+-- ── path strings ──────────────────────────────────────────────────
+
+rule FileDirnameStripsLastComponent {
+    -- dirname drops the final component and trailing separators; a bare
+    -- relative name yields ".".
+    when: Evaluates("list [file dirname /a/b/c] [file dirname /a/b/] [file dirname foo] [file dirname /a]")
+    ensures: completion.code = ok
+    ensures: completion.value = "/a/b /a . /"
+    -- probe 2026-11-28 tclsh9.1; dirname "/" is io.allium's rule
+}
+
+rule FileTailReturnsLastComponent {
+    -- tail returns the last component, ignoring trailing separators; the
+    -- root has no tail.
+    when: Evaluates("list [file tail /a/b/c] [file tail /a/b/] [file tail /] [file tail a]")
+    ensures: completion.code = ok
+    ensures: completion.value = "c b {} a"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule FileExtensionFromLastDot {
+    -- extension is the text from the last dot, including the dot; a
+    -- dot-prefixed basename keeps the whole name, and a trailing dot is ".".
+    when: Evaluates("list [file extension a/b.c] [file extension a/b.tar.gz] [file extension a/b] [file extension .cshrc] [file extension /a/b.]")
+    ensures: completion.code = ok
+    ensures: completion.value = ".c .gz {} .cshrc ."
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule FileRootnameRemovesExtension {
+    -- rootname strips the final extension; a dot-prefixed basename has an
+    -- empty root, and the trailing dot of a name ending in "." stays in the
+    -- directory part.
+    when: Evaluates("list [file rootname a/b.c] [file rootname a/b.tar.gz] [file rootname a/b] [file rootname .cshrc] [file rootname a/.cshrc]")
+    ensures: completion.code = ok
+    ensures: completion.value = "a/b a/b.tar a/b {} a/"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule FileJoinConcatenatesWithoutNormalizing {
+    -- join inserts the separator; a later absolute component discards earlier
+    -- ones, "." and ".." components are kept literally, and empty components
+    -- are dropped.
+    when: Evaluates("list [file join a b c] [file join /a b] [file join a /b] [file join a . b] [file join a .. b] [file join a {} b]")
+    ensures: completion.code = ok
+    ensures: completion.value = "a/b/c /a/b /b a/./b a/../b a/b"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule FileSplitSeparatesComponents {
+    -- split yields the leading root as its own element, drops repeated and
+    -- trailing separators, and returns empty for the empty path.
+    when: Evaluates("list [file split /a/b/c] [file split a/b/c] [file split /] [file split a//b]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{/ a b c} {a b c} / {a b}"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule FilePathtypeClassifiesPaths {
+    -- pathtype is absolute for a leading separator (including the zipfs
+    -- volume form) and relative otherwise; "" and "~" are relative.
+    when: Evaluates("list [file pathtype /a/b] [file pathtype a/b] [file pathtype ./a] [file pathtype ~/x] [file pathtype \"\"] [file pathtype //zipfs:/x]")
+    ensures: completion.code = ok
+    ensures: completion.value = "absolute relative relative relative relative absolute"
+    -- probe 2026-11-28 tclsh9.1; ~ is an ordinary relative component in 9.x
+}
+
+rule FileNormalizeResolvesDotSegments {
+    -- normalize makes the path absolute, collapses "."/".." and repeated
+    -- separators, removes trailing separators, and maps "" to "".
+    when: Evaluates("list [file normalize /tmp/a/../b] [file normalize /tmp//a///b] [file normalize \"\"] [file normalize /tmp/..]")
+    ensures: completion.code = ok
+    ensures: completion.value = "/tmp/b /tmp/a/b {} /"
+    -- probe 2026-11-28 tclsh9.1; ~ kept literal is io.allium's rule
+}
+
+rule FileNativenameIsIdentityOnUnix {
+    -- On Unix the native name is the name unchanged, including "".
+    when: Evaluates("list [file nativename /a/b] [file nativename a/b] [file nativename \"\"]")
+    ensures: completion.code = ok
+    ensures: completion.value = "/a/b a/b {}"
+    -- probe 2026-11-28 tclsh9.1 (Linux)
+}
+
+rule FileSeparatorIsSlash {
+    -- separator is "/" with or without a name argument; an empty name is
+    -- "unrecognised path".
+    when: Evaluates("list [file separator] [file separator /a/b] [file separator a] [catch {file separator \"\"} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "/ / / 1 {unrecognised path}"
+    -- probe 2026-11-28 tclsh9.1 (Linux)
+}
+
+-- ── 9.1 temporary path / volume surface ──────────────────────────
+
+rule FileTempdirIsAbsoluteAndHonorsTemplate {
+    -- tempdir returns an absolute existing directory; a template controls the
+    -- leading path (the random suffix stays free).
+    when: Evaluates("set d [file tempdir /tmp/rtcl_spec_dtXXXXXX]; list [file pathtype [file tempdir]] [string match /tmp/rtcl_spec_dt* $d] [file isdirectory $d]")
+    ensures: completion.code = ok
+    ensures: completion.value = "absolute 1 1"
+    -- probe 2026-11-28 tclsh9.1; tempdir isdirectory is io.allium's rule
+}
+
+rule FileTempfileReturnsChannelAndName {
+    -- 9.1's tempfile creates the file, returns a read-write channel (fileN)
+    -- and stores the path in nameVar; the new file is empty and blocking.
+    when: Evaluates("set ch [file tempfile nm]; set r [list [string match file* $ch] [file exists $nm] [file readable $nm] [file writable $nm] [fconfigure $ch -blocking] [file size $nm]]; close $ch; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 1 1 0"
+    -- probe 2026-11-28 tclsh9.1; doc/file.n "returns a read-write channel"
+}
+
+rule FileTildeexpandPassesThroughNonTilde {
+    -- tildeexpand leaves non-tilde paths untouched; an unknown ~user is an
+    -- error naming the user. (~/x through HOME is io.allium's rule.)
+    when: Evaluates("list [file tildeexpand /a/b] [file tildeexpand a/b] [catch {file tildeexpand ~zzz_nouser_99} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "/a/b a/b 1 {user \"zzz_nouser_99\" doesn't exist}"
+    -- probe 2026-11-28 tclsh9.1
+}
+
+rule FileVolumesListsRootAndZipfs {
+    -- volumes lists the mounted volumes; the standard 9.1 build has the
+    -- built-in zipfs volume followed by the Unix root.
+    when: Evaluates("list [file volumes] [llength [file volumes]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{//zipfs:/ /} 2"
+    -- probe 2026-11-28 tclsh9.1 (zipfs is a core 9.1 filesystem)
+}

@@ -7,8 +7,8 @@
 -- Oracle: tclsh 9.1.0 (core-9-1-0).
 --
 -- Scope: the `info` surface except `info class` / `info object` (oo.allium),
--- `info constant` / `info consts` (variables.allium) and `info loaded`
--- (interp.allium).
+-- `info constant` / `info consts` (variables.allium), `info loaded`
+-- (interp.allium) and `info coroutine` (coroutine.allium).
 -- Probes: 2026-11-28 tclsh9.1; docs doc/info.n, doc/mathfunc.n.
 -- cmdtype type names: TIP 426.
 
@@ -276,15 +276,6 @@ rule InfoHostnameIsNonEmptyAndTrimmed {
 }
 
 -- ── coroutine / error stack introspection ────────────────────────
-
-rule InfoCoroutineNamesCurrentCoroutine {
-    -- info coroutine is empty outside a coroutine and the coroutine's
-    -- command name (fully qualified) inside it.
-    when: Evaluates("list [info coroutine] [coroutine co eval {info coroutine}]")
-    ensures: completion.code = ok
-    ensures: completion.value = "{} ::co"
-    -- probe 2026-11-28 tclsh9.1
-}
 
 rule InfoErrorstackInnerForSimpleError {
     -- After an error the stack holds the INNER operation that raised it;

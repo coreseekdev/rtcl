@@ -251,13 +251,16 @@ rule ScanFloatSpecialValues {
 
 -- ── binary ────────────────────────────────────────────────────────
 
-rule BinaryNetworkFieldsAreBigEndian {
-    -- t/n/m (16/32/64-bit network order) are big-endian on both format
-    -- and scan. (Verified: binary scan [binary format n 1] H* => 00000001.)
-    when: Evaluates("binary scan [binary format t 1 m 1] H* h")
+rule BinaryNativeEndianFields {
+    -- t/n/m are 16/32/64-bit integers in the machine's NATIVE byte order,
+    -- not network order. On this x86-64 oracle they are little-endian:
+    -- t 0100, n 01000000, m 0100000000000000. The values are host-defined
+    -- by design; the spec anchors the 9.1.0 x86-64 oracle.
+    when: Evaluates("list [binary encode hex [binary format t 1]] [binary encode hex [binary format n 1]] [binary encode hex [binary format m 1]]")
     ensures: completion.code = ok
-    -- oracle h: 00010000000000000000000000000000 ... (t big-endian, then m)
-    -- rtcl matches tclsh here (earlier suspicion of LE bug was wrong)
+    ensures: completion.value = "0100 01000000 0100000000000000"
+    -- probe 2026-11-28 tclsh9.1 x86-64 (doc/binary.n: native byte order,
+    -- not network order; the earlier 8.6-era "big-endian" claim was wrong)
 }
 
 rule BinaryScanShortInputLeavesVarsUnset {

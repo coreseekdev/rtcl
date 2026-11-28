@@ -191,7 +191,7 @@ rule ExprBarewordErrors {
 rule ExprDoubleQuotedWordsSubstitute {
     -- "..." words inside an expression perform $ and [] substitution;
     -- {...} words do not.
-    when: Evaluates("expr {\" $x\"}    -- with variable x = world")
+    when: Evaluates("set x world; expr {\" $x\"}")
     ensures: completion.code = ok
     ensures: completion.value = " world"
     -- probe: set x world; puts [expr {" $x"}]

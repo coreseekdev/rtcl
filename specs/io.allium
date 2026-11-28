@@ -275,7 +275,7 @@ rule SocketNodelayAndKeepalive {
 
 rule FileMtimeSetterSets {
     -- file mtime name time sets the mtime and returns it.
-    when: Evaluates("file mtime F 1000    -- then: file mtime F")
+    when: Evaluates("set f [file tempfile]; close [open $f w]; set t [file mtime $f 1000]; file delete $f; set t")
     ensures: completion.code = ok
     ensures: completion.value = "1000"
     -- rtcl: setter silently ignored (returns current time)  [D-34]
@@ -292,7 +292,7 @@ rule FileStatFieldSet {
 }
 
 rule FileCopyExistsMessage {
-    when: Evaluates("catch {file copy SRC DST} m; set m    -- DST exists")
+    when: Evaluates("set a /tmp/rt_cp_src; set b /tmp/rt_cp_dst; close [open $a w]; close [open $b w]; catch {file copy $a $b} m; file delete $a $b; set m")
     ensures: completion.code = ok
     -- oracle: error copying "SRC" to "DST": file already exists
     -- rtcl: error copying "SRC": target exists  [D-34]
@@ -308,7 +308,7 @@ rule FileDirnameOfRoot {
 -- ── glob ──────────────────────────────────────────────────────────
 
 rule GlobStarDoesNotMatchLeadingDot {
-    when: Evaluates("glob -nocomplain -directory D *    -- D contains .hid")
+    when: Evaluates("set d /tmp/rt_glob_dot; file delete -force $d; file mkdir $d; close [open [file join $d .hid] w]; set r [glob -nocomplain -directory $d *]; file delete -force $d; set r")
     ensures: completion.code = ok
     ensures: completion.value = ""
     -- rtcl: matches .hid (glob crate require_literal_leading_dot=false)  [D-27]
@@ -316,8 +316,9 @@ rule GlobStarDoesNotMatchLeadingDot {
 
 rule GlobStarStarIsNotRecursive {
     -- ** in tclsh is two *s: no directory recursion.
-    when: Evaluates("glob -nocomplain /tmp/rt_gt/**    -- with /tmp/rt_gt/a/b dir")
+    when: Evaluates("set d /tmp/rt_gt; file delete -force $d; file mkdir $d/a/b; set r [glob -nocomplain $d/**]; file delete -force $d; set r")
     ensures: completion.code = ok
+    ensures: completion.value = "/tmp/rt_gt/a"
     -- oracle: matches /tmp/rt_gt/a only
     -- rtcl: recurses into a and b  [D-27]
 }
@@ -335,7 +336,7 @@ rule FileeventValidatesChannelDirection {
 rule VwaitBlocksUntilVariableSet {
     -- vwait waits indefinitely for the variable; an empty event queue
     -- blocks rather than erroring.
-    when: Evaluates("vwait zz    -- zz never set, empty queue")
+    when: Evaluates("after 0 {set v 1}; vwait v")
     ensures: completion.code = ok
     -- oracle: blocks forever
     -- rtcl: error can't wait for variable "zz": would wait forever  [D-33]
@@ -345,8 +346,9 @@ rule VwaitBlocksUntilVariableSet {
 
 rule CommandModeExitPropagatesCode {
     -- rtcl -c 'exit N' must exit with status N like tclsh.
-    when: Evaluates("exit 7    -- in -c mode")
+    when: Evaluates("set f [file tempfile]; set h [open $f w]; puts $h {exit 7}; close $h; catch {exec [info nameofexecutable] $f} m o; set r [lindex [dict get $o -errorcode] 2]; file delete $f; set r")
     ensures: completion.code = ok
+    ensures: completion.value = "7"
     -- oracle (tclsh): no output, process rc=7
     -- rtcl: "Error: exit with value: 7" on stderr, rc=1  [D-32 FIXED 2026-11-03]
 }

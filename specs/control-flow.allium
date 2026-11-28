@@ -17,7 +17,7 @@ given {
 rule LoopsReturnEmptyString {
     -- while, for and foreach always produce the empty string as their
     -- result, regardless of the last body evaluation.
-    when: Evaluates("while {$i < 2} {incr i}    -- with i = 0")
+    when: Evaluates("set i 0; while {$i < 2} {incr i}")
     ensures: completion.code = ok
     ensures: completion.value = ""
     -- same for: for {set i 0} {$i < 2} {incr i} {set i}
@@ -33,7 +33,10 @@ rule BreakExitsInnermostLoop {
 }
 
 rule BreakOutsideLoopIsError {
-    when: Evaluates("break    -- at top level")
+    -- at top level break is an error; the audit wraps the script in
+    -- catch (where a bare break would only yield code 3), so exercise
+    -- the same command outside every loop in a proc body.
+    when: Evaluates("proc p {} {break}; p")
     ensures: completion.code = error
     -- oracle message: invoked "break" outside of a loop
 }
@@ -51,14 +54,14 @@ rule ContinueSkipsToNextIteration {
 rule ReturnInProcBecomesOkAtBoundary {
     -- A plain `return v` inside a proc completes the proc call with
     -- code ok and value v.
-    when: Evaluates("f    -- with proc f {} {return hi}")
+    when: Evaluates("proc f {} {return hi}; f")
     ensures: completion.code = ok
     ensures: completion.value = "hi"
 }
 
 rule ReturnCodeErrorPropagatesAsError {
     -- return -code error v makes the proc call fail with message v.
-    when: Evaluates("catch {f} msg; set msg    -- with proc f {} {return -code error oops}")
+    when: Evaluates("proc f {} {return -code error oops}; catch {f} msg; set msg")
     ensures: completion.code = ok
     ensures: completion.value = "oops"
 }
@@ -67,7 +70,7 @@ rule ReturnCodeOptionIsHonoured {
     -- return -code break / -code continue behave as break/continue at
     -- the enclosing loop; return -code return propagates a return
     -- completion to the caller (level counting applies).
-    when: Evaluates("f    -- with proc f {} {return -code return inner}")
+    when: Evaluates("proc f {} {return -code return inner}; f")
     ensures: completion.code = return
     -- probe: proc f {} {return -code return inner}; puts [f] => "" (at top level)
 }
@@ -75,7 +78,7 @@ rule ReturnCodeOptionIsHonoured {
 rule ReturnLevelOptionIsHonoured {
     -- -level N shifts the completion up N extra levels; it must not be
     -- silently ignored.
-    when: Evaluates("return -level 0 -code ok v    -- inside a proc")
+    when: Evaluates("proc f {} {return -level 0 -code ok v}; f")
     ensures: completion.code = ok
     ensures: completion.value = "v"
 }

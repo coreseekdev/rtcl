@@ -3129,3 +3129,26 @@ sweep 12 既有、workspace **cargo exit 0**（rtcl-vm 871/0）、wasm32 ✓、
   release 逻辑变化——归布局类，同步骤 4 先例，建议符号化构建定位）；
   frame info_locals list 段 +12~13%（cycles min 持平 +0.7%——邻居满
   载污染，挂观察）；链接面 baseexists 分歧（独立批）。
+
+## D3 第一批——F3/F5/F6 回落门收敛（task/d3-fallback1 @ 01994e2，2026-11-28，子代理施工）
+
+- **F3 epoch 失配重编译**（2687962）：消费门失配即 recompile_stale_body
+  （memo FIFO 32，每失配体每世代一次）+ eval 单元换入 bytecode_cache；
+  首次编译即盖章当前 epoch+遮蔽面（compile_unit_skipping）——旧世界
+  eval 单元恒 epoch 0，一次 bump 后整个快路径被永久拒绝；配套
+  shadowed_tier1_folds 补 rename-away 面。验收 f3-epoch.sh（两引擎逐
+  字节一致）。保持现状（记录分歧）：单元执行中途 bump 的剩余部分仍
+  树走查（重进入点只支持命令边界）。
+- **F5 大脚本直接编译**（c158973）：>1MiB 按请求编译执行，绕过
+  parse-cache 键/存入，执行后即弃。验收 f5-bigscript.sh（24000-loop
+  1.08MB，errorInfo 与小单元及 tclsh9.1 逐字节一致——C55 树形帧消失）。
+- **F6 body_memo**（01994e2）：容量 4→32（覆盖 ~10 层嵌套驻集上界，
+  有界驻留）；「挤出不回落」由 F3/F5 承接为不变式。验收
+  f6-bodymemo.sh（8 互异大体 576KB 驻集，unit=57、tf=0）。
+- 门禁（合并树）：judge 95/95、crash-gate 128/128、probes 398/76、
+  sweep 12 既有、rtcl-vm 896/0、workspace 1527/0 exit 0、五特性 ✓。
+- 回落门现状：**仅剩 F2（exec trace 钉回）+ F4（--no-bytecode 诊断
+  模式）**——树引擎驻留面收敛到 trace 事件批（D3-2）。
+- 环境注记：/tmp tmpfs 99% 时 IO 测试假红 29 项（与本批无关），
+  TMPDIR 指向 worktree 内重跑 exit 0 全绿；Agent.md 假新鲜陷阱一次
+  实证（touch 强制重建后核对）。

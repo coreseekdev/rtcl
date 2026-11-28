@@ -1,0 +1,472 @@
+-- allium: 3
+-- scan.allium
+-- Behaviour spec: the scan command — conversion specifiers
+-- (d/o/x/X/b/u/i/c/s/e/f/g, %n, %[...], %%, %*), field width, size
+-- modifiers, base-prefix grammar, the inline list form, positional
+-- specifiers, and variable-assignment semantics.
+-- Oracle: tclsh 9.1.0 (core-9-1-0).
+--
+-- Scope: the 9.1 scan faces not already pinned by matching.allium.
+-- matching.allium already owns these six rules, deliberately not
+-- duplicated here: ScanSizeModifiersSelect64Bit, ScanIntegerTruncatesTo32Bits,
+-- ScanIntegerLiteralGrammar, ScanOverflowSaturates, ScanCharReturnsCodePoint,
+-- ScanFloatSpecialValues.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── arity and format errors ─────────────────────────────────────
+
+rule ScanWrongArity {
+    -- scan needs at least string and format; varName is variadic.
+    when: Evaluates("list [catch {scan} m1] $m1 [catch {scan abc} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {wrong # args: should be \"scan string format ?varName ...?\"} 1 {wrong # args: should be \"scan string format ?varName ...?\"}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanTooManyVariableNames {
+    -- More varName words than conversion specifiers is an error.
+    when: Evaluates("catch {scan 1 %d a b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "variable is not assigned by any conversion specifiers"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanTooFewVariableNames {
+    -- Fewer varName words than conversion specifiers is an error.
+    when: Evaluates("catch {scan {1 2} {%d %d} a} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "different numbers of variable names and field specifiers"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanUnmatchedCharSetBracket {
+    -- A character-set specifier that never closes is a format error.
+    when: Evaluates("catch {scan abc {%[]}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unmatched [ in format string"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanBadConversionCharacter {
+    -- An unknown conversion letter reports the letter in quotes.
+    when: Evaluates("catch {scan abc %y} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad scan conversion character \"y\""
+    -- probe: 2026-11-28 tclsh9.1 (a trailing % reports the NUL char
+    --   instead; %y is the ordinary case)
+}
+
+-- ── positional (%n$) specifiers ─────────────────────────────────
+
+rule ScanMixedPositionalSpecifiers {
+    -- Positional and sequential conversions cannot be mixed.
+    when: Evaluates("catch {scan {1 2} {%1$d %d}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "cannot mix \"%\" and \"%n$\" conversion specifiers"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanPositionalIndexOutOfRange {
+    -- Index 0 is out of range; indices start at 1.
+    when: Evaluates("catch {scan 12 {%0$d} a} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "\"%n$\" argument index out of range"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanDuplicatePositionalTarget {
+    -- Two positional specifiers may not write the same variable.
+    when: Evaluates("catch {scan 12 {%1$d %2$d %1$d} a b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "variable is assigned by multiple \"%n$\" conversion specifiers"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanPositionalVariableCount {
+    -- Every positional index must name a supplied variable, and every
+    -- supplied variable must be named by a specifier.
+    when: Evaluates("list [catch {scan 12 {%1$d %2$d} a} m1] $m1 [catch {scan 12 {%1$d} a b} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {\"%n$\" argument index out of range} 1 {variable is not assigned by any conversion specifiers}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanPositionalSuppressionRejected {
+    -- A position and a * are alternatives, not composable; * after a
+    -- position is parsed as the conversion character.
+    when: Evaluates("catch {scan {12 34} {%2$*d %1$d} a b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad scan conversion character \"*\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── suppression and literal format text ─────────────────────────
+
+rule ScanSuppressedConversionSkipsVariable {
+    -- %* consumes input but assigns no variable and is not counted.
+    when: Evaluates("set r [scan {12 34} {%*d %d} a]; set s [scan {12 34} {%d %*d} b]; list $r $a $s $b")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 34 1 12"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanLiteralPercent {
+    -- %% in the format matches one literal percent character.
+    when: Evaluates("list [scan {50%} {%d%%}] [scan {a%5} {a%%%d}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "50 5"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanLiteralMismatchStops {
+    -- A literal mismatch ends scanning; earlier conversions are kept and
+    -- later variables stay untouched.
+    when: Evaluates("set a X; set r [scan {12x} {%d-%d} a b]; list $r $a [info exists b]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 12 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanLiteralMatchIsCaseSensitive {
+    -- Format literals compare exactly; only conversions skip whitespace.
+    when: Evaluates("list [scan abc {abc%n} n] $n [scan Abc {abc%n} m] [info exists m]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 3 0 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanFormatWhitespaceMatchesZeroOrMore {
+    -- Whitespace in the format matches any run of whitespace, including
+    -- none, in the input.
+    when: Evaluates("list [scan abc {   abc%n} n] $n [scan { abc} { abc%n} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 3 1 4"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanConversionsSkipLeadingWhitespace {
+    -- Except for %c and %[, conversions first skip input whitespace; %s
+    -- then stops at the next whitespace.
+    when: Evaluates("list [scan {  ab cd} %s] [scan {   12} %d]")
+    ensures: completion.code = ok
+    ensures: completion.value = "ab 12"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanCharAndSetDoNotSkipWhitespace {
+    -- %c and %[ consume the input as-is, so leading blanks are data.
+    when: Evaluates("set r [scan {   abc} {%[a-z]} a]; list $r [info exists a] [scan {   x} %c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0 32"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanTrailingInputIgnored {
+    -- Unconsumed trailing input is not an error; %n records the cursor.
+    when: Evaluates("list [scan 12abc %d] [scan 12abc {%d%n}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "12 {12 2}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── inline list form ────────────────────────────────────────────
+
+rule ScanInlineOneSlotPerConversion {
+    -- With no varName arguments scan returns a list of converted values.
+    when: Evaluates("list [scan {12 34} {%d %d}] [llength [scan {12 34} {%d %d}]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{12 34} 2"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanInlinePadsUnreachedConversions {
+    -- Every non-suppressed conversion owns a slot; values not reached
+    -- are empty strings, even when a literal mismatch stopped the scan.
+    when: Evaluates("list [llength [scan 12 {%d-%d}]] [scan 12 {%d-%d}] [llength [scan abc %d]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "2 {12 {}} 1"
+    -- probe: 2026-11-28 tclsh9.1 (abc %d reaches the conversion but
+    --   matches nothing, so it still gets one empty slot)
+}
+
+rule ScanInlineEofBeforeConversionEmpty {
+    -- If input ends before any conversion is performed, the inline
+    -- result is the empty string (zero list elements); zero-conversion
+    -- formats also yield empty.
+    when: Evaluates("list [scan {} %d] [llength [scan {} {%d %d}]] [scan abc {}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 0 {}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanInlinePositionalPadsMissing {
+    -- The inline positional list is indexed by position; unreached
+    -- positions are empty, and the same positions leave variables unset.
+    when: Evaluates("scan 12 {%1$d %2$d} a b; list [scan 12 {%1$d %2$d}] [llength [scan 12 {%1$d %2$d}]] $a [info exists b]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{12 {}} 2 12 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── variable assignment and EOF ─────────────────────────────────
+
+rule ScanPartialMatchLeavesLaterVariableUnset {
+    -- On a partial match only the performed conversions are stored; a
+    -- later variable keeps its previous value, and an absent one stays
+    -- unset.
+    when: Evaluates("set b Y; set r [scan 1 {%d %d} a b]; list $r $a $b [info exists c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 Y 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanFailedConversionKeepsOldValue {
+    -- A conversion that matches nothing assigns nothing.
+    when: Evaluates("set a OLD; set r [scan abc %d a]; list $r $a [info exists b]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 OLD 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanEmptyInputReturnsMinusOne {
+    -- Var form returns -1 when the input is exhausted before any
+    -- conversion is performed, including when only whitespace remains.
+    when: Evaluates("list [scan {} %d a] [scan {   } %d b] [info exists a] [info exists b]")
+    ensures: completion.code = ok
+    ensures: completion.value = "-1 -1 0 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanVariableNameMayBeEmptyOrDash {
+    -- Any word is a legal variable name, including the empty string and
+    -- a single dash.
+    when: Evaluates("set r [scan 1 %d {}]; set s [scan 2 %d -]; list $r [set {}] $s [set -]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1 2"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── %n, integer and floating conversions ────────────────────────
+
+rule ScanNReportsCharactersConsumed {
+    -- %n consumes nothing, stores the character cursor, and counts as a
+    -- conversion; it succeeds even at end of input.
+    when: Evaluates("set r [scan {  abc} {%n%s%n} a w b]; list $r $a $w $b [scan {} %n m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 0 abc 5 1 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanDecimalStopsAtNonDecimal {
+    -- %d takes an optional sign and decimal digits; 0x/0o/0b prefixes and
+    -- underscore separators are not part of the conversion.
+    when: Evaluates("list [scan 0x10 %d] [scan 1_000 %d] [scan 08 %d] [scan -12 %d]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 1 8 -12"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanIntegerBaseConvention {
+    -- %i uses the C convention: 0x for hex, leading 0 for octal. The 9.1
+    -- 0o/0b literal prefixes are not recognized by %i.
+    when: Evaluates("list [scan 0x10 %i] [scan 0o10 %i] [scan 0b101 %i]")
+    ensures: completion.code = ok
+    ensures: completion.value = "16 0 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanOctalConversion {
+    -- %o reads octal digits; 0o is not a prefix here and a non-octal
+    -- digit ends the conversion.
+    when: Evaluates("list [scan 0777 %o] [scan 0o10 %o] [scan 8 %o] [scan 078 %o]")
+    ensures: completion.code = ok
+    ensures: completion.value = "511 0 {{}} 7"
+    -- probe: 2026-11-28 tclsh9.1 (8 %o reaches the conversion but
+    --   matches nothing: inline slot is empty)
+}
+
+rule ScanUpperHexConversion {
+    -- %X is the uppercase spelling of %x and accepts 0x/0X prefixes.
+    when: Evaluates("list [scan 0XFF %X] [scan 0XFF %x]")
+    ensures: completion.code = ok
+    ensures: completion.value = "255 255"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanBinaryPrefixAndStop {
+    -- %b accepts a 0b/0B prefix and stops at the first non-binary digit.
+    when: Evaluates("list [scan 0B101 %b] [scan 102 %b]")
+    ensures: completion.code = ok
+    ensures: completion.value = "5 2"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanUnsignedReinterpretation {
+    -- %u reports the unsigned 64-bit view of the parsed value; a positive
+    -- value that overflows the 32-bit parse wraps first, and a parse that
+    -- cannot fit saturates.
+    when: Evaluates("list [scan -1 %u] [scan 3000000000 %u] [scan 4294967296 %u]")
+    ensures: completion.code = ok
+    ensures: completion.value = "18446744073709551615 18446744072414584320 2147483647"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanFloatAliases {
+    -- e/f/g and their uppercase forms all parse a floating-point value
+    -- and produce a double.
+    when: Evaluates("list [scan 1.5e2 %e] [scan 1.5 %f] [scan .5 %g] [scan 1.5E2 %E] [scan 1.5 %G]")
+    ensures: completion.code = ok
+    ensures: completion.value = "150.0 1.5 0.5 150.0 1.5"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanFloatStopsAtShortestPrefix {
+    -- A float conversion accepts the longest valid prefix; a bare dot or
+    -- a hex-looking token is not a float.
+    when: Evaluates("list [scan 1e %f] [scan . %f] [scan 0x10 %f]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1.0 {} 0.0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── field width ─────────────────────────────────────────────────
+
+rule ScanFieldWidthLimits {
+    -- The width caps the characters consumed by one conversion.
+    when: Evaluates("list [scan 12345 %2d] [scan abcdef %3s] [scan 1.2345 %3f]")
+    ensures: completion.code = ok
+    ensures: completion.value = "12 abc 1.2"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanFieldWidthIncludesSign {
+    -- The width counts the sign character as part of the field.
+    when: Evaluates("list [scan -123 %2d] [scan +123 %2d]")
+    ensures: completion.code = ok
+    ensures: completion.value = "-1 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanZeroWidthMeansUnlimited {
+    -- An explicit width of 0 is treated as no limit.
+    when: Evaluates("list [scan 12345 %0d] [scan abc %0s]")
+    ensures: completion.code = ok
+    ensures: completion.value = "12345 abc"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanWidthCountsCharacters {
+    -- Width is measured in characters, not bytes, so a two-character
+    -- width can capture a non-ASCII scalar.
+    when: Evaluates("set s [scan [string cat h [format %c 233] llo] %2s]; list [string equal $s [string cat h [format %c 233]]] [string length $s]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 2"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── %[...] character sets ───────────────────────────────────────
+
+rule ScanCharSetWidth {
+    -- A width limits the run captured by a character set.
+    when: Evaluates("scan abc123 {%2[a-z]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "ab"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanCharSetRangesAndNegation {
+    -- Sets take ranges and a leading ^ negation; adjacent sets are
+    -- separate conversions.
+    when: Evaluates("list [scan {aZ09} {%[a-zA-Z]}] [scan {abc123} {%[^0-9]}] [scan {ab12} {%[a-z]%[0-9]}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "aZ abc {ab 12}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanCharSetBracketQuirks {
+    -- A first ] is a member, and a trailing - is a literal rather than a
+    -- range operator.
+    when: Evaluates("string cat [scan {a]b} {%[]a]}] {|} [scan {a-b} {%[ab-]}] {|} [scan {]} {%[]]}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "a\\]|a-b|\\]"
+    -- probe: 2026-11-28 tclsh9.1 (the list-less string cat avoids Tcl
+    --   list quoting of ]; the expected value keeps Tcl's escaped form)
+}
+
+rule ScanCharSetNoMatchStops {
+    -- A set that matches zero characters stops the scan and assigns
+    -- nothing.
+    when: Evaluates("set r [scan 123 {%[a-z]} a]; list $r [info exists a]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── size modifiers and overflow ─────────────────────────────────
+
+rule ScanSizeModifierLLAndLUnlimited {
+    -- l is the 64-bit wide range and saturates; ll and L are unlimited
+    -- (9.0 stopped truncating L to 64 bits) and keep arbitrary precision.
+    when: Evaluates("list [scan 9223372036854775808 %ld] [scan 9223372036854775808 %lld] [scan 9223372036854775808 %Ld] [scan -9223372036854775809 %ld] [scan -9223372036854775809 %lld]")
+    ensures: completion.code = ok
+    ensures: completion.value = "9223372036854775807 9223372036854775808 9223372036854775808 -9223372036854775808 -9223372036854775809"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanSizeModifierHIs32Bit {
+    -- h is equivalent to no modifier (32-bit), not a 16-bit short.
+    when: Evaluates("list [scan 65536 %hd] [scan 2147483648 %hd]")
+    ensures: completion.code = ok
+    ensures: completion.value = "65536 -2147483648"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanPointerSizeModifiersSaturate {
+    -- z/t follow the platform pointer width (64-bit here), and j/q name
+    -- 64-bit targets; all saturate at the 64-bit bounds.
+    when: Evaluates("list [scan 9223372036854775808 %zd] [scan -9223372036854775809 %td] [scan 9223372036854775808 %jd] [scan 9223372036854775808 %qd]")
+    ensures: completion.code = ok
+    ensures: completion.value = "9223372036854775807 -9223372036854775808 9223372036854775807 9223372036854775807"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanSizeModifierRejectedForText {
+    -- Size modifiers are integer-only; %s, %c, %n and %[ reject them.
+    when: Evaluates("list [catch {scan abc %ls} m1] $m1 [catch {scan abc %lc} m2] $m2 [catch {scan abc %ln} m3] $m3")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {field size modifier may not be specified in %s conversion} 1 {field size modifier may not be specified in %c conversion} 1 {field size modifier may not be specified in %n conversion}"
+    -- probe: 2026-11-28 tclsh9.1 (%l[ says the same with "%[" )
+}
+
+rule ScanRepeatedSizeLetterRejected {
+    -- Only ll repeats; lll and hh fall through to the conversion letter.
+    when: Evaluates("list [catch {scan 1 %llld} m1] $m1 [catch {scan 1 %hhd} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {bad scan conversion character \"l\"} 1 {bad scan conversion character \"h\"}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── positional ordering and empty formats ───────────────────────
+
+rule ScanPositionalReorders {
+    -- Positional specifiers assign and list in position order, not format
+    -- order.
+    when: Evaluates("scan {12 34} {%2$d %1$d} a b; list $a $b [scan {12 34} {%2$d %1$d}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "34 12 {34 12}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ScanEmptyFormatIsNoConversion {
+    -- An empty format performs no conversions and returns an empty inline
+    -- list.
+    when: Evaluates("list [scan abc {}] [llength [scan abc {}]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 0"
+    -- probe: 2026-11-28 tclsh9.1
+}

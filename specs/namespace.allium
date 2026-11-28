@@ -1,0 +1,1018 @@
+-- allium: 3
+-- namespace.allium
+-- Behaviour spec: the Tcl 9.1 namespace ensemble — the full 9.1 subcommand
+-- surface (children, code, current, delete, ensemble, eval, exists, export,
+-- forget, import, inscope, origin, parent, path, qualifiers, tail, unknown,
+-- upvar, which), name resolution, ::-handling, export/import/forget, the
+-- ensemble dispatch/unknown handler machinery, and its error menus.
+-- Oracle: tclsh 9.1.0 (core-9-1-0). Every rule re-run on that build
+-- 2026-11-28; values are the exact catch code + result bytes.
+--
+-- Exclusions: variables.allium owns namespace-variable linkage, variable
+-- links, `variable`, and upvar/uplevel frame semantics (including
+-- `namespace which -variable`'s no-global-fallback rule); oo.allium owns
+-- OO object namespaces.  This file states only the namespace command surface.
+--
+-- Surprises pinned below (all oracle-verified): namespace names always
+-- resolve relative to the current namespace, so `namespace eval n` inside
+-- ::n creates ::n::n; `namespace delete` does not glob and validates every
+-- name before deleting anything; `namespace import`/`export` are snapshot
+-- /pattern stores, not live links; `namespace ensemble` export sets are
+-- live, but imports are not; an ensemble unknown handler returns a rewrite
+-- list (empty means "re-resolve"), not a result; `namespace which -command`
+-- with no name is parsed as a name and returns empty.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── names, current, eval ─────────────────────────────────────────
+
+rule NsCurrentReportsFullyQualifiedName {
+    -- namespace current is :: at the root and fully qualified elsewhere.
+    when: Evaluates("list [namespace current] [namespace eval a {namespace current}] [namespace eval a::b {namespace current}]")
+    ensures: completion.code = ok
+    ensures: completion.value = ":: ::a ::a::b"
+}
+
+rule NsRelativeNameResolvesInCurrentNamespace {
+    -- Namespace names are always resolved relative to the current
+    -- namespace: inside ::n, `namespace eval n` creates ::n::n, and
+    -- `namespace exists n` asks about that child.
+    when: Evaluates("namespace eval n {namespace eval n {}}; list [namespace exists ::n::n] [namespace eval n {namespace exists n}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+}
+
+rule NsAbsoluteNameBypassesCurrentNamespace {
+    -- A leading :: makes the name absolute regardless of the caller.
+    when: Evaluates("namespace eval n {namespace eval ::m {namespace current}}; list [namespace exists ::m] [namespace exists ::n::m]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+}
+
+rule NsColonRunsCollapseAndTrailingIgnored {
+    -- Runs of two or more colons are one separator; a trailing :: on a
+    -- namespace name is ignored.
+    when: Evaluates("list [namespace eval ::::a {namespace current}] [namespace eval b:::c {namespace current}] [namespace eval {::d::e::} {namespace current}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "::a ::b::c ::d::e"
+}
+
+rule NsEvalCreatesLeadingNamespaces {
+    -- Qualified names create all missing ancestors.
+    when: Evaluates("namespace eval a::b::c {}; list [namespace exists ::a] [namespace exists ::a::b] [namespace exists ::a::b::c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1"
+}
+
+rule NsEvalConcatenatesBodyArguments {
+    -- Extra arguments are concatenated with spaces, eval-style.
+    when: Evaluates("namespace eval n {list a} {b}")
+    ensures: completion.code = ok
+    ensures: completion.value = "a b"
+}
+
+rule NsEvalReturnsBodyValue {
+    when: Evaluates("namespace eval n {expr {6*7}}")
+    ensures: completion.code = ok
+    ensures: completion.value = "42"
+}
+
+rule NsEvalPropagatesReturn {
+    -- A return in the body leaves namespace eval as a return completion.
+    when: Evaluates("list [catch {namespace eval n {return hi}} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "2 hi"
+}
+
+rule NsEvalPropagatesBreakAndContinue {
+    -- break/continue cross namespace eval unchanged (codes 3 and 4).
+    when: Evaluates("list [catch {namespace eval n {break}} b] [catch {namespace eval n {continue}} c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 4"
+}
+
+rule NsEvalPropagatesError {
+    when: Evaluates("list [catch {namespace eval n {error boom}} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 boom"
+}
+
+rule NsEvalReturnLevelTwoPropagates {
+    -- `return -level 2` in a namespace eval body inside a proc completes
+    -- the proc's caller with a return completion carrying the value.
+    when: Evaluates("proc q {} {namespace eval n {return -level 2 x}}; list [catch q m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "2 x"
+}
+
+rule NsEvalRequiresBody {
+    when: Evaluates("catch {namespace eval n} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"namespace eval name arg ?arg...?\""
+}
+
+rule NsSubcommandMenu {
+    -- The 9.1 namespace subcommand menu, alphabetical, with `or which`.
+    when: Evaluates("catch {namespace foo} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown or ambiguous subcommand \"foo\": must be children, code, current, delete, ensemble, eval, exists, export, forget, import, inscope, origin, parent, path, qualifiers, tail, unknown, upvar, or which"
+}
+
+rule NsNoSubcommandUsage {
+    when: Evaluates("catch {namespace} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"namespace subcommand ?arg ...?\""
+}
+
+rule NsSubcommandAbbreviation {
+    -- Unique prefixes work: curr is current and ch is children.  A fresh
+    -- 9.1 root has exactly the three core child namespaces.
+    when: Evaluates("list [namespace curr] [llength [namespace ch]]")
+    ensures: completion.code = ok
+    ensures: completion.value = ":: 3"
+}
+
+rule NsAmbiguousSubcommand {
+    -- `e` is ambiguous (ensemble/eval/exists/export) and reports the menu.
+    when: Evaluates("catch {namespace e} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown or ambiguous subcommand \"e\": must be children, code, current, delete, ensemble, eval, exists, export, forget, import, inscope, origin, parent, path, qualifiers, tail, unknown, upvar, or which"
+}
+
+rule NsExistsChecksNamespacePresence {
+    when: Evaluates("list [namespace exists ::] [namespace exists ::nosuch]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+}
+
+-- ── children, parent, qualifiers, tail ───────────────────────────
+
+rule NsChildrenListsDirectChildren {
+    -- children returns only direct children, fully qualified.
+    when: Evaluates("namespace eval q {namespace eval a1 {}; namespace eval a2 {}; namespace eval deep {namespace eval x {}}}; list [lsort [namespace children ::q]] [lsort [namespace children ::q a*]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{::q::a1 ::q::a2 ::q::deep} {::q::a1 ::q::a2}"
+}
+
+rule NsChildrenPatternAbsoluteAndRelative {
+    -- A relative pattern is prefixed with the namespace argument; an
+    -- absolute pattern is used as-is, but still filters direct children.
+    when: Evaluates("namespace eval q {namespace eval a1 {}; namespace eval a2 {};}; list [lsort [namespace children q a*]] [lsort [namespace children ::q {::q::a*}]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{::q::a1 ::q::a2} {::q::a1 ::q::a2}"
+}
+
+rule NsRootChildrenAreCoreNamespaces {
+    -- A fresh 9.1 interpreter has exactly ::oo, ::tcl and ::zlib at root.
+    when: Evaluates("lsort [namespace children ::]")
+    ensures: completion.code = ok
+    ensures: completion.value = "::oo ::tcl ::zlib"
+}
+
+rule NsChildrenUnknownNamespaceErrors {
+    when: Evaluates("catch {namespace children nosuch} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "namespace \"nosuch\" not found in \"::\""
+}
+
+rule NsParentReportsEnclosingNamespace {
+    -- The root's parent is the empty name, and parent :: is empty too.
+    when: Evaluates("namespace eval a::b {}; list [namespace parent ::a::b] [namespace parent ::a] [namespace parent ::] [namespace parent]")
+    ensures: completion.code = ok
+    ensures: completion.value = "::a :: {} {}"
+}
+
+rule NsParentOfCurrentNamespace {
+    when: Evaluates("namespace eval q {namespace eval k {namespace parent}}")
+    ensures: completion.code = ok
+    ensures: completion.value = "::q"
+}
+
+rule NsParentUnknownNamespaceErrors {
+    when: Evaluates("catch {namespace parent nosuch} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "namespace \"nosuch\" not found in \"::\""
+}
+
+rule NsQualifiersAndTailSplitNames {
+    -- qualifiers/tail are pure string splits; :: yields empty for both.
+    when: Evaluates("list [namespace qualifiers ::a::b::c] [namespace tail ::a::b::c] [namespace qualifiers c] [namespace tail c] [namespace qualifiers ::] [namespace tail ::]")
+    ensures: completion.code = ok
+    ensures: completion.value = "::a::b c {} c {} {}"
+}
+
+rule NsQualifiersTailCollapseExtraColons {
+    -- Extra colons collapse in qualifiers/tail, and an all-colon prefix
+    -- has no qualifiers.
+    when: Evaluates("list [namespace tail ::::::a] [namespace qualifiers ::::::a] [namespace qualifiers a::::b] [namespace tail a::::b]")
+    ensures: completion.code = ok
+    ensures: completion.value = "a {} a b"
+}
+
+rule NsQualifiersAndTailDoNotValidateNamespaces {
+    -- Neither command checks that the qualifier names exist.
+    when: Evaluates("list [namespace qualifiers ::zz::yy::x] [namespace tail ::zz::yy::x]")
+    ensures: completion.code = ok
+    ensures: completion.value = "::zz::yy x"
+}
+
+-- ── delete ───────────────────────────────────────────────────────
+
+rule NsDeleteRemovesChildNamespaces {
+    -- Deleting a namespace deletes its whole subtree.
+    when: Evaluates("namespace eval a {namespace eval b {namespace eval c {}}}; namespace delete a; list [namespace exists ::a] [namespace exists ::a::b]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0"
+}
+
+rule NsDeleteValidatesAllNamesBeforeDeleting {
+    -- The name list is validated up front: one missing name aborts the
+    -- command and the existing names are left intact.
+    when: Evaluates("namespace eval x {}; namespace eval y {}; list [catch {namespace delete ::x ::nosuch} m] $m [namespace exists ::x] [namespace exists ::y]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {unknown namespace \"::nosuch\" in namespace delete command} 1 1"
+}
+
+rule NsDeleteNoArgsIsNoop {
+    when: Evaluates("namespace delete; namespace exists ::")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+}
+
+rule NsDeleteRejectsGlobPattern {
+    -- Unlike import/forget, delete has no pattern form.
+    when: Evaluates("catch {namespace delete ::n::*} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown namespace \"::n::*\" in namespace delete command"
+}
+
+rule NsDeleteRemovesCommandsAndEnsembles {
+    -- Deleting the linked namespace also removes its ensemble command.
+    when: Evaluates("namespace eval n {proc p {} {return P}; namespace export p; namespace ensemble create}; namespace delete n; list [info commands ::n::p] [namespace ensemble exists ::n] [namespace exists ::n]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 0 0"
+}
+
+rule NsDeleteRelativeNameDeletesChild {
+    when: Evaluates("namespace eval q {namespace eval k {}}; namespace eval q {namespace delete k}; namespace exists ::q::k")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+}
+
+rule NsDeleteMissingNamespaceErrors {
+    when: Evaluates("catch {namespace delete ::nosuch} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown namespace \"::nosuch\" in namespace delete command"
+}
+
+-- ── code / inscope ───────────────────────────────────────────────
+
+rule NsCodeWrapsScriptInInscope {
+    -- namespace code returns a four-word script; the namespace is the
+    -- fully qualified current namespace.
+    when: Evaluates("list [namespace code {set x 1}] [namespace eval n {namespace code {set x 1}}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{::namespace inscope :: {set x 1}} {::namespace inscope ::n {set x 1}}"
+}
+
+rule NsCodeCapturesNamespaceForLaterEval {
+    -- Evaluating the captured script elsewhere runs it in the capturing
+    -- namespace, so the global v is untouched.
+    when: Evaluates("namespace eval n {variable v 5; set ::s [namespace code {set v}]}; set v 9; list [eval $::s] $v")
+    ensures: completion.code = ok
+    ensures: completion.value = "5 9"
+}
+
+rule NsCodeAppendsArgumentsAsListElements {
+    -- Appended words become list elements of the wrapped script, so the
+    -- proc receives two arguments.
+    when: Evaluates("namespace eval n {proc p {a b} {list [namespace current] $a $b}; set ::s [namespace code p]}; eval $::s X Y")
+    ensures: completion.code = ok
+    ensures: completion.value = "::n X Y"
+}
+
+rule NsCodeRequiresOneArgument {
+    when: Evaluates("catch {namespace code a b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"namespace code arg\""
+}
+
+rule NsInscopeRunsScriptInNamespace {
+    -- inscope evaluates in the named namespace and returns the body value.
+    when: Evaluates("namespace eval n {variable v 1}; list [namespace inscope n {set v}] [namespace inscope n {incr v}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 2"
+}
+
+rule NsInscopeRequiresExistingNamespace {
+    -- Unlike namespace eval, inscope never creates the namespace.
+    when: Evaluates("catch {namespace inscope nosuch {set x}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "namespace \"nosuch\" not found in \"::\""
+}
+
+rule NsInscopeAppendsArgumentsWithoutResubstitution {
+    -- Extra args are appended as proper list elements: "a b" stays one
+    -- argument.
+    when: Evaluates("namespace eval n {}; namespace inscope n {list} {a b} c")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a b} c"
+}
+
+rule NsInscopePropagatesReturn {
+    when: Evaluates("namespace eval n {}; list [catch {namespace inscope n {return hi}} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "2 hi"
+}
+
+rule NsInscopeUsage {
+    when: Evaluates("catch {namespace inscope n} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"namespace inscope name arg ?arg...?\""
+}
+
+-- ── path ─────────────────────────────────────────────────────────
+
+rule NsPathReportsAndSets {
+    -- Setting the path returns empty; querying returns the list as set.
+    when: Evaluates("namespace eval n {list [namespace path {::tcl::mathop}] [namespace path]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} ::tcl::mathop"
+}
+
+rule NsPathResolvesCommands {
+    when: Evaluates("namespace eval p {proc d {} {return D}}; namespace eval n {namespace path {::p}; d}")
+    ensures: completion.code = ok
+    ensures: completion.value = "D"
+}
+
+rule NsPathCurrentNamespaceWins {
+    -- The current namespace is searched before the path.
+    when: Evaluates("namespace eval p {proc d {} {return P}}; namespace eval n {proc d {} {return N}; namespace path {::p}; d}")
+    ensures: completion.code = ok
+    ensures: completion.value = "N"
+}
+
+rule NsPathOrderDeterminesWinner {
+    -- Earlier path entries win; which reports the winning path name.
+    when: Evaluates("namespace eval p1 {proc d {} {return P1}}; namespace eval p2 {proc d {} {return P2}}; namespace eval n {namespace path {::p1 ::p2}; list [d] [namespace which -command d]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "P1 ::p1::d"
+}
+
+rule NsPathOrderReversed {
+    when: Evaluates("namespace eval p1 {proc d {} {return P1}}; namespace eval p2 {proc d {} {return P2}}; namespace eval n {namespace path {::p2 ::p1}; d}")
+    ensures: completion.code = ok
+    ensures: completion.value = "P2"
+}
+
+rule NsPathRejectsMissingNamespace {
+    when: Evaluates("catch {namespace eval n {namespace path {::nosuch}}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "namespace \"::nosuch\" not found"
+}
+
+rule NsPathResolvesRelativeNames {
+    -- Relative path entries resolve in the namespace whose path is set.
+    when: Evaluates("namespace eval outer {namespace eval n {proc d {} {return D}}}; namespace eval outer {namespace path {n}; d}")
+    ensures: completion.code = ok
+    ensures: completion.value = "D"
+}
+
+rule NsPathEmptyRestoresNoPath {
+    -- Clearing the path makes path-only commands unresolvable again.
+    when: Evaluates("namespace eval p {proc d {} {return D}}; namespace eval n {namespace path {::p}; namespace path {}; list [namespace path] [catch {d} m] $m}")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 1 {invalid command name \"d\"}"
+}
+
+rule NsPathAllowsGlobalNamespace {
+    when: Evaluates("namespace eval n {namespace path {::}}; namespace eval n {namespace path}")
+    ensures: completion.code = ok
+    ensures: completion.value = "::"
+}
+
+-- ── origin / which ───────────────────────────────────────────────
+
+rule NsOriginFollowsImportChain {
+    -- origin follows imported aliases back to the first definition.
+    when: Evaluates("namespace eval a {proc p {} {return P}; namespace export p}; namespace eval b {namespace import ::a::p; namespace export p}; namespace eval c {namespace import ::b::p}; list [c::p] [namespace origin ::c::p]")
+    ensures: completion.code = ok
+    ensures: completion.value = "P ::a::p"
+}
+
+rule NsOriginReturnsOwnNameForLocalCommand {
+    -- For a command that is not an import, origin is its own name.
+    when: Evaluates("namespace eval n {proc p {} {return P}}; list [namespace origin set] [namespace origin ::n::p]")
+    ensures: completion.code = ok
+    ensures: completion.value = "::set ::n::p"
+}
+
+rule NsOriginRejectsUnknownCommand {
+    when: Evaluates("catch {namespace origin nosuch} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "invalid command name \"nosuch\""
+}
+
+rule NsWhichDefaultsToCommandLookup {
+    -- No option means -command.
+    when: Evaluates("list [namespace which set] [namespace which -command set]")
+    ensures: completion.code = ok
+    ensures: completion.value = "::set ::set"
+}
+
+rule NsWhichFindsCommandThroughPath {
+    when: Evaluates("namespace eval p {proc d {} {return D}}; namespace eval n {namespace path {::p}; namespace which -command d}")
+    ensures: completion.code = ok
+    ensures: completion.value = "::p::d"
+}
+
+rule NsWhichReportsImportedAliasNotOrigin {
+    -- which reports the visible (importing) name; origin follows the link.
+    when: Evaluates("namespace eval n {proc p {} {return P}; namespace export p}; namespace eval m {namespace import ::n::p}; list [namespace which -command ::m::p] [namespace origin ::m::p]")
+    ensures: completion.code = ok
+    ensures: completion.value = "::m::p ::n::p"
+}
+
+rule NsWhichReturnsEmptyForMissingNames {
+    -- A missing name is empty, not an error, for both kinds.
+    when: Evaluates("list [namespace which nosuch] [namespace which -variable nosuch]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {}"
+}
+
+rule NsWhichRejectsConflictingOptions {
+    when: Evaluates("catch {namespace which -command -variable x} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"namespace which ?-command? ?-variable? name\""
+}
+
+rule NsWhichRejectsUnknownOption {
+    when: Evaluates("catch {namespace which -foo b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"namespace which ?-command? ?-variable? name\""
+}
+
+rule NsWhichSingleOptionIsTreatedAsName {
+    -- With exactly one argument, an option-looking word is the name
+    -- (not an option), so lookup finds nothing and returns empty.
+    when: Evaluates("list [namespace which -command] [namespace which -variable]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {}"
+}
+
+rule NsWhichVariableAcceptsQualifiedName {
+    -- A qualified variable name is reported back fully qualified.
+    when: Evaluates("namespace eval n {variable v 5}; namespace which -variable ::n::v")
+    ensures: completion.code = ok
+    ensures: completion.value = "::n::v"
+}
+
+-- ── export / import / forget ─────────────────────────────────────
+
+rule NsExportAppendsDeduplicatesAndClears {
+    -- Exports accumulate, deduplicate in first-occurrence order, and
+    -- -clear resets before appending.
+    when: Evaluates("namespace eval n {namespace export a b a c}; list [namespace eval n {namespace export}] [namespace eval n {namespace export -clear p}] [namespace eval n {namespace export}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a b c} {} p"
+}
+
+rule NsExportRejectsQualifiedPattern {
+    -- Export patterns may name only commands in the exporting namespace.
+    when: Evaluates("catch {namespace eval n {namespace export a::b}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "invalid export pattern \"a::b\": pattern can't specify a namespace"
+}
+
+rule NsExportSettingReturnsEmpty {
+    when: Evaluates("namespace eval n {namespace export p q}; list [namespace eval n {namespace export -clear r}] [namespace eval n {namespace export p}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {}"
+}
+
+rule NsExportPatternsApplyToLaterCommands {
+    -- Export is a pattern store, not a snapshot: a command created after
+    -- the pattern is exported and importable.
+    when: Evaluates("namespace eval n {namespace export p*; proc p1 {} {return P1}}; namespace eval m {namespace import ::n::p*}; m::p1")
+    ensures: completion.code = ok
+    ensures: completion.value = "P1"
+}
+
+rule NsImportBringsExportedCommand {
+    -- Import returns empty; the alias is callable; a query lists simple names.
+    when: Evaluates("namespace eval n {proc p {} {return P}; namespace export p}; namespace eval m {namespace import ::n::p}; list [m::p] [namespace eval m {namespace import}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "P p"
+}
+
+rule NsImportIgnoresUnexportedCommand {
+    -- A command that exists but is not exported is silently not imported.
+    when: Evaluates("namespace eval n {proc p {} {return P}}; namespace eval m {namespace import ::n::p}; list [catch {namespace eval m {namespace import ::n::p}} e] [info commands ::m::p]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 {}"
+}
+
+rule NsImportSnapshotSemantics {
+    -- Import is a snapshot: a command exported after the import is not
+    -- retroactively imported.
+    when: Evaluates("namespace eval n {proc p {} {return P}; namespace export p}; namespace eval m {namespace import ::n::*}; proc ::n::q {} {return Q}; namespace eval n {namespace export q}; list [namespace eval m {namespace import}] [info commands ::m::q]")
+    ensures: completion.code = ok
+    ensures: completion.value = "p {}"
+}
+
+rule NsImportConflictErrors {
+    when: Evaluates("namespace eval n {proc p {} {return P}; namespace export p}; namespace eval m {proc p {} {return M}}; catch {namespace eval m {namespace import ::n::p}} e; set e")
+    ensures: completion.code = ok
+    ensures: completion.value = "can't import command \"p\": already exists"
+}
+
+rule NsImportForceOverwritesExisting {
+    -- -force replaces the conflicting command and rebinds the alias.
+    when: Evaluates("namespace eval n {proc p {} {return P}; namespace export p}; namespace eval m {proc p {} {return M}; namespace import -force ::n::p}; list [m::p] [namespace origin ::m::p]")
+    ensures: completion.code = ok
+    ensures: completion.value = "P ::n::p"
+}
+
+rule NsImportForceSwitchesOrigin {
+    when: Evaluates("namespace eval n {proc p {} {return P}; namespace export p}; namespace eval o {proc p {} {return O}; namespace export p}; namespace eval m {namespace import ::n::p; namespace import -force ::o::p}; list [m::p] [namespace origin ::m::p]")
+    ensures: completion.code = ok
+    ensures: completion.value = "O ::o::p"
+}
+
+rule NsImportRejectsUnknownNamespace {
+    when: Evaluates("catch {namespace eval m {namespace import ::nosuch::*}} e; set e")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown namespace in import pattern \"::nosuch::*\""
+}
+
+rule NsImportRejectsGlobInNamespaceName {
+    -- Glob characters are allowed only in the command part.
+    when: Evaluates("catch {namespace eval m {namespace import ::n*::p}} e; set e")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown namespace in import pattern \"::n*::p\""
+}
+
+rule NsImportNoArgsListsImportedNames {
+    -- No arguments lists imported commands as simple names.
+    when: Evaluates("namespace eval n {proc p {} {return P}; proc q {} {return Q}; namespace export p q}; namespace eval m {namespace import ::n::p ::n::q}; namespace eval m {lsort [namespace import]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "p q"
+}
+
+rule NsImportRejectsRepeatedForce {
+    -- -force is recognized once, at the front; a second one is a pattern.
+    when: Evaluates("catch {namespace eval m {namespace import -force -force ::n::p}} e; set e")
+    ensures: completion.code = ok
+    ensures: completion.value = "no namespace specified in import pattern \"-force\""
+}
+
+rule NsImportAliasRemovedWithOrigin {
+    -- Removing the origin command deletes its imported aliases.
+    when: Evaluates("namespace eval n {proc p {} {return P}; namespace export p}; namespace eval m {namespace import ::n::p}; rename ::n::p {}; list [info commands ::m::p] [info commands ::n::p]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {}"
+}
+
+rule NsForgetSimpleNameRemovesImport {
+    -- A simple name forgets matching imported commands, not the origin.
+    when: Evaluates("namespace eval n {proc p {} {return P}; namespace export p}; namespace eval m {namespace import ::n::p}; namespace eval m {namespace forget p}; list [info commands ::m::p] [info commands ::n::p]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} ::n::p"
+}
+
+rule NsForgetQualifiedPatternRemovesByOrigin {
+    -- A qualified pattern matches the exporting name and may glob the
+    -- command part.
+    when: Evaluates("namespace eval n {proc p {} {return P}; proc q {} {return Q}; namespace export p q}; namespace eval m {namespace import ::n::p ::n::q}; namespace eval m {namespace forget ::n::p*}; list [lsort [info commands ::m::*]] [info commands ::n::p]")
+    ensures: completion.code = ok
+    ensures: completion.value = "::m::q ::n::p"
+}
+
+rule NsForgetUnknownNamespaceErrors {
+    when: Evaluates("catch {namespace eval m {namespace forget ::nosuch::*}} e; set e")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown namespace in namespace forget pattern \"::nosuch::*\""
+}
+
+rule NsForgetNoArgsIsNoop {
+    when: Evaluates("namespace eval n {proc p {} {return P}; namespace export p}; namespace eval m {namespace import ::n::p}; list [namespace eval m {namespace forget}] [info commands ::m::p]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} ::m::p"
+}
+
+rule NsForgetUnimportedNameIsNoop {
+    -- Forgetting a name that was never imported is not an error.
+    when: Evaluates("namespace eval n {proc p {} {return P}; namespace export p}; list [catch {namespace eval m {namespace forget ::n::p}} e] $e [info commands ::m::p]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 {} {}"
+}
+
+-- ── ensemble: creation, dispatch, options ────────────────────────
+
+rule NsEnsembleCreateReturnsLinkedCommandName {
+    -- Default command name is the linked namespace's name.
+    when: Evaluates("list [namespace eval n {namespace ensemble create}] [namespace ensemble create]")
+    ensures: completion.code = ok
+    ensures: completion.value = "::n ::"
+}
+
+rule NsEnsembleDispatchesExportedCommands {
+    when: Evaluates("namespace eval n {proc a {} {return A}; proc b {} {return B}; namespace export a b}; namespace eval n {namespace ensemble create}; list [n a] [n b]")
+    ensures: completion.code = ok
+    ensures: completion.value = "A B"
+}
+
+rule NsEnsembleExportSetIsLive {
+    -- With no -map/-subcommands, the export set is consulted at each
+    -- invocation: newly exported c works, unexported d does not.
+    when: Evaluates("namespace eval n {proc a {} {return A}; namespace export a; namespace ensemble create}; proc ::n::c {} {return C}; proc ::n::d {} {return D}; namespace eval n {namespace export c}; list [n c] [catch {n d} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "C 1 {unknown or ambiguous subcommand \"d\": must be a, or c}"
+}
+
+rule NsEnsembleUnknownSubcommandMenu {
+    when: Evaluates("namespace eval n {proc a {} {return A}; proc b {} {return B}; namespace export a b; namespace ensemble create}; catch {n z} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown or ambiguous subcommand \"z\": must be a, or b"
+}
+
+rule NsEnsembleNoExportsMessage {
+    -- An ensemble linked to a namespace with no exports says so, instead
+    -- of offering an empty subcommand menu.
+    when: Evaluates("namespace ensemble create -command ::e; catch {e x} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown subcommand \"x\": namespace :: does not export any commands"
+}
+
+rule NsEnsembleExactSubcommandBeatsPrefix {
+    -- An exact match wins even though it is also a prefix of another.
+    when: Evaluates("namespace eval n {proc a {} {return A}; proc ab {} {return AB}; namespace export a ab; namespace ensemble create}; n a")
+    ensures: completion.code = ok
+    ensures: completion.value = "A"
+}
+
+rule NsEnsemblePrefixMatching {
+    when: Evaluates("namespace eval n {proc alpha {} {return AL}; proc beta {} {return BE}; namespace export alpha beta; namespace ensemble create}; list [n al] [n alph]")
+    ensures: completion.code = ok
+    ensures: completion.value = "AL AL"
+}
+
+rule NsEnsemblePrefixDisabledRequiresExact {
+    -- -prefixes 0 changes both matching and the error wording (no
+    -- "ambiguous").
+    when: Evaluates("namespace eval n {proc alpha {} {return AL}; proc beta {} {return BE}; namespace export alpha beta; namespace ensemble create -prefixes 0}; list [catch {n al} m] $m [n alpha]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {unknown subcommand \"al\": must be alpha, or beta} AL"
+}
+
+rule NsEnsembleAmbiguousPrefixMenu {
+    when: Evaluates("namespace eval n {proc alpha {} {return A}; proc alpine {} {return B}; namespace export alpha alpine; namespace ensemble create}; catch {n al} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown or ambiguous subcommand \"al\": must be alpha, or alpine"
+}
+
+rule NsEnsembleMapRewritesSubcommandWords {
+    -- -map replaces the ensemble+subcommand words; it is returned fully
+    -- qualified.
+    when: Evaluates("namespace eval n {proc a {} {return A}}; namespace ensemble create -command ::e -map {x ::n::a}; list [e x] [namespace ensemble configure ::e -map]")
+    ensures: completion.code = ok
+    ensures: completion.value = "A {x ::n::a}"
+}
+
+rule NsEnsembleMapQualifiesRelativeTargets {
+    -- A relative map target is qualified against the namespace whose
+    -- ensemble is being configured.
+    when: Evaluates("namespace eval n {proc a {} {return A}; namespace ensemble create -map {s a}}; namespace ensemble configure ::n -map")
+    ensures: completion.code = ok
+    ensures: completion.value = "s ::n::a"
+}
+
+rule NsEnsembleMapTargetMayCarryArguments {
+    -- Map targets are command prefixes; extra words precede actual args.
+    when: Evaluates("namespace eval n {proc add {a b} {expr {$a+$b}}}; namespace ensemble create -command ::e -map {inc {::n::add 1}}; e inc 2")
+    ensures: completion.code = ok
+    ensures: completion.value = "3"
+}
+
+rule NsEnsembleExplicitSubcommandsFallBackToSameName {
+    -- With -subcommands, a name absent from -map dispatches to the same
+    -- name in the linked namespace (here, a missing ::b).
+    when: Evaluates("namespace eval n {proc a {} {return A}; namespace ensemble create -command ::e -subcommands {a b} -map {a ::n::a}}; list [e a] [catch {e b} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "A 1 {invalid command name \"b\"}"
+}
+
+rule NsEnsembleExplicitSubcommandsMenu {
+    when: Evaluates("namespace eval n {proc a {} {return A}; proc ab {} {return AB}; namespace export a ab}; namespace eval n {namespace ensemble create -subcommands {a ab}}; catch {n ax} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown or ambiguous subcommand \"ax\": must be a, or ab"
+}
+
+rule NsEnsembleMapKeysFormMenu {
+    -- Non-empty -map with empty -subcommands makes the map keys the
+    -- subcommand set.
+    when: Evaluates("namespace eval n {proc a {} {return A}; proc ab {} {return AB}}; namespace ensemble create -command ::e -map {a ::n::a ab ::n::ab}; catch {e ax} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown or ambiguous subcommand \"ax\": must be a, or ab"
+}
+
+rule NsEnsembleParametersPrecedeSubcommand {
+    -- -parameters names caller words inserted between the ensemble name
+    -- and the subcommand (the doc's do/plus example).
+    when: Evaluates("namespace eval do {namespace export *; namespace ensemble create -parameters x; proc plus {x y} {expr {$x+$y}}; proc minus {x y} {expr {$x-$y}}}; do 1 plus [do 9 minus 7]")
+    ensures: completion.code = ok
+    ensures: completion.value = "3"
+}
+
+rule NsEnsembleParameterErrorNamesValues {
+    -- Wrong-argument text shows the actual parameter word and the
+    -- missing formal argument.
+    when: Evaluates("namespace eval do {namespace export *; namespace ensemble create -parameters x; proc plus {x y} {expr {$x+$y}}}; catch {do 1 plus} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"do 1 plus y\""
+}
+
+rule NsEnsembleNoSubcommandUsage {
+    when: Evaluates("namespace ensemble create -command ::e; catch {e} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"e subcommand ?arg ...?\""
+}
+
+rule NsEnsembleConfigureReturnsAllOptions {
+    -- Full configuration is a fixed-order dictionary; -namespace is the
+    -- creating namespace, not the command's namespace.
+    when: Evaluates("namespace eval n {namespace ensemble create -command ::e -map {x ::n::a}}; namespace ensemble configure ::e")
+    ensures: completion.code = ok
+    ensures: completion.value = "-map {x ::n::a} -namespace ::n -parameters {} -prefixes 1 -subcommands {} -unknown {}"
+}
+
+rule NsEnsembleConfigureReadsAndWrites {
+    when: Evaluates("namespace eval n {namespace ensemble create -command ::e}; list [namespace ensemble configure ::e -prefixes 0] [namespace ensemble configure ::e -prefixes]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 0"
+}
+
+rule NsEnsembleConfigureNamespaceReadOnly {
+    when: Evaluates("namespace eval n {namespace ensemble create -command ::e}; list [namespace ensemble configure ::e -namespace] [catch {namespace ensemble configure ::e -namespace ::n} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "::n 1 {option -namespace is read-only}"
+}
+
+rule NsEnsembleConfigureRequiresEnsembleCommand {
+    when: Evaluates("catch {namespace ensemble configure set -map} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "\"set\" is not an ensemble command"
+}
+
+rule NsEnsembleConfigureUnknownCommand {
+    when: Evaluates("catch {namespace ensemble configure ::nosuch} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown command \"::nosuch\""
+}
+
+rule NsEnsembleConfigureBadOptionMenu {
+    -- configure accepts -namespace but not -command.
+    when: Evaluates("namespace eval n {namespace ensemble create -command ::e}; catch {namespace ensemble configure ::e -command} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"-command\": must be -map, -namespace, -parameters, -prefixes, -subcommands, or -unknown"
+}
+
+rule NsEnsembleCreateBadOptionMenu {
+    -- create accepts -command but not -namespace.
+    when: Evaluates("catch {namespace ensemble create -namespace ::n} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"-namespace\": must be -command, -map, -parameters, -prefixes, -subcommands, or -unknown"
+}
+
+rule NsEnsembleCreateOptionNeedsValue {
+    when: Evaluates("catch {namespace ensemble create -map} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"namespace ensemble create ?option value ...?\""
+}
+
+rule NsEnsembleExistsDetectsEnsembles {
+    -- exists is true only for ensemble commands (a namespace's own
+    -- ensemble counts); it returns 0 for ordinary/missing commands.
+    when: Evaluates("namespace eval n {namespace ensemble create}; list [namespace ensemble exists ::n] [namespace ensemble exists set] [namespace ensemble exists ::nosuch]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 0"
+}
+
+rule NsEnsembleExistsUsage {
+    when: Evaluates("catch {namespace ensemble exists} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"namespace ensemble exists cmdname\""
+}
+
+rule NsEnsembleBadSubcommandMenu {
+    -- The ensemble's own three subcommands have their own menu and
+    -- "bad subcommand" wording.
+    when: Evaluates("catch {namespace ensemble foo} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad subcommand \"foo\": must be configure, create, or exists"
+}
+
+rule NsEnsembleAmbiguousSubcommand {
+    when: Evaluates("catch {namespace ensemble c} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "ambiguous subcommand \"c\": must be configure, create, or exists"
+}
+
+-- ── ensemble: unknown handler ────────────────────────────────────
+
+rule NsEnsembleUnknownHandlerReceivesFullInvocation {
+    -- The handler gets the fully qualified ensemble name, the subcommand
+    -- and every argument; an empty result re-resolves and then errors.
+    when: Evaluates("namespace eval n {proc a {} {return A}; namespace export a}; namespace ensemble create -command ::e -map {x ::n::a} -unknown {apply {{args} {set ::got $args; return {}}}}; list [catch {e z 1 2} m] $m $::got")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {unknown or ambiguous subcommand \"z\": must be x} {::e z 1 2}"
+}
+
+rule NsEnsembleUnknownHandlerReceivesParameters {
+    -- -parameters words are part of the invocation the handler sees.
+    when: Evaluates("namespace eval n {proc a {} {return A}; namespace export a}; namespace ensemble create -command ::e -parameters p -map {x ::n::a} -unknown {apply {{args} {set ::got $args; return {}}}}; list [catch {e P z Q} m] $m $::got")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {unknown or ambiguous subcommand \"z\": must be x} {::e P z Q}"
+}
+
+rule NsEnsembleUnknownHandlerRewritesCommand {
+    -- A non-empty result list is the rewrite command prefix.
+    when: Evaluates("namespace eval n {proc a {} {return A}}; namespace ensemble create -command ::e -map {x ::n::a} -unknown {apply {{args} {return {::n::a}}}}; e z")
+    ensures: completion.code = ok
+    ensures: completion.value = "A"
+}
+
+rule NsEnsembleUnknownHandlerEmptyResultReresolves {
+    when: Evaluates("namespace eval n {proc a {} {return A}}; namespace ensemble create -command ::e -map {x ::n::a} -unknown {apply {{args} {return {}}}}; catch {e z} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown or ambiguous subcommand \"z\": must be x"
+}
+
+rule NsEnsembleUnknownHandlerCanInstallMapping {
+    -- The documented idiom: handler updates the map, returns {}, and the
+    -- ensemble re-dispatches the original subcommand.
+    when: Evaluates("namespace eval n {proc a {} {return A}}; namespace ensemble create -command ::e -map {x ::n::a} -unknown {apply {{args} {namespace ensemble configure ::e -map {z ::n::a}; return {}}}}; e z")
+    ensures: completion.code = ok
+    ensures: completion.value = "A"
+}
+
+rule NsEnsembleUnknownHandlerNonListResult {
+    -- A result that is not a list (a lone open brace here) is an error.
+    when: Evaluates("namespace eval n {proc a {} {return A}}; namespace ensemble create -command ::e -map {x ::n::a} -unknown {apply {{args} {return [format %c 123]}}}; catch {e z} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unmatched open brace in list"
+}
+
+rule NsEnsembleUnknownHandlerErrorPropagates {
+    when: Evaluates("namespace eval n {proc a {} {return A}}; namespace ensemble create -command ::e -map {x ::n::a} -unknown {apply {{args} {error no}}}; catch {e z} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "no"
+}
+
+rule NsEnsembleUnknownHandlerRecursionDetected {
+    -- Returning the same ensemble+subcommand loops until Tcl's recursion
+    -- guard fires.
+    when: Evaluates("namespace eval n {proc a {} {return A}}; namespace ensemble create -command ::e -map {x ::n::a} -unknown {apply {{args} {return {::e z}}}}; catch {e z} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "too many nested evaluations (infinite loop?)"
+}
+
+rule NsEnsembleAddsNoCallFrame {
+    -- Dispatch adds no Tcl call frame: info level inside the target is 1
+    -- whether called through the ensemble or directly.
+    when: Evaluates("namespace eval n {proc a {} {info level}; namespace export a; namespace ensemble create}; list [n a] [n::a]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+}
+
+-- ── namespace unknown ────────────────────────────────────────────
+
+rule NsUnknownDefaultHandlerPerNamespace {
+    -- The root reports ::unknown; an ordinary namespace reports empty
+    -- (meaning "use the default").
+    when: Evaluates("namespace eval n {}; list [namespace unknown] [namespace eval n {namespace unknown}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "::unknown {}"
+}
+
+rule NsUnknownFallsBackToGlobalHandler {
+    -- An unset per-namespace handler falls back to the ::unknown command.
+    when: Evaluates("namespace eval n {}; proc ::unknown {args} {return \"GLOBAL:$args\"}; namespace eval n {nosuch 1}")
+    ensures: completion.code = ok
+    ensures: completion.value = "GLOBAL:nosuch 1"
+}
+
+rule NsUnknownHandlerReceivesInvocationWords {
+    when: Evaluates("namespace eval n {namespace unknown {::h}}; proc ::h {args} {return \"H:$args\"}; namespace eval n {zz a}")
+    ensures: completion.code = ok
+    ensures: completion.value = "H:zz a"
+}
+
+rule NsUnknownHandlerRunsInNamespaceContext {
+    -- The handler runs with the failed invocation's frame as caller, so
+    -- uplevel 1 sees the namespace.
+    when: Evaluates("namespace eval n {namespace unknown {::h}}; proc ::h {args} {uplevel 1 {namespace current}}; namespace eval n {zz}")
+    ensures: completion.code = ok
+    ensures: completion.value = "::n"
+}
+
+rule NsUnknownHandlerResultIsCommandResult {
+    -- Unlike an ensemble unknown handler, the namespace handler's result
+    -- is the command's result, not a rewrite prefix.
+    when: Evaluates("namespace eval n {namespace unknown {apply {{args} {return \"U:$args\"}}}}; namespace eval n {foo}")
+    ensures: completion.code = ok
+    ensures: completion.value = "U:foo"
+}
+
+rule NsUnknownHandlerErrorPropagates {
+    when: Evaluates("namespace eval n {namespace unknown {apply {{args} {error custom}}}}; catch {namespace eval n {foo}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "custom"
+}
+
+rule NsUnknownHandlerNotUsedWhenCommandExists {
+    when: Evaluates("namespace eval n {namespace unknown {apply {{args} {return U}}}; proc foo {} {return F}}; namespace eval n {foo}")
+    ensures: completion.code = ok
+    ensures: completion.value = "F"
+}
+
+rule NsUnknownRequiresAtMostOneScript {
+    when: Evaluates("catch {namespace unknown a b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"namespace unknown ?script?\""
+}
+
+rule NsUnknownSetAndQuery {
+    when: Evaluates("namespace eval n {namespace unknown {apply {{args} {return OK}}}}; namespace eval n {namespace unknown}")
+    ensures: completion.code = ok
+    ensures: completion.value = "apply {{args} {return OK}}"
+}
+
+rule NsUnknownRespectsCommandPath {
+    -- Resolution (current namespace, path, global) happens before the
+    -- handler is consulted.
+    when: Evaluates("namespace eval p {proc d {} {return D}}; namespace eval n {namespace path {::p}; namespace unknown {apply {{args} {return U}}}}; namespace eval n {d}")
+    ensures: completion.code = ok
+    ensures: completion.value = "D"
+}
+
+-- ── namespace upvar ──────────────────────────────────────────────
+
+rule NsUpvarLinksNamespaceVariable {
+    -- namespace upvar returns empty and links the local to the ns var.
+    when: Evaluates("namespace eval n {variable v 1}; set r [namespace upvar ::n v l]; list [set l] $r")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {}"
+}
+
+rule NsUpvarCreatesUndefinedLink {
+    -- Linking a non-existent variable is allowed; it reads as unset until
+    -- written.
+    when: Evaluates("namespace eval n {}; namespace upvar ::n v l; list [info exists l] [catch {set l} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 1 {can't read \"l\": no such variable}"
+}
+
+rule NsUpvarAcceptsMultiplePairs {
+    when: Evaluates("namespace eval n {variable a 1; variable b 2}; namespace upvar ::n a x b y; list $x $y")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 2"
+}
+
+rule NsUpvarResolvesNamespaceRelatively {
+    -- The namespace argument follows namespace-name resolution.
+    when: Evaluates("namespace eval outer {namespace eval n {variable v 5}}; namespace eval outer {namespace upvar n v l; set l}")
+    ensures: completion.code = ok
+    ensures: completion.value = "5"
+}
+
+rule NsUpvarMissingNamespaceErrors {
+    -- Absolute missing namespace reports without the "in <caller>" tail
+    -- (unlike inscope).
+    when: Evaluates("catch {namespace upvar ::nosuch v l} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "namespace \"::nosuch\" not found"
+}
+
+rule NsUpvarSelfLinkErrors {
+    when: Evaluates("namespace eval n {variable v 1}; catch {namespace eval n {namespace upvar ::n v v}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "can't upvar from variable to itself"
+}
+
+rule NsUpvarRequiresPairs {
+    when: Evaluates("catch {namespace upvar ::n v} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"namespace upvar ns ?otherVar myVar ...?\""
+}
+
+rule NsUpvarWorksInsideProc {
+    when: Evaluates("namespace eval n {variable v 1}; proc p {} {namespace upvar ::n v l; set l 9}; p; set ::n::v")
+    ensures: completion.code = ok
+    ensures: completion.value = "9"
+}

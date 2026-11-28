@@ -1,0 +1,313 @@
+-- allium: 3
+-- utility.allium
+-- Behaviour spec: small utility commands — history, zlib, pid, tclLog,
+-- and time. Deterministic faces only: process ids, zlib output lengths
+-- and timing numbers are inherently environmental and are pinned as
+-- shapes or not at all.
+-- Oracle: tclsh 9.1.0 (core-9-1-0).
+--
+-- Doc: doc/history.n, doc/zlib.n, doc/pid.n, doc/time.n. Probes re-run
+-- against tclsh 9.1.0 on 2026-11-28. `timerate` and `zipfs` already have
+-- shape rules in interp.allium (TimerateReportsRateShape,
+-- ZipfsRootIsVolumeRoot) and are not repeated here.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── history ──────────────────────────────────────────────────────
+-- Every history rule starts with `history clear` so event numbers do not
+-- depend on what ran earlier. The non-interactive shell records no
+-- commands by itself, so the explicit adds are the whole list.
+
+rule HistoryClearResetsNumbering {
+    -- clear erases all events and resets the next id to 1.
+    when: Evaluates("history clear; list [history nextid] [llength [history]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+    -- probe: 2026-11-28 tclsh9.1; doc/history.n "clear"
+}
+
+rule HistoryAddRecordsWithoutExecuting {
+    -- add returns the empty string and records the command; event 1 is
+    -- the first recorded command.
+    when: Evaluates("history clear; list [history add {set hx 1}] [history nextid] [history event 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 2 {set hx 1}"
+    -- probe: 2026-11-28 tclsh9.1; doc/history.n "add"
+}
+
+rule HistoryAddExecReturnsResult {
+    -- The exec flag (any unique prefix) both records and evaluates the
+    -- command, returning its result.
+    when: Evaluates("history clear; list [history add {expr 2+3} exec] [history add {expr 3+4} e]")
+    ensures: completion.code = ok
+    ensures: completion.value = "5 7"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule HistoryAddRejectsBadFlag {
+    when: Evaluates("history clear; catch {history add {set a 1} foo} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad argument \"foo\": should be \"exec\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule HistoryNextidCountsEvents {
+    when: Evaluates("history clear; history add a; history add b; history nextid")
+    ensures: completion.code = ok
+    ensures: completion.value = "3"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule HistoryInfoFormatsNumberedEvents {
+    -- info returns a human-readable string: the event number right
+    -- aligned in six columns, two spaces, then the command.
+    when: Evaluates("history clear; history add {set a 1}; history info")
+    ensures: completion.code = ok
+    ensures: completion.value = "     1  set a 1"
+    -- probe: 2026-11-28 tclsh9.1 (hex: 2020202020312020 73657420612031)
+}
+
+rule HistoryInfoCountLimits {
+    -- A count selects the most recent events only.
+    when: Evaluates("history clear; history add a; history add b; history info 1")
+    ensures: completion.code = ok
+    ensures: completion.value = "     2  b"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule HistoryChangeReplacesEvent {
+    when: Evaluates("history clear; history add old; history change new 1; history event 1")
+    ensures: completion.code = ok
+    ensures: completion.value = "new"
+    -- probe: 2026-11-28 tclsh9.1; doc/history.n "change"
+}
+
+rule HistoryRedoReexecutesEvent {
+    -- redo evaluates the selected historical event and returns its
+    -- result; the stored command is unchanged.
+    when: Evaluates("history clear; history add {expr 2+3}; history add {set z 9}; list [history redo 1] [history event 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "5 {expr 2+3}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule HistoryRedoCurrentEventRejected {
+    when: Evaluates("history clear; history add {expr 2+3}; catch {history redo 1} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "cannot redo the current event"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule HistoryKeepSetsLimit {
+    -- The default limit is 20; keep with a count returns the new limit.
+    when: Evaluates("history clear; list [history keep] [history keep 2] [history keep]")
+    ensures: completion.code = ok
+    ensures: completion.value = "20 2 2"
+    -- probe: 2026-11-28 tclsh9.1; doc/history.n "keep"
+}
+
+rule HistoryKeepTrimsOldest {
+    -- Shrinking the limit discards the oldest events and keeps numbering.
+    when: Evaluates("history clear; history keep 2; history add a; history add b; history add c; list [history event 2] [history event 3] [catch {history event 1}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "b c 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule HistoryKeepRejectsBadCount {
+    when: Evaluates("history clear; catch {history keep x} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "illegal keep count \"x\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule HistoryEventMissing {
+    when: Evaluates("history clear; catch {history event 99} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "event \"99\" hasn't occurred yet"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule HistorySubcommandMenu {
+    -- Spelling errors (including ambiguous prefixes such as "c") get the
+    -- full subcommand menu.
+    when: Evaluates("history clear; catch {history gorp} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown or ambiguous subcommand \"gorp\": must be add, change, clear, event, info, keep, nextid, or redo"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── zlib ─────────────────────────────────────────────────────────
+-- Checksums are algorithm-defined and stable. Compressed byte streams
+-- depend on the linked zlib build, so only the zlib header and the
+-- round-trip are pinned; lengths are deliberately not.
+
+rule ZlibCrc32KnownValues {
+    -- CRC-32 of "abc" and of the empty string.
+    when: Evaluates("list [zlib crc32 abc] [zlib crc32 {}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "891568578 0"
+    -- probe: 2026-11-28 tclsh9.1; doc/zlib.n "crc32"
+}
+
+rule ZlibAdler32KnownValues {
+    when: Evaluates("list [zlib adler32 abc] [zlib adler32 {}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "38600999 1"
+    -- probe: 2026-11-28 tclsh9.1; doc/zlib.n "adler32"
+}
+
+rule ZlibCompressUsesZlibHeaderAndRoundTrips {
+    -- zlib compress emits the zlib stream header (0x78 0x9C at the
+    -- default level) and decompress reverses it.
+    when: Evaluates("binary scan [zlib compress abc] H* h; list [string range $h 0 3] [zlib decompress [zlib compress abc]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "789c abc"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ZlibDeflateInflateRoundTrips {
+    -- Raw deflate/inflate carry no zlib header.
+    when: Evaluates("zlib inflate [zlib deflate abc]")
+    ensures: completion.code = ok
+    ensures: completion.value = "abc"
+    -- probe: 2026-11-28 tclsh9.1; doc/zlib.n "deflate"/"inflate"
+}
+
+rule ZlibGzipGunzipRoundTripsWithHeader {
+    -- gzip output starts with the 1F 8B magic; gunzip restores the data
+    -- and reports a fixed header back through -headerVar.
+    when: Evaluates("binary scan [zlib gzip abc] H* h; set d {}; list [string range $h 0 3] [zlib gunzip [zlib gzip abc -header {time 1000000000 os 3 filename f.txt type text}] -headerVar d] [dict get $d filename] [dict get $d time] [dict get $d os] [dict get $d type] [dict get $d size]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1f8b abc f.txt 1000000000 3 text 3"
+    -- probe: 2026-11-28 tclsh9.1; doc/zlib.n "gzip"/"gunzip"
+}
+
+rule ZlibStreamRoundTrip {
+    -- A streaming compressor is a command whose name contains "zlib";
+    -- put/finalize/get produce data that decompress accepts.
+    when: Evaluates("set s [zlib stream compress]; $s put abc; $s finalize; set d [$s get]; set n [string match {*zlib*} $s]; $s close; list $n [zlib decompress $d]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 abc"
+    -- probe: 2026-11-28 tclsh9.1; doc/zlib.n "stream"
+}
+
+rule ZlibCompressLevelRange {
+    when: Evaluates("catch {zlib compress abc 99} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "level must be 0 to 9"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ZlibCompressLevelMustBeInteger {
+    when: Evaluates("catch {zlib compress abc x} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "expected integer but got \"x\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ZlibBadSubcommandMenu {
+    when: Evaluates("catch {zlib gorp} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown or ambiguous subcommand \"gorp\": must be adler32, compress, crc32, decompress, deflate, gunzip, gzip, inflate, push, or stream"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ZlibPushBadMode {
+    when: Evaluates("catch {zlib push gorp stdout} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad mode \"gorp\": must be compress, decompress, deflate, gunzip, gzip, or inflate"
+    -- probe: 2026-11-28 tclsh9.1; doc/zlib.n "push"
+}
+
+rule ZlibDecompressBadDataErrors {
+    when: Evaluates("catch {zlib decompress notzlibdata} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "data error"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── pid ──────────────────────────────────────────────────────────
+-- Actual process ids are environmental; only the decimal-string shape,
+-- self-consistency, and the empty/list forms are pinned.
+
+rule PidIsOwnPositiveInteger {
+    when: Evaluates("list [string is integer -strict [pid]] [expr {[pid] > 0}] [expr {[pid] == [pid]}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1"
+    -- probe: 2026-11-28 tclsh9.1; doc/pid.n
+}
+
+rule PidOfPlainChannelIsEmpty {
+    -- A channel that is not a process pipeline yields the empty list.
+    when: Evaluates("set f [open /dev/null r]; set r [pid $f]; close $f; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule PidOfPipelineListsProcessIds {
+    -- A pipeline yields one decimal id per process.
+    when: Evaluates("set p [open {|cat} r]; set r [pid $p]; close $p; list [llength $r] [string is integer -strict [lindex $r 0]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule PidWrongArgs {
+    when: Evaluates("catch {pid a b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"pid ?channel?\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── tclLog ───────────────────────────────────────────────────────
+
+rule TclLogTakesOneArgAndReturnsZero {
+    -- tclLog is a one-argument proc that writes its message to stderr
+    -- and returns 0 (the result of the inner catch). Only the signature
+    -- and return value are observable in-process.
+    when: Evaluates("list [info args tclLog] [tclLog hello]")
+    ensures: completion.code = ok
+    ensures: completion.value = "string 0"
+    -- probe: 2026-11-28 tclsh9.1 (stderr receives "hello"); body is
+    -- `catch {puts stderr $string}`.
+}
+
+-- ── time ─────────────────────────────────────────────────────────
+-- Timing values themselves are environmental; the unit string, the
+-- zero-iteration cases, and argument errors are deterministic.
+
+rule TimeReturnsMicrosecondsPerIteration {
+    -- The result is an average followed by the fixed unit suffix.
+    when: Evaluates("regexp {^[0-9]+(\\.[0-9]+)? microseconds per iteration$} [time {set x 1} 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: 2026-11-28 tclsh9.1; doc/time.n
+}
+
+rule TimeZeroOrNegativeCountIsZero {
+    -- A non-positive count performs no iterations and reports 0.
+    when: Evaluates("list [time {set x 1} 0] [time {set x 1} -1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{0 microseconds per iteration} {0 microseconds per iteration}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule TimeBadCount {
+    when: Evaluates("catch {time {set x 1} x} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "expected integer but got \"x\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule TimeWrongArgs {
+    when: Evaluates("catch {time} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"time command ?count?\""
+    -- probe: 2026-11-28 tclsh9.1
+}

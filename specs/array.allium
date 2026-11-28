@@ -1,0 +1,600 @@
+-- allium: 3
+-- array.allium
+-- Behaviour spec: the array ensemble and parray — element naming, glob
+-- patterns, array set/get/unset, the startsearch/nextelement/donesearch
+-- iterator and its search identifiers, array default, array for,
+-- array statistics, and parray's aligned output.
+-- Oracle: tclsh 9.1.0 (core-9-1-0). All values probed 2026-11-28 with
+-- .refer/tcl910/inst/bin/tclsh9.1; array names/get results are hash
+-- order, so rules sort before comparing.
+--
+-- Out of scope here (pinned elsewhere): ArrayElementsAreVariables,
+-- ArrayNamesListsKeys, ArrayExistsAndSize, UnsetElementShrinksArray,
+-- ArrayUnsetWholeRemovesVariable, ArrayDefaultFillsMissingElement-
+-- WithoutCreatingIt, ArrayForIteratesKeyValuePairs (variables.allium);
+-- array trace ops (trace.allium); info exists on arrays (info.allium).
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── ensemble dispatch ─────────────────────────────────────────────
+
+rule ArraySubcommandMenu {
+    -- Unknown subcommands report the full 9.1 menu (including the 9.1
+    -- additions default and for) in alphabetical order.
+    when: Evaluates("catch {array gorp a} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown or ambiguous subcommand \"gorp\": must be anymore, default, donesearch, exists, for, get, names, nextelement, set, size, startsearch, statistics, or unset"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayNoArgsIsArityError {
+    when: Evaluates("array")
+    ensures: completion.code = error
+    ensures: completion.value = "wrong # args: should be \"array subcommand ?arg ...?\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArraySubcommandsAcceptUniquePrefixes {
+    -- Subcommand names are matched by unique prefix, as elsewhere in Tcl.
+    when: Evaluates("array set z1 {x 1}; list [array ex z1] [array si z1] [array na z1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 x"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArraySubcommandArityMessages {
+    -- Arity is checked before the array is looked up; each subcommand has
+    -- its own usage string.
+    when: Evaluates("list [catch {array get} m1] $m1 [catch {array get z2 x y} m2] $m2 [catch {array for {k v}} m3] $m3")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {wrong # args: should be \"array get arrayName ?pattern?\"} 1 {wrong # args: should be \"array get arrayName ?pattern?\"} 1 {wrong # args: should be \"array for {key value} arrayName script\"}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── exists / size on non-arrays ──────────────────────────────────
+
+rule ArrayExistsFalseForScalarAndElement {
+    -- A scalar variable and an array *element* are not arrays; only the
+    -- whole array answers 1.
+    when: Evaluates("set z3 1; array set z4 {k v}; list [array exists z3] [array exists z4(k)] [info exists z4(k)]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArraySizeZeroForMissingAndScalar {
+    -- array size never errors on a name that is not an array; it is 0.
+    when: Evaluates("set z5 1; list [array size nope5] [array size z5]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayElementWriteMaterializesArray {
+    -- Writing `set a(key) value` creates the array variable itself.
+    when: Evaluates("set n1(k) 1; list [array exists n1] [array size n1] [array names n1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 k"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── array names ──────────────────────────────────────────────────
+
+rule ArrayNamesGlobIsDefaultMode {
+    -- A lone pattern uses string match glob rules and matches only the
+    -- element name, not the rendered a(name) form.
+    when: Evaluates("array set z6 {aa 1 ab 2 b 3}; lsort [array names z6 a*]")
+    ensures: completion.code = ok
+    ensures: completion.value = "aa ab"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayNamesExactModeIsLiteral {
+    -- -exact compares the pattern literally; glob metacharacters in the
+    -- pattern are ordinary characters.
+    when: Evaluates("array set n5 {a* 1 ab 2}; list [lsort [array names n5 -glob a*]] [lsort [array names n5 -exact a*]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a* ab} a*"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayNamesRegexpMode {
+    when: Evaluates("array set z9 {aa 1 ab 2 b 3}; lsort [array names z9 -regexp {^(aa|b)$}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "aa b"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayNamesModeAcceptsPrefix {
+    when: Evaluates("array set z8 {aa 1 ab 2}; lsort [array names z8 -e aa]")
+    ensures: completion.code = ok
+    ensures: completion.value = "aa"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayNamesBadModeMenu {
+    when: Evaluates("array set za {x 1}; catch {array names za -foo x} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"-foo\": must be -exact, -glob, or -regexp"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayNamesBadRegexpIsCompileError {
+    -- -regexp surfaces the regexp compiler's diagnostic verbatim.
+    when: Evaluates("array set zb {x 1}; catch {array names zb -regexp {(}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "cannot compile regular expression pattern: parentheses () not balanced"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayNamesEmptyAndMissingAreEmpty {
+    -- An existing empty array and a missing variable both yield the empty
+    -- string, with no error.
+    when: Evaluates("array set zc {}; list [array names zc] [array names nope6]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── array get ────────────────────────────────────────────────────
+
+rule ArrayGetReturnsFlatNameValuePairs {
+    -- array get returns one flat list of alternating names and values.
+    when: Evaluates("array set zd {b 2 a 1}; lsort [array get zd]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 2 a b"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayGetKeepsValuesAsSingleElements {
+    -- Values are not flattened: a value containing spaces stays one list
+    -- element.
+    when: Evaluates("array set n2 {k {a b c}}; array get n2")
+    ensures: completion.code = ok
+    ensures: completion.value = "k {a b c}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayGetPatternFiltersNames {
+    when: Evaluates("array set ze {aa 1 ab 2 b 3}; lsort [array get ze a*]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 2 aa ab"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayGetEmptyMissingAndScalarAreEmpty {
+    -- Unlike array names mode errors, array get is forgiving: an empty
+    -- array, a missing name and even a scalar variable yield "".
+    when: Evaluates("array set zf {}; set zf2 1; list [array get zf] [array get nope7] [array get zf2 *]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {} {}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── array set ────────────────────────────────────────────────────
+
+rule ArraySetMergesAndReplaces {
+    -- array set never clears existing elements: listed keys are replaced,
+    -- new keys are added, unlisted keys survive.
+    when: Evaluates("array set zg {x 1}; array set zg {x 2 y 3}; list [array size zg] [lsort [array get zg]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "2 {2 3 x y}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArraySetEmptyListCreatesEmptyArray {
+    -- On a missing name an empty list still creates the array variable.
+    when: Evaluates("array set zh {}; list [array exists zh] [array size zh] [array names zh]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0 {}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArraySetOddListIsAtomic {
+    -- An odd-length list is rejected before any element is written; the
+    -- array is not even created.
+    when: Evaluates("catch {array set zi {x 1 y}} m; list $m [array exists zi]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{list must have an even number of elements} 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArraySetOnScalarNamesElementInError {
+    -- The error names the first element that would be created, via the
+    -- generic set path, not the array command.
+    when: Evaluates("set zj 1; catch {array set zj {x 1}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "can't set \"zj(x)\": variable isn't array"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArraySetDuplicateKeyLastWins {
+    when: Evaluates("array set zk {x 1 x 2}; array get zk")
+    ensures: completion.code = ok
+    ensures: completion.value = "x 2"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArraySetElementNamesAreLiteralKeys {
+    -- Element names are arbitrary strings: parentheses and spaces are part
+    -- of the name, not a nested-index syntax.
+    when: Evaluates("array set zl {b(1) x {x y} 2}; lsort [array names zl]")
+    ensures: completion.code = ok
+    ensures: completion.value = "b(1) {x y}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── array unset ──────────────────────────────────────────────────
+
+rule ArrayUnsetOneElementKeepsArray {
+    when: Evaluates("array set n3 {x 1 y 2}; array unset n3 x; list [array exists n3] [array size n3] [array names n3]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 y"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayUnsetPatternKeepsArray {
+    -- With a pattern, only matching elements go; the array variable stays.
+    when: Evaluates("array set zm {aa 1 ab 2 b 3}; array unset zm a*; list [array exists zm] [lsort [array names zm]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 b"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayUnsetStarEmptiesButKeepsArray {
+    -- Pattern "*" is not the no-pattern form: it removes every element but
+    -- leaves an existing empty array (contrast ArrayUnsetWholeRemoves-
+    -- Variable in variables.allium).
+    when: Evaluates("array set zn {a 1 b 2}; array unset zn *; list [array exists zn] [array size zn]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayUnsetMissingOrScalarIsSilent {
+    -- array unset on a missing variable or a scalar is a silent no-op that
+    -- returns the empty string; it never errors.
+    when: Evaluates("set zo 1; list [array unset nope8] [array unset zo]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── search: startsearch / anymore / nextelement / donesearch ─────
+
+rule ArraySearchVisitsEachElementOnce {
+    -- A search driven by anymore/nextelement yields every element name
+    -- exactly once; anymore turns 0 when the search is exhausted.
+    when: Evaluates("array set s1 {a 1 b 2}; set id [array startsearch s1]; set out {}; while {[array anymore s1 $id]} {lappend out [array nextelement s1 $id]}; array donesearch s1 $id; lsort $out")
+    ensures: completion.code = ok
+    ensures: completion.value = "a b"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArraySearchIdsIncrementAndNameTheArray {
+    -- Search ids have the shape s-<n>-<arrayName>; n increments per array
+    -- so concurrent searches stay distinct.
+    when: Evaluates("array set s2 {a 1}; set i1 [array startsearch s2]; set i2 [array startsearch s2]; list $i1 $i2 [expr {$i1 ne $i2}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "s-1-s2 s-2-s2 1"
+    -- probe: 2026-11-28 tclsh9.1 (qualified arrays embed ::ns::name)
+}
+
+rule ArraySearchAnymoreAfterExhaustion {
+    -- After the last element, anymore answers 0 and nextelement answers "".
+    when: Evaluates("array set s3 {a 1}; set id [array startsearch s3]; array nextelement s3 $id; list [array anymore s3 $id] [array nextelement s3 $id]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 {}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArraySearchAnymoreDistinguishesEmptyName {
+    -- nextelement returning "" is ambiguous for an element literally named
+    -- ""; anymore is the reliable end-of-search test.
+    when: Evaluates("array set s4 {}; set s4() v; set id [array startsearch s4]; set seen 0; while {[array anymore s4 $id]} {incr seen [expr {[array nextelement s4 $id] eq {}}]}; list $seen")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayDonesearchReturnsEmpty {
+    when: Evaluates("array set n4 {a 1}; set id [array startsearch n4]; list [array donesearch n4 $id] [string match {s-1-*} $id]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArraySearchAfterDonesearchIsGone {
+    -- donesearch destroys the search state; reusing the id fails.
+    when: Evaluates("array set s5 {a 1}; set id [array startsearch s5]; array donesearch s5 $id; catch {array anymore s5 $id} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "couldn't find search \"s-1-s5\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArraySearchIllegalIdentifier {
+    -- A syntactically foreign id is rejected before any lookup.
+    when: Evaluates("array set s6 {a 1}; catch {array anymore s6 bogus} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "illegal search identifier \"bogus\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArraySearchIdentifierIsBoundToItsArray {
+    -- A valid id from one array cannot drive a search on another; the
+    -- message names both the id and the wrong variable.
+    when: Evaluates("array set s7 {a 1}; array set s8 {b 2}; set id [array startsearch s7]; catch {array nextelement s8 $id} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "search identifier \"s-1-s7\" isn't for variable \"s8\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArraySearchMutationTerminatesAllSearches {
+    -- Adding or removing an element aborts every search on that array, as
+    -- if donesearch had been called.
+    when: Evaluates("array set s9 {a 1 b 2}; set id [array startsearch s9]; array nextelement s9 $id; set s9(c) 3; catch {array anymore s9 $id} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "couldn't find search \"s-1-s9\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArraySearchMissingArrayErrors {
+    -- startsearch requires an existing array; unlike names/size it errors.
+    when: Evaluates("catch {array startsearch nope9} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "\"nope9\" isn't an array"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── array default (TIP 508, 9.1) ─────────────────────────────────
+
+rule ArrayDefaultExistsStates {
+    -- A variable with no default answers 0; setting elements does not
+    -- create a default.
+    when: Evaluates("list [array default exists d1] [array set d1 {x 1}] [array default exists d1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 {} 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayDefaultGetWithoutDefaultErrors {
+    -- An existing array with no default has nothing to get.
+    when: Evaluates("array set d2 {x 1}; catch {array default get d2} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "array has no default value"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayDefaultGetMissingVariableErrors {
+    when: Evaluates("catch {array default get nopeD} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "\"nopeD\" isn't an array"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayDefaultSetCreatesEmptyArray {
+    -- Setting a default on a missing name creates an empty array; the
+    -- command itself returns "".
+    when: Evaluates("list [array default set d3 foo] [array exists d3] [array size d3] [array default get d3]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 1 0 foo"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayDefaultSetReplacesPrevious {
+    when: Evaluates("array default set d4 1; array default set d4 2; array default get d4")
+    ensures: completion.code = ok
+    ensures: completion.value = "2"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayDefaultUnsetKeepsElements {
+    -- Removing the default removes only the default; elements survive and
+    -- further gets of the default error again.
+    when: Evaluates("array set d5 {x 1}; array default set d5 D; list [array default unset d5] [array default exists d5] [array size d5] $d5(x)")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 0 1 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayDefaultUnsetMissingIsNoop {
+    when: Evaluates("list [array default unset nopeE] [array default exists nopeE]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayDefaultOnScalarErrors {
+    -- exists/get/unset use the plain "isn't an array" text; set uses the
+    -- can't-array-default-set form.
+    when: Evaluates("set d6 1; list [catch {array default exists d6} m1] $m1 [catch {array default set d6 v} m2] $m2 [catch {array default unset d6} m3] $m3")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {\"d6\" isn't an array} 1 {can't array default set \"d6\": variable isn't array} 1 {\"d6\" isn't an array}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayDefaultSubcommandMenu {
+    -- default's option menu says "bad option" (not "subcommand").
+    when: Evaluates("array set d7 {x 1}; catch {array default gorp d7} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"gorp\": must be get, set, exists, or unset"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayDefaultArityMessages {
+    -- The Tcl-level default helper signs its usage strings with
+    -- ::tcl::array::default.
+    when: Evaluates("list [catch {array default} m1] $m1 [catch {array default set d8} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {wrong # args: should be \"array default option arrayName ?value?\"} 1 {wrong # args: should be \"::tcl::array::default set arrayName value\"}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayDefaultAppendStartsFromDefault {
+    -- append treats the default as the current value of a missing element
+    -- and then creates the element (size grows to 1).
+    when: Evaluates("array default set d9 D; append d9(y) +more; list $d9(y) [array size d9]")
+    ensures: completion.code = ok
+    ensures: completion.value = "D+more 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayDefaultIncrStartsFromDefault {
+    when: Evaluates("array default set da 10; incr da(k); list $da(k) [array size da]")
+    ensures: completion.code = ok
+    ensures: completion.value = "11 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayDefaultLappendStartsFromDefault {
+    -- lappend appends to the default as a list value.
+    when: Evaluates("array default set db {}; lappend db(q) a b; list $db(q) [array size db]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a b} 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayDefaultDictSetUsesDefault {
+    -- dict set on a missing element starts from the default (here {}) and
+    -- stores a dict in the element.
+    when: Evaluates("array default set dc {}; dict set dc(e) k v; array get dc")
+    ensures: completion.code = ok
+    ensures: completion.value = "e {k v}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── array for ────────────────────────────────────────────────────
+
+rule ArrayForDeleteAborts {
+    -- Removing an element during iteration is an error, not a skip.
+    when: Evaluates("array set f1 {a 1 b 2}; catch {array for {k v} f1 {unset f1($k)}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "array changed during iteration"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayForInsertAborts {
+    when: Evaluates("array set f2 {a 1}; catch {array for {k v} f2 {set f2(new) 9}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "array changed during iteration"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayForValueReplaceIsAllowed {
+    -- Writing a new value to an existing key is not a structural change;
+    -- iteration completes over all keys.
+    when: Evaluates("array set f3 {a 1 b 2}; set out {}; array for {k v} f3 {set f3($k) [expr {$v*10}]; lappend out $k}; lsort $out")
+    ensures: completion.code = ok
+    ensures: completion.value = "a b"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayForNeedsTwoVariableNames {
+    when: Evaluates("array set f4 {a 1}; catch {array for {k} f4 {}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "must have two variable names"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayForMissingArrayErrors {
+    when: Evaluates("catch {array for {k v} nopeF {}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "\"nopeF\" isn't an array"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayForBreakStops {
+    -- break in the body ends iteration normally (one body run).
+    when: Evaluates("array set f5 {a 1 b 2 c 3}; set n 0; array for {k v} f5 {incr n; break}; set n")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayForContinueRunsNext {
+    -- continue abandons the rest of the body but not the loop.
+    when: Evaluates("array set f6 {a 1 b 2}; set n 0; array for {k v} f6 {incr n; continue}; set n")
+    ensures: completion.code = ok
+    ensures: completion.value = "2"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── array statistics ─────────────────────────────────────────────
+
+rule ArrayStatisticsShape {
+    -- statistics is a 13-line report: a head line, 11 bucket lines and an
+    -- average-distance line. Only counts are pinned; hash layout varies.
+    when: Evaluates("array set g1 {a 1 b 2 c 3}; set st [split [array statistics g1] [format %c 10]]; list [lindex $st 0] [llength $st] [lindex $st 1]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{3 entries in table, 4 buckets} 13 {number of buckets with 0 entries: 1}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayStatisticsEmptyArray {
+    when: Evaluates("array set g2 {}; set st [split [array statistics g2] [format %c 10]]; list [lindex $st 0] [lindex $st 1] [lindex $st end]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{0 entries in table, 4 buckets} {number of buckets with 0 entries: 4} {average search distance for entry: 0.0}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ArrayStatisticsMissingArrayErrors {
+    when: Evaluates("catch {array statistics nopeG} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "\"nopeG\" isn't an array"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── parray (auto-loaded Tcl proc in 9.1) ─────────────────────────
+
+rule ParrayIsAutoLoadedProc {
+    -- parray is not defined in a fresh interpreter; first use auto-loads
+    -- it from the script library as a proc.
+    when: Evaluates("list [info commands parray] [catch {parray nopeQ} m] $m [info cmdtype parray]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 1 {\"nopeQ\" isn't an array} proc"
+    -- probe: 2026-11-28 tclsh9.1 (zipfs library tcl_library)
+}
+
+rule ParrayAlignedPairs {
+    -- Each line is name(key) padded so keys align, then " = value". Keys
+    -- are padded to the longest key: x gets an extra space before "=".
+    when: Evaluates("array set p1 {x 1 yy 22}; rename puts ::tcl::_p1; proc puts {args} {lappend ::o1 [lindex $args end]}; parray p1; rename puts {}; rename ::tcl::_p1 puts; join $::o1 |")
+    ensures: completion.code = ok
+    ensures: completion.value = "p1(x)  = 1|p1(yy) = 22"
+    -- probe: 2026-11-28 tclsh9.1 (puts intercepted to keep stdout clean)
+}
+
+rule ParrayPatternFilters {
+    -- The optional pattern is a glob over element names and output is
+    -- sorted by name.
+    when: Evaluates("array set p2 {alpha 1 beta 2}; rename puts ::tcl::_p2; proc puts {args} {lappend ::o2 [lindex $args end]}; parray p2 a*; rename puts {}; rename ::tcl::_p2 puts; join $::o2 |")
+    ensures: completion.code = ok
+    ensures: completion.value = "p2(alpha) = 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ParrayEmptyArrayPrintsNothing {
+    -- An empty array produces no lines at all (not even a header).
+    when: Evaluates("array set p3 {}; rename puts ::tcl::_p3; proc puts {args} {lappend ::o3 [lindex $args end]}; parray p3; rename puts {}; rename ::tcl::_p3 puts; list [array size p3] [info exists ::o3]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ParrayMissingArrayErrors {
+    when: Evaluates("catch {parray nopeP} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "\"nopeP\" isn't an array"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ParrayArityMessage {
+    when: Evaluates("catch {parray p4 a b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"parray a ?pattern?\""
+    -- probe: 2026-11-28 tclsh9.1 (usage echoes the argument, not "arrayName")
+}

@@ -1,0 +1,476 @@
+-- allium: 3
+-- dict-extra.allium
+-- Behaviour spec: the rest of the 9.1 dict ensemble — value-mutating
+-- subcommands (append/lappend/incr/set/unset), path walks (get/exists),
+-- selectors (keys/values/size), copy transforms (remove/replace/merge),
+-- scripted traversals (filter/for/map), scoped bodies (update/with),
+-- canonical dict string form, and malformed-dict errors.
+-- Complements dict.allium; no rule here repeats one there.
+-- Oracle: tclsh 9.1.0 (core-9-1-0). All faces probed 2026-11-28.
+--
+-- Already pinned in dict.allium and deliberately not repeated:
+--   create duplicate-key/odd-arg, get no-key validation and lookup
+--   errorCode, getdef/getwithdefault, dict info block shape,
+--   unknown/prefix subcommand dispatch, set array-element rejection,
+--   incr non-integer value, lappend bad list, for empty result,
+--   map break discarding, update read/writeback on error and unset.
+--
+-- rtcl divergences from this spec are tracked in DIVERGENCES.md.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── append / lappend ─────────────────────────────────────────────
+
+rule Dict2AppendCreatesKey {
+    -- append sets the variable and returns the new dict string.
+    when: Evaluates("set d {}; list [dict append d k abc] $d")
+    ensures: completion.code = ok
+    ensures: completion.value = "{k abc} {k abc}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule Dict2AppendTreatsRemainingArgsAsOneKey {
+    -- append has exactly one key; every later argument is a value
+    -- concatenated onto that key (nothing is appended to key "b" here).
+    when: Evaluates("set d {k x}; dict append d k y z; set d")
+    ensures: completion.code = ok
+    ensures: completion.value = "k xyz"
+    -- probe: dict append d a x b y => a xby
+}
+
+rule Dict2AppendNoValuesCreatesEmptyValue {
+    when: Evaluates("set d {}; dict append d k; list [dict size $d] $d")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {k {}}"
+}
+
+rule Dict2LappendCreatesAndReturnsListValue {
+    when: Evaluates("set d {}; list [dict lappend d k a b] $d")
+    ensures: completion.code = ok
+    ensures: completion.value = "{k {a b}} {k {a b}}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule Dict2LappendEachArgIsOneElement {
+    -- Multi-word arguments become single list elements, not words.
+    when: Evaluates("set d {}; dict lappend d k \"a b\" c; set d")
+    ensures: completion.code = ok
+    ensures: completion.value = "k {{a b} c}"
+}
+
+-- ── incr ──────────────────────────────────────────────────────────
+
+rule Dict2IncrCreatesMissingKeyAsOne {
+    when: Evaluates("set d {}; list [dict incr d n] $d")
+    ensures: completion.code = ok
+    ensures: completion.value = "{n 1} {n 1}"
+}
+
+rule Dict2IncrAppliesExplicitIncrement {
+    when: Evaluates("set d {n 4}; list [dict incr d n 3] $d")
+    ensures: completion.code = ok
+    ensures: completion.value = "{n 7} {n 7}"
+}
+
+rule Dict2IncrIsArbitraryPrecision {
+    -- 9.1 integers widen past the 64-bit range; no wraparound.
+    when: Evaluates("set d {n 9223372036854775807}; dict incr d n; set d")
+    ensures: completion.code = ok
+    ensures: completion.value = "n 9223372036854775808"
+}
+
+rule Dict2IncrBadIncrementLeavesValueUnchanged {
+    when: Evaluates("set d {n 1}; catch {dict incr d n x} m; list $m $d")
+    ensures: completion.code = ok
+    ensures: completion.value = "{expected integer but got \"x\"} {n 1}"
+}
+
+-- ── get / exists ─────────────────────────────────────────────────
+
+rule Dict2GetWalksNestedPath {
+    when: Evaluates("dict get {a {b {c 7}}} a b c")
+    ensures: completion.code = ok
+    ensures: completion.value = "7"
+}
+
+rule Dict2GetMissingPathKeyNamesKey {
+    when: Evaluates("catch {dict get {a {b 1}} a z} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "key \"z\" not known in dictionary"
+}
+
+rule Dict2GetThroughScalarReportsMissingValue {
+    -- Descending through a non-dict leaf is a malformed-dict error,
+    -- not "key not known".
+    when: Evaluates("catch {dict get {a 1} a b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "missing value to go with key"
+}
+
+rule Dict2GetNoKeyReturnsCanonicalDict {
+    when: Evaluates("dict get {a 1 b 2}")
+    ensures: completion.code = ok
+    ensures: completion.value = "a 1 b 2"
+}
+
+rule Dict2ExistsWalksPath {
+    when: Evaluates("list [dict exists {a {b {c 7}}} a b c] [dict exists {a {b {c 7}}} a b z]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+}
+
+rule Dict2ExistsNeverValidatesMalformedDict {
+    -- Unlike get/keys/size, exists reports 0 for an odd-length dict
+    -- instead of raising a malformed-dict error.
+    when: Evaluates("list [dict exists {a b c} a] [dict exists {a b c} b] [dict exists {a 1 b} a]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0 0"
+}
+
+rule Dict2ExistsRequiresAtLeastOneKey {
+    when: Evaluates("catch {dict exists {a 1}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"dict exists dictionary key ?key ...?\""
+}
+
+-- ── keys / values / size ─────────────────────────────────────────
+
+rule Dict2KeysPreserveInsertionOrder {
+    when: Evaluates("dict keys {z 1 a 2 m 3}")
+    ensures: completion.code = ok
+    ensures: completion.value = "z a m"
+}
+
+rule Dict2KeysPatternFiltersInOrder {
+    when: Evaluates("dict keys {aa 1 ab 2 b 3} a*")
+    ensures: completion.code = ok
+    ensures: completion.value = "aa ab"
+}
+
+rule Dict2ValuesPreserveKeyOrder {
+    when: Evaluates("dict values {z 1 a 2 m 3}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 2 3"
+}
+
+rule Dict2ValuesPatternMatchesValues {
+    when: Evaluates("dict values {a foo b bar c food} f*")
+    ensures: completion.code = ok
+    ensures: completion.value = "foo food"
+}
+
+rule Dict2SizeCountsTopLevelPairsOnly {
+    when: Evaluates("list [dict size {a {b 1 c 2}}] [dict size {}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+}
+
+rule Dict2DuplicateKeysCollapseLastWins {
+    -- A dict value with repeated keys is a 1-entry dict carrying the
+    -- last value; keys/values/size all see the collapsed view.
+    when: Evaluates("list [dict size {a 1 a 2}] [dict keys {a 1 a 2}] [dict values {a 1 a 2}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 a 2"
+}
+
+-- ── remove / replace / merge ─────────────────────────────────────
+
+rule Dict2RemoveMultipleKeys {
+    when: Evaluates("dict remove {a 1 b 2 c 3} a c")
+    ensures: completion.code = ok
+    ensures: completion.value = "b 2"
+}
+
+rule Dict2RemoveIgnoresMissingKeys {
+    when: Evaluates("dict remove {a 1 b 2} z")
+    ensures: completion.code = ok
+    ensures: completion.value = "a 1 b 2"
+}
+
+rule Dict2RemoveKeysAreTopLevelOnly {
+    -- remove does not walk paths: "b" is a top-level key, so a nested
+    -- b survives; removing a then b removes the whole a entry.
+    when: Evaluates("list [dict remove {a {b 1} c 2} b] [dict remove {a {b 1}} a b]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a {b 1} c 2} {}"
+}
+
+rule Dict2ReplaceKeepsExistingKeyPosition {
+    when: Evaluates("dict replace {a 1 b 2} a 9 c 3")
+    ensures: completion.code = ok
+    ensures: completion.value = "a 9 b 2 c 3"
+}
+
+rule Dict2ReplaceDuplicateKeysLastWins {
+    when: Evaluates("dict replace {a 1 b 2} b 8 b 9")
+    ensures: completion.code = ok
+    ensures: completion.value = "a 1 b 9"
+}
+
+rule Dict2ReplaceRequiresValuePairs {
+    when: Evaluates("catch {dict replace {a 1} b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"dict replace dictionary ?key value ...?\""
+}
+
+rule Dict2MergeLaterValuesWin {
+    when: Evaluates("dict merge {a 1 b 2} {b 3 c 4}")
+    ensures: completion.code = ok
+    ensures: completion.value = "a 1 b 3 c 4"
+}
+
+rule Dict2MergeKeepsFirstOccurrencePosition {
+    -- The winning value keeps the position from the first dict that
+    -- introduced the key; later new keys append in order.
+    when: Evaluates("dict merge {a 1 b 2} {c 3 a 9}")
+    ensures: completion.code = ok
+    ensures: completion.value = "a 9 b 2 c 3"
+}
+
+rule Dict2MergeNoArgsIsEmptyDict {
+    when: Evaluates("list [dict merge] [dict merge {a 1}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {a 1}"
+}
+
+-- ── set / unset ──────────────────────────────────────────────────
+
+rule Dict2SetReturnsNewDictAndKeepsOrder {
+    when: Evaluates("set d {a 1 b 2}; list [dict set d a 9] $d")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a 9 b 2} {a 9 b 2}"
+}
+
+rule Dict2SetThroughScalarFailsUnchanged {
+    when: Evaluates("set d {a 1}; catch {dict set d a b 2} m; list $m $d")
+    ensures: completion.code = ok
+    ensures: completion.value = "{missing value to go with key} {a 1}"
+}
+
+rule Dict2UnsetKeysFormNestedPath {
+    -- unset's trailing arguments are a path, not independent keys:
+    -- "a b" descends into a and fails because a is scalar.
+    when: Evaluates("set d {a 1 b 2}; catch {dict unset d a b} m; list $m $d")
+    ensures: completion.code = ok
+    ensures: completion.value = "{missing value to go with key} {a 1 b 2}"
+}
+
+rule Dict2UnsetMissingIntermediateKeyErrors {
+    when: Evaluates("set d {a {b 1}}; catch {dict unset d z b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "key \"z\" not known in dictionary"
+}
+
+rule Dict2UnsetWholeKeyDropsSubdict {
+    when: Evaluates("set d {a {b 1} c 2}; list [dict unset d a] $d")
+    ensures: completion.code = ok
+    ensures: completion.value = "{c 2} {c 2}"
+}
+
+-- ── update / with ────────────────────────────────────────────────
+
+rule Dict2UpdateBindsExistingAndLeavesMissingUnset {
+    -- A mapped key absent from the dict leaves its variable unset
+    -- (info exists 0) for the body.
+    when: Evaluates("set d {a 1}; dict update d a x z y {list [info exists x] [info exists y]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+}
+
+rule Dict2UpdateReturnsBodyResult {
+    when: Evaluates("set d {a 1}; dict update d a x {expr {$x+41}}")
+    ensures: completion.code = ok
+    ensures: completion.value = "42"
+}
+
+rule Dict2UpdateCreatesKeyForMissingVariable {
+    -- Setting a variable that was unset for a missing key adds that key
+    -- on write-back.
+    when: Evaluates("set d {a 1}; dict update d a x z y {set y 5}; set d")
+    ensures: completion.code = ok
+    ensures: completion.value = "a 1 z 5"
+}
+
+rule Dict2UpdatePreservesKeyOrder {
+    when: Evaluates("set d {a 1 b 2}; dict update d b y a x {set x 9; set y 8}; set d")
+    ensures: completion.code = ok
+    ensures: completion.value = "a 9 b 8"
+}
+
+rule Dict2WithExposesKeysAsVariables {
+    when: Evaluates("set d {a 1 b 2}; dict with d {list $a $b}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 2"
+}
+
+rule Dict2WithReturnsBodyResultAndWritesBack {
+    when: Evaluates("set d {a 1}; list [dict with d {set a 5}] $d")
+    ensures: completion.code = ok
+    ensures: completion.value = "5 {a 5}"
+}
+
+rule Dict2WithKeyPathScopesSubdict {
+    -- With a key path, the body sees the subdict's keys as variables and
+    -- write-back rebuilds that nested dict.
+    when: Evaluates("set d {a {b 1}}; dict with d a {set b 7}; set d")
+    ensures: completion.code = ok
+    ensures: completion.value = "a {b 7}"
+}
+
+rule Dict2WithMissingKeyErrors {
+    when: Evaluates("set d {a 1}; catch {dict with d z {set z 1}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "key \"z\" not known in dictionary"
+}
+
+rule Dict2WithWritesBackOnError {
+    when: Evaluates("set d {a 1}; catch {dict with d {set a 4; error boom}} m; list $m $d")
+    ensures: completion.code = ok
+    ensures: completion.value = "boom {a 4}"
+}
+
+rule Dict2WithVariablesShadowOuterScope {
+    -- The mapped variables live in the current scope: an existing
+    -- same-named variable is overwritten and not restored afterwards.
+    when: Evaluates("set a 99; set d {a 1}; dict with d {set a 2}; list $a $d")
+    ensures: completion.code = ok
+    ensures: completion.value = "2 {a 2}"
+}
+
+-- ── filter ───────────────────────────────────────────────────────
+
+rule Dict2FilterKeyPattern {
+    when: Evaluates("dict filter {aa 1 ab 2 b 3} key a*")
+    ensures: completion.code = ok
+    ensures: completion.value = "aa 1 ab 2"
+}
+
+rule Dict2FilterValuePattern {
+    when: Evaluates("dict filter {a 1 b 22 c 3} value 2*")
+    ensures: completion.code = ok
+    ensures: completion.value = "b 22"
+}
+
+rule Dict2FilterScriptKeepsTruthyPairs {
+    when: Evaluates("dict filter {a 1 b 2 c 3} script {k v} {expr {$v > 1}}")
+    ensures: completion.code = ok
+    ensures: completion.value = "b 2 c 3"
+}
+
+rule Dict2FilterScriptBreakKeepsAccumulated {
+    -- Unlike dict map, filter keeps pairs accepted before break.
+    when: Evaluates("dict filter {a 1 b 2 c 3} script {k v} {if {$k eq \"b\"} {break}; expr 1}")
+    ensures: completion.code = ok
+    ensures: completion.value = "a 1"
+}
+
+rule Dict2FilterScriptContinueSkipsPair {
+    when: Evaluates("dict filter {a 1 b 2 c 3} script {k v} {if {$k eq \"b\"} {continue}; expr 1}")
+    ensures: completion.code = ok
+    ensures: completion.value = "a 1 c 3"
+}
+
+rule Dict2FilterBadTypeMenu {
+    when: Evaluates("catch {dict filter {a 1} zzz {k v} {expr 1}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad filterType \"zzz\": must be key, script, or value"
+}
+
+-- ── for / map ────────────────────────────────────────────────────
+
+rule Dict2ForPreservesOrder {
+    when: Evaluates("set out {}; dict for {k v} {z 1 a 2 m 3} {lappend out $k}; set out")
+    ensures: completion.code = ok
+    ensures: completion.value = "z a m"
+}
+
+rule Dict2ForContinueSkipsIteration {
+    when: Evaluates("set out {}; dict for {k v} {a 1 b 2 c 3} {if {$k eq \"b\"} {continue}; lappend out $k$v}; set out")
+    ensures: completion.code = ok
+    ensures: completion.value = "a1 c3"
+}
+
+rule Dict2ForBreakStopsIteration {
+    when: Evaluates("set out {}; dict for {k v} {a 1 b 2 c 3} {lappend out $k; if {$k eq \"b\"} {break}}; set out")
+    ensures: completion.code = ok
+    ensures: completion.value = "a b"
+}
+
+rule Dict2ForRequiresTwoVariableNames {
+    when: Evaluates("catch {dict for {k} {a 1} {}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "must have exactly two variable names"
+}
+
+rule Dict2MapBuildsDictFromBodyResults {
+    when: Evaluates("dict map {k v} {a 1 b 2} {expr {$v*10}}")
+    ensures: completion.code = ok
+    ensures: completion.value = "a 10 b 20"
+}
+
+rule Dict2MapContinueSkipsPair {
+    -- continue omits the pair entirely; iteration continues.
+    when: Evaluates("dict map {k v} {a 1 b 2 c 3} {if {$k eq \"b\"} {continue}; expr {$v*10}}")
+    ensures: completion.code = ok
+    ensures: completion.value = "a 10 c 30"
+}
+
+-- ── canonical string form ────────────────────────────────────────
+
+rule Dict2CanonicalFormQuotesOnSpaces {
+    when: Evaluates("list [dict create {a b} {c d}] [dict create a \"x y\"]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{{a b} {c d}} {a {x y}}"
+}
+
+rule Dict2CanonicalFormNestsSubdicts {
+    when: Evaluates("dict create a [dict create z 1 a 2]")
+    ensures: completion.code = ok
+    ensures: completion.value = "a {z 1 a 2}"
+}
+
+rule Dict2EmptyDictIsEmptyString {
+    when: Evaluates("list [dict create] [string length [dict create]] [dict create a {}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 0 {a {}}"
+}
+
+rule Dict2EmptyKeyIsLegal {
+    when: Evaluates("dict create {} v")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} v"
+}
+
+-- ── dispatch / malformed dicts ───────────────────────────────────
+
+rule Dict2MutatorsRequireKeyArg {
+    when: Evaluates("list [catch {dict append d} m1] $m1 [catch {dict lappend d} m2] $m2 [catch {dict incr d} m3] $m3")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {wrong # args: should be \"dict append dictVarName key ?value ...?\"} 1 {wrong # args: should be \"dict lappend dictVarName key ?value ...?\"} 1 {wrong # args: should be \"dict incr dictVarName key ?increment?\"}"
+}
+
+rule Dict2NoSubcommandMessage {
+    when: Evaluates("catch {dict} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"dict subcommand ?arg ...?\""
+}
+
+rule Dict2MalformedDictMissingValue {
+    -- An odd-length dict string completes with an error.
+    when: Evaluates("dict size {a b c}")
+    ensures: completion.code = error
+    ensures: completion.value = "missing value to go with key"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule Dict2MalformedDictUnmatchedBrace {
+    -- A dict-string parse error names the dict, not the list layer.
+    when: Evaluates("set s [format %ca 123]; dict keys $s")
+    ensures: completion.code = error
+    ensures: completion.value = "unmatched open brace in dict"
+    -- probe: set s "{a"; dict keys $s => unmatched open brace in dict
+}

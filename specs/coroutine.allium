@@ -1,0 +1,619 @@
+-- allium: 3
+-- coroutine.allium
+-- Behaviour spec: coroutine / yield / yieldto / coroinject / coroprobe,
+-- tailcall, and the observable coroutine faces of info coroutine / interp.
+-- Oracle: tclsh 9.1.0 (core-9-1-0).
+--
+-- Evidence: every `when` script was re-run against
+-- .refer/tcl910/inst/bin/tclsh9.1 on 2026-11-28; values are measured bytes.
+-- Sources, in evidence order:
+--   * oracle probes (2026-11-28), archived lineage in specs/coroutine.probes
+--     (those 2026-11-12 probes were written against tclsh 8.6.17 and are
+--     re-anchored here, not copied);
+--   * doc/coroutine.n (DESCRIPTION, EXAMPLES and DETAILED SEMANTICS);
+--   * doc/tailcall.n;
+--   * .refer/tcl910/tcl90-changes.md (coroinject/coroprobe added in 9.0,
+--     TIP 383).
+--
+-- Scope: a caller-visible coroutine command, not the scheduler or the VM
+-- implementation. Deterministic scripts only: no timers, no event loop, no
+-- dependence on process/thread scheduling.
+-- Excludes: coroutine destruction traces, errorInfo line-number formatting,
+-- timer/after integration, and stack introspection beyond what `info level`
+-- and `uplevel` expose here.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── creation and lifecycle ──────────────────────────────────────
+
+rule CoroutineCreationReturnsFirstYield {
+    -- `coroutine name cmd` runs cmd immediately and returns the value given to
+    -- its first `yield`; it does not return the command name. The command
+    -- `name` then exists to resume the body.
+    when: Evaluates("proc g {} {yield 1; yield 2; return 3}; set first [coroutine c g]; list $first [c] [c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 2 3"
+    -- probe: coroutine.probes:3 (8.6 lineage), re-run 2026-11-28; doc/coroutine.n DESCRIPTION.
+}
+
+rule CoroutineCommandLivesUntilCompletion {
+    -- After a normal return the coroutine command is deleted; a later call is
+    -- an ordinary invalid-command error.
+    when: Evaluates("proc g {} {yield A; return B}; coroutine c g; set a [c]; list $a [info commands c] [catch {c} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "B {} 1 {invalid command name \"c\"}"
+    -- probe: 2026-11-28; doc/coroutine.n "Once command returns normally ... deleted".
+}
+
+rule CoroutineNoYieldRunsToCompletion {
+    -- A body that never yields runs to completion inside the creation call and
+    -- leaves no coroutine command behind.
+    when: Evaluates("proc p {} {return 1}; set r [coroutine kp p]; list $r [info commands kp]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {}"
+    -- probe: coroutine.probes:10; doc/coroutine.n "If the coroutine context never yields".
+}
+
+rule CoroutineBodyErrorPropagatesAndDeletes {
+    -- An error in the body is raised by whichever call is running the body
+    -- (here the creation call) and deletes the coroutine.
+    when: Evaluates("proc boom {} {error boom-coro}; set e [catch {coroutine kb boom} m]; list $e $m [info commands kb] [catch {kb} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 boom-coro {} 1 {invalid command name \"kb\"}"
+    -- probe: coroutine.probes:9; re-run 2026-11-28.
+}
+
+rule CoroutineCompletionCodePropagates {
+    -- Non-ok completion codes other than error (custom `return -code 7`) are
+    -- delivered to the resuming caller as that code, then the coroutine dies.
+    when: Evaluates("proc g {} {yield A; return -code 7 seven}; coroutine c g; list [catch {c} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "7 seven"
+    -- probe: 2026-11-28; doc/return.n return -code.
+}
+
+rule CoroutineErrorCodePreserved {
+    -- errorCode set by `return -code error -errorcode` survives the coroutine
+    -- boundary unchanged.
+    when: Evaluates("proc g {} {yield A; return -code error -errorcode {MY CODE} boom}; coroutine c g; list [catch {c} m] $m $::errorCode")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 boom {MY CODE}"
+    -- probe: 2026-11-28.
+}
+
+rule CoroutineErrorInfoIncludesBodyFrames {
+    -- The errorInfo of a coroutine error names the body's procedure frames;
+    -- the trailing invoked-from-within is the ordinary command call.
+    when: Evaluates("proc inner {} {error deep-boom}; proc g {} {yield A; inner}; coroutine c g; catch {c} m; list $m [string match {*procedure*} $::errorInfo] [string match {*inner*} $::errorInfo]")
+    ensures: completion.code = ok
+    ensures: completion.value = "deep-boom 1 1"
+    -- probe: 2026-11-28; doc/coroutine.n DETAILED SEMANTICS.
+}
+
+rule CoroutineStartsFreshStack {
+    -- The body runs with no caller stack frames above it: `uplevel 1` from the
+    -- coroutine reaches the global frame, not the proc that created it.
+    when: Evaluates("proc g {} {yield [uplevel 1 {info exists x}]}; proc caller {} {set x CALLER; coroutine c g}; list [caller]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+    -- probe: 2026-11-28; doc/coroutine.n "there will be no stack frames above it".
+}
+
+rule CoroutineCommandResolvedInCallerNamespace {
+    -- The body command is resolved in the namespace where `coroutine` is
+    -- called, before the coroutine stack exists; an unqualified name therefore
+    -- does not leak in from another namespace.
+    when: Evaluates("namespace eval ns {proc g {} {yield ok}; proc make {} {coroutine c g}}; list [ns::make] [catch {coroutine c2 g} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "ok 1 {invalid command name \"g\"}"
+    -- probe: 2026-11-28; doc/coroutine.n "which command to call will be determined in the namespace".
+}
+
+rule CoroutineWrongArgs {
+    when: Evaluates("list [catch {coroutine} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {wrong # args: should be \"coroutine name cmd ?arg ...?\"}"
+    -- probe: 2026-11-28.
+}
+
+rule CoroutineUnknownBodyCommand {
+    -- Failure to resolve the body command aborts creation; no coroutine
+    -- command is installed.
+    when: Evaluates("list [catch {coroutine c nosuchproc} m] $m [info commands c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {invalid command name \"nosuchproc\"} {}"
+    -- probe: 2026-11-28.
+}
+
+rule DuplicateCoroutineNameReplacesExisting {
+    -- Creating a coroutine over an existing name silently replaces the old
+    -- command (the old suspended coroutine becomes unreachable); there is no
+    -- "already exists" error.
+    when: Evaluates("proc g1 {} {yield one; return one-end}; proc g2 {} {yield two; return two-end}; coroutine c g1; set first [coroutine c g2]; set after [c]; list $first $after")
+    ensures: completion.code = ok
+    ensures: completion.value = "two two-end"
+    -- probe: 2026-11-28; doc/coroutine.n does not specify a conflict, oracle replaces.
+}
+
+-- ── yield and resumption ────────────────────────────────────────
+
+rule YieldWithoutValueProducesEmpty {
+    -- `yield` with no argument yields the empty string; the resumption value
+    -- then becomes the result of the yield call.
+    when: Evaluates("proc g {} {set v [yield]; return <$v>}; set first [coroutine c g]; list [string length $first] [c X]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 <X>"
+    -- probe: coroutine.probes:5; doc/coroutine.n "if no value is supplied, the empty string is used".
+}
+
+rule YieldReturnsResumptionValue {
+    -- Each suspension point yields its own value; the single argument of the
+    -- resuming call becomes that yield's result.
+    when: Evaluates("proc g {} {yield A; set w [yield B]; return <$w>}; coroutine c g; set b [c R]; list $b [c Z]")
+    ensures: completion.code = ok
+    ensures: completion.value = "B <Z>"
+    -- probe: coroutine.probes:4; re-run 2026-11-28.
+}
+
+rule YieldAtDepthSuspendsWholeCoroutine {
+    -- A yield in a procedure called from the body suspends the whole coroutine,
+    -- and the caller observes a plain return from the coroutine command.
+    when: Evaluates("proc deep {} {yield deep-val}; proc g {} {deep; return unreachable}; set first [coroutine c g]; set second [c]; list $first $second")
+    ensures: completion.code = ok
+    ensures: completion.value = "deep-val unreachable"
+    -- probe: coroutine.probes:6; doc/coroutine.n DETAILED SEMANTICS "coroutines may yield at depth".
+}
+
+rule YieldRejectsExtraArguments {
+    -- yield accepts at most one value; extra arguments are a usage error and
+    -- no coroutine is left behind.
+    when: Evaluates("proc g {} {yield 1 2 3}; list [catch {coroutine c g} m] $m [info commands c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {wrong # args: should be \"yield ?returnValue?\"} {}"
+    -- probe: 2026-11-28.
+}
+
+rule YieldOutsideCoroutineIsError {
+    when: Evaluates("list [catch {yield 1} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {yield can only be called in a coroutine}"
+    -- probe: 2026-11-28.
+}
+
+rule YieldtoOutsideCoroutineIsError {
+    when: Evaluates("list [catch {yieldto list a} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {yieldto can only be called in a coroutine}"
+    -- probe: 2026-11-28.
+}
+
+rule CoroutineResumeRejectsMultipleArguments {
+    -- A coroutine suspended by `yield` takes zero or one resumption argument;
+    -- the usage text embeds the coroutine's command name.
+    when: Evaluates("proc g {} {set v [yield A]; return B:$v}; coroutine c g; list [catch {c x y} m] $m [c z]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {wrong # args: should be \"c ?arg?\"} B:z"
+    -- probe: 2026-11-28.
+}
+
+-- ── yieldto ─────────────────────────────────────────────────────
+
+rule YieldtoReturnsTargetResultToCaller {
+    -- yieldto runs the target command and suspends the coroutine; the target's
+    -- return value is what the coroutine's caller receives.
+    when: Evaluates("proc y {} {yieldto list a b}; coroutine t y")
+    ensures: completion.code = ok
+    ensures: completion.value = "a b"
+    -- probe: coroutine.probes:7; doc/coroutine.n "cedes execution".
+}
+
+rule YieldtoResumeValueIsArgumentList {
+    -- Resuming a yieldto-suspended coroutine accepts any number of arguments;
+    -- they arrive as one list value that becomes the result of yieldto.
+    when: Evaluates("proc y {} {set v [yieldto list a]; return <$v>}; set first [coroutine t y]; set second [t r1 r2]; list $first $second")
+    ensures: completion.code = ok
+    ensures: completion.value = "a {<r1 r2>}"
+    -- probe: coroutine.probes:7; re-run 2026-11-28.
+}
+
+rule YieldtoTargetRunsInCallerFrame {
+    -- yieldto evaluates its arguments in the coroutine's frame but executes the
+    -- target in the resumer's frame: a `set` in the target creates the global
+    -- variable, not a coroutine local.
+    when: Evaluates("proc y {} {set loc L; yieldto set g $loc}; set first [coroutine t y]; list $first [set ::g]")
+    ensures: completion.code = ok
+    ensures: completion.value = "L L"
+    -- probe: 2026-11-28; doc/coroutine.n leaves the target frame implicit.
+}
+
+rule YieldtoResolvesTargetInCoroutineNamespace {
+    -- The target command name is resolved in the namespace of the coroutine's
+    -- body, so a body defined in ::ns sees ::ns::target unqualified.
+    when: Evaluates("namespace eval ns {proc target {} {return ns-target}; proc y {} {set v [yieldto target]; return got:$v}}; set first [coroutine c ::ns::y]; set second [c R]; list $first $second")
+    ensures: completion.code = ok
+    ensures: completion.value = "ns-target got:R"
+    -- probe: 2026-11-28; doc/coroutine.n "resolved in the context of the coroutine".
+}
+
+rule YieldtoTargetErrorLeavesCoroutineSuspended {
+    -- An error from the yieldto target is reported to the resumer, but does not
+    -- kill or resume the coroutine; a later resume continues with the
+    -- resumption value.
+    when: Evaluates("proc bad {} {error target-boom}; proc y {} {set v [yieldto bad]; return got:$v}; set e [catch {coroutine tg y} m]; set r [tg R]; list $e $m $r")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 target-boom got:R"
+    -- probe: 2026-11-28.
+}
+
+rule YieldtoUnknownTargetLeavesCoroutineSuspended {
+    -- An unresolvable yieldto target behaves like a failing target: the error
+    -- reaches the caller, the coroutine stays suspended, and the next resume
+    -- returns the resumption value.
+    when: Evaluates("proc y {} {yieldto nosuchcmd}; set e [catch {coroutine c y} m]; set r [c R]; list $e $m $r [info commands c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {invalid command name \"nosuchcmd\"} R {}"
+    -- probe: 2026-11-28.
+}
+
+rule YieldtoToSuspendedCoroutineChains {
+    -- yieldto can aim at another suspended coroutine: that coroutine's return
+    -- becomes the first caller's result, and it is deleted on completion.
+    when: Evaluates("proc b {} {set v [yield b-ready]; return b-done:$v}; proc a {} {set r [yieldto B hello]; yield a-after:$r; return a-end}; coroutine B b; set first [coroutine A a]; set second [A]; list $first $second [info commands B]")
+    ensures: completion.code = ok
+    ensures: completion.value = "b-done:hello a-after: {}"
+    -- probe: coroutine.probes:11; doc/coroutine.n "transfer control directly from one coroutine to another".
+}
+
+rule YieldtoNoArgsUsage {
+    when: Evaluates("proc y {} {yieldto}; list [catch {coroutine c y} m] $m [info commands c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {wrong # args: should be \"yieldto command ?arg ...?\"} {}"
+    -- probe: 2026-11-28.
+}
+
+-- ── coroinject (TIP 383, present in 9.0/9.1) ────────────────────
+
+rule CoroinjectRunsAtResumption {
+    -- An injected command runs when the coroutine is next resumed. It receives
+    -- two appended arguments: the suspending command's name ("yield") and the
+    -- resumption value. Its result becomes the yield's result.
+    when: Evaluates("proc g {} {set a [yield A]; return <$a>}; coroutine c g; coroinject c apply {{t v} {return $t|$v}}; c P")
+    ensures: completion.code = ok
+    ensures: completion.value = "<yield|P>"
+    -- probe: 2026-11-28; doc/coroutine.n TIP383 bullets; tcl90-changes.md:246.
+}
+
+rule CoroinjectStacksInReverseOrder {
+    -- Multiple injections before one resume execute in reverse definition
+    -- order; each result feeds the next as its resumption value.
+    when: Evaluates("proc g {} {set a [yield A]; return <$a>}; coroutine c g; coroinject c apply {{t v} {return one:$v}}; coroinject c apply {{t v} {return two:$v}}; c P")
+    ensures: completion.code = ok
+    ensures: completion.value = "<one:two:P>"
+    -- probe: 2026-11-28; doc/coroutine.n "performed in reverse order of definition".
+}
+
+rule CoroinjectIsOneOff {
+    -- An injection is consumed by one resumption; the following resume uses
+    -- the ordinary argument directly.
+    when: Evaluates("proc g {} {set a [yield A]; set b [yield B]; return $a/$b}; coroutine c g; coroinject c apply {{t v} {return INJ:$v}}; set one [c X]; set two [c Y]; list $one $two")
+    ensures: completion.code = ok
+    ensures: completion.value = "B INJ:X/Y"
+    -- probe: 2026-11-28; doc/coroutine.n "The injection is a one-off".
+}
+
+rule CoroinjectYieldtoGetsArgumentList {
+    -- For a yieldto suspension the appended type is "yieldto" and the appended
+    -- value is the whole resumption argument list.
+    when: Evaluates("proc g {} {set a [yieldto list A B]; return <$a>}; coroutine c g; coroinject c apply {{t v} {return $t|$v}}; c P Q")
+    ensures: completion.code = ok
+    ensures: completion.value = "<yieldto|P Q>"
+    -- probe: 2026-11-28; doc/coroutine.n "the argument (or list of arguments, in the case of yieldto)".
+}
+
+rule CoroinjectMayYield {
+    -- An injected command may itself yield; the coroutine then suspends inside
+    -- the injection and the original yield completes only on a later resume.
+    when: Evaluates("proc g {} {set a [yield A]; return got:$a}; coroutine c g; coroinject c apply {{t v} {yield inj-yield; return injected:$v}}; set one [c X]; set two [c Y]; list $one $two")
+    ensures: completion.code = ok
+    ensures: completion.value = "inj-yield got:injected:X"
+    -- probe: 2026-11-28; doc/coroutine.n "It may yield or yieldto as part of its execution".
+}
+
+rule CoroinjectErrorPropagatesAndDeletes {
+    -- An error raised by an injected command surfaces from the resume and
+    -- deletes the coroutine.
+    when: Evaluates("proc g {} {set v [yield a]; return got:$v}; coroutine c g; coroinject c apply {{t v} {error inject-boom}}; list [catch {c X} m] $m [info commands c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 inject-boom {}"
+    -- probe: 2026-11-28.
+}
+
+rule CoroinjectRequiresSuspendedCoroutine {
+    -- A running coroutine cannot be injected into (the failure message says
+    -- "suspended", unlike the unknown-name case); the error kills the running
+    -- coroutine.
+    when: Evaluates("proc g {} {coroinject [info coroutine] set z 1}; list [catch {coroutine c g} m] $m [info commands c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {can only inject a command into a suspended coroutine} {}"
+    -- probe: 2026-11-28; doc/coroutine.n "running coroutines may be neither probed nor injected".
+}
+
+rule CoroinjectUnknownNameError {
+    when: Evaluates("list [catch {coroinject nope set x 1} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {can only inject a command into a coroutine}"
+    -- probe: 2026-11-28.
+}
+
+rule CoroinjectWrongArgs {
+    when: Evaluates("list [catch {coroinject} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {wrong # args: should be \"coroinject coroName cmd ?arg1 arg2 ...?\"}"
+    -- probe: 2026-11-28.
+}
+
+-- ── coroprobe (TIP 383) ─────────────────────────────────────────
+
+rule CoroprobeSeesSuspendedFrame {
+    -- coroprobe runs the command at the exact frame where the coroutine
+    -- suspended: locals of that frame are visible and info level / info
+    -- coroutine report that point.
+    when: Evaluates("proc deep {} {set dl D; yield P}; proc g {} {deep}; coroutine c g; list [coroprobe c set dl] [coroprobe c info level] [coroprobe c info coroutine]")
+    ensures: completion.code = ok
+    ensures: completion.value = "D 2 ::c"
+    -- probe: 2026-11-28; doc/coroutine.n "run a command at the point where the coroutine is at".
+}
+
+rule CoroprobeMutationsPersist {
+    -- A probe returns the target command's result, may change coroutine
+    -- variables, and leaves the coroutine suspended at the same yield.
+    when: Evaluates("proc g {} {set n 1; set v [yield A]; return $n/$v}; coroutine c g; coroprobe c set n 5; set seen [coroprobe c set n]; list $seen [c Z]")
+    ensures: completion.code = ok
+    ensures: completion.value = "5 5/Z"
+    -- probe: 2026-11-28; doc/coroutine.n "the gross state of the coroutine remains the same".
+}
+
+rule CoroprobeErrorPropagatesWithoutDisturbingCoroutine {
+    -- A failing probe command is reported to the prober; the coroutine is
+    -- untouched and later resumes normally.
+    when: Evaluates("proc g {} {set v [yield a]; return got:$v}; coroutine c g; set e [catch {coroprobe c error probe-boom} m]; set r [c Z]; list $e $m $r")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 probe-boom got:Z"
+    -- probe: 2026-11-28.
+}
+
+rule CoroprobeRequiresSuspendedCoroutine {
+    when: Evaluates("proc g {} {coroprobe [info coroutine] set z 1}; list [catch {coroutine c g} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {can only inject a probe command into a suspended coroutine}"
+    -- probe: 2026-11-28.
+}
+
+rule CoroprobeUnknownNameError {
+    when: Evaluates("list [catch {coroprobe nope set x} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {can only inject a probe command into a coroutine}"
+    -- probe: 2026-11-28.
+}
+
+rule CoroprobeAfterCompletionError {
+    -- Once a coroutine has completed its command name is gone, so probing it is
+    -- indistinguishable from probing an unknown name.
+    when: Evaluates("proc g {} {return fin}; coroutine c g; list [catch {coroprobe c set x} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {can only inject a probe command into a coroutine}"
+    -- probe: 2026-11-28.
+}
+
+rule CoroprobeWrongArgs {
+    when: Evaluates("list [catch {coroprobe} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {wrong # args: should be \"coroprobe coroName cmd ?arg1 arg2 ...?\"}"
+    -- probe: 2026-11-28.
+}
+
+-- ── tailcall ────────────────────────────────────────────────────
+
+rule TailcallReplacesFrame {
+    -- tailcall replaces the current proc's frame instead of adding one: the
+    -- target sees the caller's level, while an ordinary call adds a level.
+    when: Evaluates("proc p {} {info level}; proc q {} {tailcall p}; proc r {} {p}; list [q] [r]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 2"
+    -- probe: 2026-11-28; doc/tailcall.n "replaces the currently executing procedure".
+}
+
+rule TailcallKeepsCoroutineContext {
+    -- A tailcall from a coroutine body keeps both the coroutine identity and
+    -- the frame depth of the body.
+    when: Evaluates("proc p {} {list [info coroutine] [info level]}; proc q {} {tailcall p}; coroutine c q")
+    ensures: completion.code = ok
+    ensures: completion.value = "::c 1"
+    -- probe: 2026-11-28.
+}
+
+rule TailcallResultAndNoContinuation {
+    -- tailcall's target result is the proc's result; statements after the
+    -- tailcall never run.
+    when: Evaluates("set ::flag 0; proc p {} {return pv}; proc q {} {tailcall p; set ::flag 1}; list [q] $::flag")
+    ensures: completion.code = ok
+    ensures: completion.value = "pv 0"
+    -- probe: 2026-11-28; doc/tailcall.n equivalent to return [uplevel 1 ...].
+}
+
+rule TailcallNoArgumentsReturnsEmpty {
+    -- `tailcall` with no command still ends the proc with the empty result.
+    when: Evaluates("set ::flag 0; proc q {} {tailcall; set ::flag 2}; list [q] $::flag")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 0"
+    -- probe: 2026-11-28.
+}
+
+rule TailcallErrorPropagates {
+    when: Evaluates("proc pe {} {error tail-err}; proc qe {} {tailcall pe}; list [catch {qe} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 tail-err"
+    -- probe: 2026-11-28; doc/tailcall.n error propagation.
+}
+
+rule TailcallErrorInfoIncludesBothFrames {
+    -- A tailcall does not hide the replacing command: errorInfo names the
+    -- target proc's frame and the original tailcalling proc.
+    when: Evaluates("proc pe {} {error tail-err}; proc qe {} {tailcall pe}; catch {qe} m; list $m [string match {*procedure*} $::errorInfo] [string match {*qe*} $::errorInfo]")
+    ensures: completion.code = ok
+    ensures: completion.value = "tail-err 1 1"
+    -- probe: 2026-11-28.
+}
+
+rule TailcallOutsideProcIsError {
+    when: Evaluates("list [catch {tailcall list a} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {tailcall can only be called from a proc, lambda or method}"
+    -- probe: 2026-11-28.
+}
+
+rule TailcallWorksInLambda {
+    -- An apply lambda is a valid tailcall frame.
+    when: Evaluates("proc lv {} {info level}; apply {{} {tailcall lv}}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: 2026-11-28; doc/tailcall.n "procedure, lambda application, or method".
+}
+
+rule TailcallWorksInsideCatchAndUplevel {
+    -- Unlike the 8.6 text of doc/tailcall.n, 9.1.0 permits a tailcall inside
+    -- catch, try, or an uplevel into a proc frame; it still replaces that
+    -- frame (targets report level 1 here, not 2).
+    when: Evaluates("proc q {} {info level}; proc p {} {catch {tailcall q}}; proc u {} {uplevel 1 {tailcall q}}; proc r {} {u}; list [p] [r]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+    -- probe: 2026-11-28; doc/tailcall.n still carries the 8.6 prohibition, oracle permits it.
+}
+
+rule TailcallRelinksUpvarToCaller {
+    -- Because the frame is replaced, `upvar 1` in the target points at the
+    -- tailcalling proc's caller, not at the discarded proc frame.
+    when: Evaluates("proc a {} {upvar 1 v w; set w}; proc b {} {set v 5; a}; proc bt {} {set v 5; tailcall a}; list [b] [catch {bt} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "5 1 {can't read \"w\": no such variable}"
+    -- probe: 2026-11-28.
+}
+
+rule TailcallUnknownCommandIsError {
+    when: Evaluates("proc q {} {tailcall nosuchcmd a}; list [catch {q} m] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {invalid command name \"nosuchcmd\"}"
+    -- probe: 2026-11-28.
+}
+
+rule TailcallResolvesInCurrentNamespace {
+    -- The target is resolved in the current namespace context, not the
+    -- caller's.
+    when: Evaluates("namespace eval ns {proc target {} {return ns-target}; proc caller {} {tailcall target}}; ns::caller")
+    ensures: completion.code = ok
+    ensures: completion.value = "ns-target"
+    -- probe: 2026-11-28; doc/tailcall.n "looked up in the current namespace context".
+}
+
+rule TailcallWorksInMethod {
+    -- A TclOO method body is also a valid tailcall frame.
+    when: Evaluates("oo::class create K {method m {} {tailcall string cat M}}; set o [K new]; list [$o m]")
+    ensures: completion.code = ok
+    ensures: completion.value = "M"
+    -- probe: 2026-11-28.
+}
+
+-- ── info coroutine and interp interaction ───────────────────────
+
+rule InfoCoroutineOutsideIsEmpty {
+    -- Outside any coroutine, info coroutine returns the empty string, including
+    -- when evaluated through eval/uplevel at top level.
+    when: Evaluates("info coroutine")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+    -- probe: 2026-11-28; doc/coroutine.n "the name of the current coroutine can be retrieved".
+}
+
+rule InfoCoroutineIsQualifiedNameInside {
+    -- Inside the body, info coroutine reports the fully qualified command name.
+    when: Evaluates("proc g {} {yield [info coroutine]}; coroutine c g")
+    ensures: completion.code = ok
+    ensures: completion.value = "::c"
+    -- probe: coroutine.probes:22-25 lineage; re-run 2026-11-28.
+}
+
+rule InfoCoroutineFromNestedProc {
+    -- info coroutine is coroutine-wide: a proc called at any depth reports the
+    -- same name, before and after resumption.
+    when: Evaluates("proc deep {} {info coroutine}; proc g {} {yield [deep]; return [deep]}; set a [coroutine c g]; set b [c]; list $a $b")
+    ensures: completion.code = ok
+    ensures: completion.value = "::c ::c"
+    -- probe: 2026-11-28; doc/coroutine.n EXAMPLES filterByFactor.
+}
+
+rule InfoCoroutineUsesNamespaceOfCreation {
+    -- A coroutine created inside a namespace is named in that namespace.
+    when: Evaluates("namespace eval ns {proc g {} {yield [info coroutine]}; coroutine c g}")
+    ensures: completion.code = ok
+    ensures: completion.value = "::ns::c"
+    -- probe: 2026-11-28; doc/coroutine.n "coroutine names are local to the current namespace".
+}
+
+rule InfoCoroutineTracksRename {
+    -- info coroutine reports the coroutine command's current name: renaming a
+    -- suspended coroutine changes the answer on the next resume.
+    when: Evaluates("proc g {} {yield [info coroutine]; return [info coroutine]}; set first [coroutine c g]; rename c d; set second [d]; list $first $second")
+    ensures: completion.code = ok
+    ensures: completion.value = "::c ::d"
+    -- probe: 2026-11-28.
+}
+
+rule InfoCoroutineInChildInterpIsEmpty {
+    when: Evaluates("interp create ch; list [ch eval {info coroutine}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{}"
+    -- probe: 2026-11-28.
+}
+
+rule CoroutineCommandsDoNotCrossInterpreters {
+    -- A coroutine belongs to the interpreter that created it; its command is
+    -- not visible in the parent, and coroutine identity does not leak.
+    when: Evaluates("interp create ch; ch eval {proc g {} {yield [info coroutine]}; coroutine c g}; list [info commands ::c] [ch eval {info commands ::c}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} ::c"
+    -- probe: 2026-11-28; doc/interp.n.
+}
+
+rule InterpAliasResumesCoroutine {
+    -- An interp alias may target a coroutine command; invoking it from the
+    -- child resumes (and here completes) the parent's coroutine.
+    when: Evaluates("interp create ch; proc g {} {yield A; return B}; coroutine c g; interp alias ch x {} c; set r [ch eval {x}]; list $r [info commands c]")
+    ensures: completion.code = ok
+    ensures: completion.value = "B {}"
+    -- probe: 2026-11-28; doc/interp.n alias.
+}
+
+-- ── nested coroutines ───────────────────────────────────────────
+
+rule NestedCoroutineHasOwnName {
+    -- A coroutine created by another coroutine gets its own qualified name;
+    -- calls to it and info coroutine inside it report the inner name only.
+    when: Evaluates("proc inner {} {yield [info coroutine]; return [info coroutine]}; proc outer {} {set c [coroutine ic inner]; yield $c; return [ic]}; set o [coroutine oc outer]; set a [oc]; list $o $a")
+    ensures: completion.code = ok
+    ensures: completion.value = "::ic ::ic"
+    -- probe: 2026-11-28; doc/coroutine.n sieve example "creation of coroutines inside a coroutine".
+}
+
+rule NestedCoroutineDrivesIndependently {
+    -- The outer body drives the inner coroutine by calling it; the inner
+    -- completion is observable only through the outer body, and a further call
+    -- after completion is an invalid-command error converted by catch.
+    when: Evaluates("proc inner {} {yield i1; yield i2; return i3}; proc outer {} {set c [coroutine ic inner]; set r [ic]; yield O:$r; set r2 [ic]; yield O2:$r2; set r3 [catch {ic} m]; return $r3}; set o [coroutine oc outer]; set a [oc]; set b [oc]; list $o $a $b")
+    ensures: completion.code = ok
+    ensures: completion.value = "O:i2 O2:i3 1"
+    -- probe: 2026-11-28.
+}

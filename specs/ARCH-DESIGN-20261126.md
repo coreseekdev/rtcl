@@ -125,7 +125,7 @@ C39（递归深度口径）在树引擎删除后变成单纯的调用深度问�
   令集：核心语言 + expr + list/dict/string + channel 内存面 + OO）与
   现行 `std`（全量）。36 项扩展已是独立 feature；`encoding`/`clock`/
   `file`/`exec` 已可选——Core Profile 把它们整体关掉并固定体积上限
-  （目标 ≤1.5MB，现 2.1MB）。
+  （初锚 ≤1.5MB；2026-11-28 用户裁定重锚 **core opt-s ≤2MB**——基座自 11 月起增长 +292KB 且标准面 fn 指针表结构性 retain 不可死剥离，现 core 1.83MB 达标、余量 8.7%）。
 - D5 的 num-bigint 在 core 里保留（语言核心）；D4 的缓存保留。
 - 每批 wasm 构建体积入账 BASELINE；体积回退是门禁。
 

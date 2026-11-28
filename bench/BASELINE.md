@@ -3169,7 +3169,7 @@ sweep 12 既有、workspace **cargo exit 0**（rtcl-vm 871/0）、wasm32 ✓、
   省 −140,714B；缺口构成 = 标准面 CommandFunc fn 指针表结构性 retain
   （MODULARIZATION §1 定调不可死剥离）+ 基座自 11-19 增长 +292KB
   （E2 lseq/惰性索引面）。设计时点「关清单即达标」的算术已失效——
-  **重锚红线或产品层裁定更深关闭清单，属用户决策项**。盲砍标准面
+  **重锚红线或产品层裁定更深关闭清单，裁定（2026-11-28 用户）：**红线重锚 core opt-s ≤2MB**——现 1.83MB 达标（余量 8.7%）；更深关闭清单（盲砍标准面）与"替代标准 Tcl"冲突，不做**。盲砍标准面
   （event/interp/binary/lseq）与"替代标准 Tcl"冲突，不做。
 - 门禁（合并树）：judge 95/95、crash-gate 128/128、probes 398/76、
   sweep 12 既有、rtcl-vm 898×2 特性、workspace exit 0、五特性+core

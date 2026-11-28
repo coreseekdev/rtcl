@@ -1,0 +1,588 @@
+-- allium: 3
+-- subst.allium
+-- Behaviour spec: the subst command — default backslash/command/variable
+-- substitution and their interaction, the 9.1 option set
+-- (-backslashes/-commands/-variables plus their -no* opposites), option
+-- combinations, backslash faces, command and variable substitution, and
+-- the parser/error faces of the string argument.
+-- Oracle: tclsh 9.1.0 (core-9-1-0). All rules probed 2026-11-28.
+--
+-- control-flow.allium keeps the two overview option rules
+-- (SubstOptionsSelectFaces, SubstRejectsOppositeOptionMix); this file owns
+-- the rest of the command surface and does not restate them.
+-- Surprise pinned below: 9.1 subst does NOT accept "--"; the delimiter is
+-- reported as a bad option (unlike switch and many other commands).
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── default substitution and ordering ───────────────────────────
+
+rule SubstAppliesAllThreeFaces {
+    -- With no options all three faces run; the result keeps a newline
+    -- produced by backslash substitution (length 8, map shows the NL).
+    when: Evaluates("set x 5; set r [subst {a$x b[expr 1+1] c\\n}]; list [string length $r] [string map {\\n N} $r]")
+    ensures: completion.code = ok
+    ensures: completion.value = "8 {a5 b2 cN}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstSubstitutionsApplyLeftToRight {
+    -- Faces are processed in text order: $i reads 0, then incr i yields 1,
+    -- then $i reads 1, then incr i yields 2.
+    when: Evaluates("set i 0; subst {$i[incr i]$i[incr i]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "0112"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstTopLevelBracesAreLiteral {
+    -- At the top level of the string braces are ordinary characters; only
+    -- ${...} and [...] change their meaning.
+    when: Evaluates("subst {a{b}c}")
+    ensures: completion.code = ok
+    ensures: completion.value = "a{b}c"
+    -- doc/subst.n: no special treatment of curly braces
+}
+
+rule SubstTopLevelQuotesAreLiteral {
+    -- Double quotes are ordinary characters outside command substitution.
+    when: Evaluates("subst {a\"b\"c}")
+    ensures: completion.code = ok
+    ensures: completion.value = "a\"b\"c"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstUnmatchedTopLevelBraceIsLiteral {
+    -- An unbalanced { at the top level is passed through, not an error;
+    -- brace errors only arise inside ${...} or a command substitution.
+    when: Evaluates("subst [format {abc%c} 123]")
+    ensures: completion.code = ok
+    ensures: completion.value = "abc{"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstSubstitutedTextIsNotRescanned {
+    -- The value substituted for $a is inserted literally; its own $b is
+    -- not substituted again.
+    when: Evaluates("set b 7; set a {$b}; subst {$a}")
+    ensures: completion.code = ok
+    ensures: completion.value = "$b"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── option selection: negative forms ────────────────────────────
+
+rule SubstNobackslashesKeepsEscapes {
+    -- -nobackslashes leaves backslash sequences verbatim while command and
+    -- variable substitution continue.
+    when: Evaluates("set x 5; subst -nobackslashes {a\\tb $x [expr 1+1]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "a\\tb 5 2"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstNocommandsKeepsBrackets {
+    -- -nocommands makes [ and ] ordinary; $x still substitutes.
+    when: Evaluates("set x 5; subst -nocommands {$x [expr 1+1]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "5 [expr 1+1]"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstNovariablesKeepsDollar {
+    -- -novariables makes $ ordinary; command substitution still runs.
+    when: Evaluates("set x 5; subst -novariables {$x [expr 1+1]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "$x 2"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── option selection: 9.1 positive forms ────────────────────────
+
+rule SubstBackslashesOnly {
+    -- -backslashes enables only backslash substitution; $ and [...] stay
+    -- literal (the tab is mapped to T for a printable assertion).
+    when: Evaluates("set x 5; string map {\\t T} [subst -backslashes {a\\tb $x [expr 1+1]}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "aTb $x [expr 1+1]"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstCommandsOnly {
+    -- -commands enables only command substitution.
+    when: Evaluates("set x 5; subst -commands {$x [expr 1+1]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "$x 2"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstVariablesOnly {
+    -- -variables enables only variable substitution, including array
+    -- elements; the bracket text stays literal.
+    when: Evaluates("set a(k) v; subst -variables {x$a(k)y [expr 1+1]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "xvy [expr 1+1]"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstBackslashesAndCommandsUnion {
+    when: Evaluates("set x 5; string map {\\t T} [subst -backslashes -commands {a\\tb $x [expr 1+1]}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "aTb $x 2"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstBackslashesAndVariablesUnion {
+    when: Evaluates("set x 5; string map {\\t T} [subst -backslashes -variables {a\\tb $x [expr 1+1]}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "aTb 5 [expr 1+1]"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstCommandsAndVariablesUnion {
+    when: Evaluates("set x 5; subst -commands -variables {a\\tb $x [expr 1+1]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "a\\tb 5 2"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstAllPositiveEqualsDefault {
+    -- Naming all three positive options is equivalent to no option.
+    when: Evaluates("set x 5; string equal [subst {a\\tb $x [expr 1+1]}] [subst -backslashes -commands -variables {a\\tb $x [expr 1+1]}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstAllNegativeLeavesLiteral {
+    -- Naming all three negative options leaves the string untouched.
+    when: Evaluates("set x 5; subst -nobackslashes -nocommands -novariables {a\\tb $x [expr 1+1]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "a\\tb $x [expr 1+1]"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── option repetition, mixing and parsing ───────────────────────
+
+rule SubstRepeatedNegativeOptionAccepted {
+    -- Repeating the same negative option is accepted (flags are OR-ed),
+    -- not a conflict.
+    when: Evaluates("subst -nocommands -nocommands {[expr 1+1]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "[expr 1+1]"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstRepeatedPositiveOptionAccepted {
+    when: Evaluates("set x 5; subst -variables -variables {$x}")
+    ensures: completion.code = ok
+    ensures: completion.value = "5"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstPositiveNegativeConflictIsOrderIndependent {
+    -- Any positive option combined with any negative option is an error,
+    -- in either textual order: there is no last-wins rule.
+    when: Evaluates("set x 5; list [catch {subst -variables -nobackslashes {a$x}} m1] $m1 [catch {subst -nobackslashes -variables {a$x}} m2] $m2")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {cannot combine positive and negative options} 1 {cannot combine positive and negative options}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstUniqueOptionPrefixAccepted {
+    -- Options resolve by unique prefix: -var, -com and -back are enough.
+    when: Evaluates("set x 5; list [subst -var {$x}] [subst -com {[expr 1+1]}] [string map {\\t T} [subst -back {a\\tb}]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "5 2 aTb"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstAmbiguousOptionPrefixRejected {
+    -- -no prefixes all three negative options and is ambiguous.
+    when: Evaluates("catch {subst -no {x}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "ambiguous option \"-no\": must be -backslashes, -commands, -variables, -nobackslashes, -nocommands, or -novariables"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstDoubleDashIsRejected {
+    -- 9.1 subst has no -- end-of-options delimiter; it is a bad option.
+    -- (The script builds the two dashes with string repeat so the audit
+    -- trigger itself carries no literal --.)
+    when: Evaluates("catch {subst [string repeat - 2] {a$x}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"--\": must be -backslashes, -commands, -variables, -nobackslashes, -nocommands, or -novariables"
+    -- probe: 2026-11-28 tclsh9.1; doc/subst.n lists no -- form
+}
+
+rule SubstBadOptionMenu {
+    -- The error menu lists the positive forms first, then the negative
+    -- ones (order is part of the observable text).
+    when: Evaluates("catch {subst -foo a} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"-foo\": must be -backslashes, -commands, -variables, -nobackslashes, -nocommands, or -novariables"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstNonFinalArgumentsMustBeOptions {
+    -- Every argument except the last is parsed as an option, so a plain
+    -- word in that position is a bad option, not the string.
+    when: Evaluates("catch {subst a b} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"a\": must be -backslashes, -commands, -variables, -nobackslashes, -nocommands, or -novariables"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstLastArgumentIsStringEvenIfOptionLike {
+    -- The final argument is always the string, even when it looks like an
+    -- option; a lone option-shaped argument is returned unchanged.
+    when: Evaluates("list [subst -nocommands] [subst -nocommands -nocommands]")
+    ensures: completion.code = ok
+    ensures: completion.value = "-nocommands -nocommands"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstNoArgsIsWrongNumArgs {
+    when: Evaluates("catch {subst} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"subst ?-backslashes? ?-commands? ?-variables? ?-nobackslashes? ?-nocommands? ?-novariables? string\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── backslash faces ─────────────────────────────────────────────
+
+rule SubstBackslashNewlineIsSpace {
+    -- A backslash-newline (built at run time so the trigger stays one
+    -- line) plus following spaces collapses to a single space.
+    when: Evaluates("set s \"a\\\\[format %c 10]   b\"; subst $s")
+    ensures: completion.code = ok
+    ensures: completion.value = "a b"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstBackslashTabIsSingleCharacter {
+    -- \t yields one tab character (length 3, mapped to T).
+    when: Evaluates("list [string length [subst {a\\tb}]] [string map {\\t T} [subst {a\\tb}]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 aTb"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstBackslashEscapesMetaCharacters {
+    -- \$ \[ \] \{ \} all substitute to the bare character, so the escaped
+    -- text is not rescanned as a variable or command.
+    when: Evaluates("subst {a\\$b\\[c\\]d\\{e\\}}")
+    ensures: completion.code = ok
+    ensures: completion.value = "a$b[c]d{e}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstBackslashUnicodeEscape {
+    -- \uXXXX takes up to four hex digits; \u0041 is A.
+    when: Evaluates("subst {a\\u0041b}")
+    ensures: completion.code = ok
+    ensures: completion.value = "aAb"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstBackslashHexOctalAndNulEscapes {
+    -- \x takes at most two hex digits (\x4b is K), octal takes up to
+    -- three (\101 is A), and \0 inserts a NUL byte (length 3 here).
+    when: Evaluates("list [subst {a\\x4b}] [subst {a\\101b}] [string length [subst {a\\0b}]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "aK aAb 3"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstUnknownBackslashEscapeDropsSlash {
+    -- An unknown escape drops the backslash and keeps the character.
+    when: Evaluates("list [subst {a\\qb}] [subst {a\\ b}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "aqb {a b}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstTrailingBackslashIsLiteral {
+    -- A backslash at end of the string is literal, not an error.
+    when: Evaluates("set s \"a\\\\\"; list [string length [subst $s]] [string equal [subst $s] $s]")
+    ensures: completion.code = ok
+    ensures: completion.value = "2 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── command substitution ────────────────────────────────────────
+
+rule SubstNestedCommandSubstitution {
+    -- Brackets nest through full command parsing.
+    when: Evaluates("subst {a[expr 1+[expr 2+3]]b}")
+    ensures: completion.code = ok
+    ensures: completion.value = "a6b"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstCommandResultIsNotRescanned {
+    -- The command's result is inserted literally; a bracket pair in the
+    -- result is not evaluated a second time.
+    when: Evaluates("set c {[expr 1+1]}; subst {[set c]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "[expr 1+1]"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstEmptyCommandSubstitutesEmpty {
+    -- An empty command substitution is well formed and contributes nothing.
+    when: Evaluates("subst {a[]b}")
+    ensures: completion.code = ok
+    ensures: completion.value = "ab"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstCommandsApplyInsideLiteralBraces {
+    -- Braces are literal text but do not shield a bracketed command.
+    when: Evaluates("subst {a{[expr 1+1]}b}")
+    ensures: completion.code = ok
+    ensures: completion.value = "a{2}b"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstCommandUsesFullTclSyntax {
+    -- Inside brackets the normal Tcl parser applies (quotes, format args).
+    when: Evaluates("subst {[format {%s-%s} a b]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "a-b"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstCommandErrorPropagates {
+    -- An error inside a command substitution aborts subst and becomes the
+    -- command's error.
+    when: Evaluates("catch {subst {a[error boom]b}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "boom"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstBreakTruncatesAtSubstitution {
+    -- break during command substitution stops the whole subst; the result
+    -- is the text before the substitution that raised it.
+    when: Evaluates("subst {abc,[break],def}")
+    ensures: completion.code = ok
+    ensures: completion.value = "abc,"
+    -- doc/subst.n EXAMPLES
+}
+
+rule SubstContinueSubstitutesEmpty {
+    -- continue substitutes the empty string for that one substitution and
+    -- continues with the rest.
+    when: Evaluates("subst {abc,[continue],def}")
+    ensures: completion.code = ok
+    ensures: completion.value = "abc,,def"
+    -- doc/subst.n EXAMPLES
+}
+
+rule SubstReturnSubstitutesValue {
+    -- A return exception is caught: its value is substituted for that
+    -- substitution and the rest continues.
+    when: Evaluates("subst {abc,[return foo;expr {1+2}],def}")
+    ensures: completion.code = ok
+    ensures: completion.value = "abc,foo,def"
+    -- doc/subst.n EXAMPLES
+}
+
+rule SubstReturnCustomCodeSubstitutesValue {
+    -- Any non-ok, non-error return code is caught the same way.
+    when: Evaluates("subst {abc,[return -code 10 foo],def}")
+    ensures: completion.code = ok
+    ensures: completion.value = "abc,foo,def"
+    -- doc/subst.n EXAMPLES
+}
+
+rule SubstReturnErrorCodeSubstitutesValue {
+    -- Even return -code error is a return completion at this point, so its
+    -- value is substituted rather than turning into an error.
+    when: Evaluates("subst {abc,[return -code error foo],def}")
+    ensures: completion.code = ok
+    ensures: completion.value = "abc,foo,def"
+    -- probe: 2026-11-28 tclsh9.1 (surprise; raw code is return)
+}
+
+-- ── variable substitution ───────────────────────────────────────
+
+rule SubstScalarVariable {
+    when: Evaluates("set ab cd; subst {$ab}")
+    ensures: completion.code = ok
+    ensures: completion.value = "cd"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstVariableNameIncludesArrayIndex {
+    -- $ab(x) is one array-element reference, not $ab followed by (x).
+    when: Evaluates("set ab(x) v; subst {<$ab(x)>}")
+    ensures: completion.code = ok
+    ensures: completion.value = "<v>"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstArrayElementSubstitutes {
+    when: Evaluates("set a(k) v; subst {x$a(k)y}")
+    ensures: completion.code = ok
+    ensures: completion.value = "xvy"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstBracedVariableName {
+    when: Evaluates("set ab cd; subst {${ab}}")
+    ensures: completion.code = ok
+    ensures: completion.value = "cd"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstBracedArrayElement {
+    -- ${...} may contain an array reference too.
+    when: Evaluates("set a(k) v; subst {${a(k)}}")
+    ensures: completion.code = ok
+    ensures: completion.value = "v"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstBracedNameAcceptsSpecialCharacters {
+    -- The braced form admits characters a bare $name would stop at.
+    when: Evaluates("set {a-b} v; subst {${a-b}}")
+    ensures: completion.code = ok
+    ensures: completion.value = "v"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstArrayIndexIsSubstituted {
+    -- The text between ( and ) is itself substituted before lookup.
+    when: Evaluates("set b 2; set a(2) v; subst {$a($b)}")
+    ensures: completion.code = ok
+    ensures: completion.value = "v"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstCommandSubstitutionStillSubstitutesVariables {
+    -- -novariables does not leak into commands: [format $a] still resolves
+    -- $a while the top-level $a stays literal.
+    when: Evaluates("set a 44; subst -novariables {$a [format $a]}")
+    ensures: completion.code = ok
+    ensures: completion.value = "$a 44"
+    -- doc/subst.n EXAMPLES
+}
+
+rule SubstVariableIndexStillRunsCommands {
+    -- -nocommands does not leak into variable substitution: the array
+    -- index $a([b]) executes [b] even though top-level [ is literal.
+    when: Evaluates("proc b {} {return c}; array set a {c c [b] tricky}; subst -nocommands {[b] $a([b])}")
+    ensures: completion.code = ok
+    ensures: completion.value = "[b] c"
+    -- doc/subst.n EXAMPLES
+}
+
+rule SubstUndefinedVariableIsError {
+    when: Evaluates("catch {subst {$nosuch}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "can't read \"nosuch\": no such variable"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstUndefinedArrayElementIsError {
+    when: Evaluates("array set a {k v}; catch {subst {$a(nokey)}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "can't read \"a(nokey)\": no such element in array"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstScalarUsedAsArrayIsError {
+    when: Evaluates("set a 5; catch {subst {$a(k)}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "can't read \"a(k)\": variable isn't array"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstNamespaceQualifiedVariable {
+    -- Both bare and braced forms accept namespace-qualified names.
+    when: Evaluates("namespace eval n {variable v 7}; list [subst {$n::v}] [subst {${n::v}}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "7 7"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstLoneDollarIsLiteral {
+    -- A $ not followed by a variable name is ordinary text.
+    when: Evaluates("list [subst {$}] [subst {$ }]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{$} {$ }"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstEmptyBracedNameIsError {
+    -- ${} names the empty variable and fails at lookup.
+    when: Evaluates("catch {subst [format {$%c%c} 123 125]} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "can't read \"\": no such variable"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── malformed input ─────────────────────────────────────────────
+
+rule SubstUnmatchedBracketIsError {
+    -- The string is built at run time so the trigger keeps its braces
+    -- balanced.
+    when: Evaluates("catch {subst [format {abc%c} 91]} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "missing close-bracket"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstUnmatchedBraceInCommandIsError {
+    -- Braces inside a command substitution are real grouping syntax.
+    when: Evaluates("catch {subst [format {[list %cabc} 123]} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "missing close-brace"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstMissingQuoteInCommandIsError {
+    -- Quotes are real syntax inside a command substitution.
+    when: Evaluates("catch {subst [format {[format %ca} 34]} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "missing \""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstExtraCharactersAfterCloseBrace {
+    -- A braced word glued to more characters is a parse error inside the
+    -- command substitution.
+    when: Evaluates("catch {subst {[list {a}b]}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "extra characters after close-brace"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstExtraCharactersAfterCloseQuote {
+    when: Evaluates("catch {subst {[list \"a\"b]}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "extra characters after close-quote"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstUnclosedVariableBraceIsError {
+    -- ${ without its } has a dedicated message.
+    when: Evaluates("catch {subst [format {$%cabc} 123]} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "missing close-brace for variable name"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule SubstUnclosedArrayIndexIsError {
+    -- An unclosed array index reports missing ), not a brace error.
+    when: Evaluates("catch {subst {x$a(}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "missing )"
+    -- probe: 2026-11-28 tclsh9.1
+}

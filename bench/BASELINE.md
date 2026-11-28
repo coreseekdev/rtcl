@@ -3098,3 +3098,34 @@ sweep 12 既有、workspace **cargo exit 0**（rtcl-vm 871/0）、wasm32 ✓、
 - wasm 体积 **-3001B（-0.09%）**。
 - 保留未修：dead_flat/flat_aliases/ns_transient/upvars 本体（步骤 5
   面）；baseexists 分歧（链接面独立批）。
+
+## D1 步骤 5——删镜像/对拍块与链接面决策（task/d1-vars5 @ a111a51/4975554，2026-11-28，子代理施工）
+
+- **删除**（净 −921 行；vars.rs 5726→4919，含 call/mod/misc/vararena
+  合计净 −905）：Interp 级镜像（globals/array_globals/elem_counts/
+  phantom_globals/var_order——release 仍 push 但零读）、CallFrame 级
+  （locals/array_locals/elem_counts）、全部 debug 对拍块与快径镜像断
+  言、死代码（stack_ns_elem_keys/loc_get/loc_remove/loc_elem_count_bump/
+  with_var_slot_link/array_stamp_key/normalise_ns/full_key/
+  TraceSet::record_count/Interp::scope_vars）。
+- **locals_order 重放路径保留**（T3 直列未完全走 vt 插入序——链接条目
+  只入日志不入 vt，合流风险在 T3 逐字节红线；vt 插入序≡日志序已由
+  步骤 2-4 对拍证毕，重放源留任，决策注记落 CallFrame.locals_order）。
+- **链接面全保留**（注记落各面 doc）：upvars（链接名可无 vt 条目、
+  Dead 惰性探测即语义）、flat_aliases/dead_flat（前置重写层非
+  per-Var 态）、ns_transient（take/恢复挂 ns-eval 体进出）、
+  drop_frame_global_links（keep-alive 需扇入记账；UNDEFINED 位+upvars
+  扫描零平行存储实现同语义）。
+- wasm 体积：release raw +885B（布局抖动——native release 反而
+  -3232B）；**如实结论**：镜像本就是 debug 域，release/wasm 从未编
+  译，本步无 wasm 回收空间（步骤 1 的 +25.6KB 是 arena 机制本体）。
+- 门禁（提交树）：judge **95/95**（release 三跑+debug 构建独立循环）、
+  crash-gate 128/128、probes 398/76（名单与基线逐项同）、sweep 12 既
+  有、rtcl-vm 889/0 std+nostd、workspace exit 0、wasm32 ✓。
+- 基准（ABBA 交错 vs bf1e6f6 独立构建）：var_incr +1.1%、dict_ops
+  -3.3%、list_ops **-7.2%**、proc_fib +2.0%、arith_loop cycles 钉核
+  -3.6%；ns 体持平；t7 数组 write-old **-6.4%**；RSS 持平略好。
+- **遗留**：t7 read-50k +3.6~6.0%（三安静窗一致，该路径本步零
+  release 逻辑变化——归布局类，同步骤 4 先例，建议符号化构建定位）；
+  frame info_locals list 段 +12~13%（cycles min 持平 +0.7%——邻居满
+  载污染，挂观察）；链接面 baseexists 分歧（独立批）。

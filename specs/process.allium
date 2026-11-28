@@ -1,0 +1,845 @@
+-- allium: 3
+-- process.allium
+-- Behaviour spec: process, environment and file-system-adjacent commands —
+-- glob, exec, cd/pwd, source, the env array, child-process exit, fblocked,
+-- flush, open access modes, and the 9.1 file system/home/channels faces.
+-- Oracle: tclsh 9.1.0 (core-9-1-0).
+--
+-- Scope notes. This file owns the process/environment surface that
+-- io.allium (base open/gets/puts/read/seek/eof/close), utility.allium
+-- (pid/history/zlib) and error-deep.allium (uncatchable exit) do not cover.
+-- `exit` is pinned only through a child process: an in-process exit would
+-- terminate the interpreter under specification.
+--
+-- 9.1 glob differs from the 8.6 spec round in two ways that are pinned
+-- below: no-match is an empty result, not an error (Tcl 9.0 made
+-- -nocomplain behaviour the default, doc/glob.n), and the result order is
+-- arbitrary (doc/glob.n "No particular order is guaranteed"). Rules
+-- therefore pin set membership via lsort, never raw order.
+--
+-- Every when: is a single-line, self-contained script. Temp paths are
+-- fixed under /tmp and removed inside the script; channel names in error
+-- text are normalised with regsub to CH. Absolute temp paths that appear
+-- in values are file-tailed or string-matched.
+
+use "./interp.allium" as interp
+
+given {
+    completion: interp/Completion
+}
+
+-- ── glob ─────────────────────────────────────────────────────────
+-- Probes: 2026-11-28 tclsh9.1. No-match is empty (0 0), -nocomplain is a
+-- no-op, and glob does not sort (a c b creation order can come back as
+-- b a c); doc/glob.n documents both.
+
+rule GlobNoMatchIsEmptyNotError {
+    -- In 9.1 a pattern that matches nothing returns the empty list; it is
+    -- no longer an error (Tcl 9.0 made -nocomplain the default).
+    when: Evaluates("list [catch {glob /tmp/rt_p_no_such_glob_zz9*} m] [string length $m]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0"
+    -- probe: 2026-11-28 tclsh9.1; doc/glob.n -nocomplain
+}
+
+rule GlobNocomplainIsNoOp {
+    -- -nocomplain no longer changes the outcome; both forms are empty.
+    when: Evaluates("list [llength [glob -nocomplain /tmp/rt_p_no_such_glob_zz9*]] [llength [glob /tmp/rt_p_no_such_glob_zz9*]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule GlobDirectoryReturnsFullPaths {
+    -- -directory prefixes each result with the directory; membership is
+    -- pinned (order is arbitrary), so tails are sorted and $d/a is
+    -- searched exactly.
+    when: Evaluates("set d /tmp/rt_p_glob1; file delete -force $d; file mkdir $d; foreach n {c a b} {close [open $d/$n w]}; set r [glob -directory $d *]; set v [list [llength $r] [lsort [lmap x $r {file tail $x}]] [expr {[lsearch -exact $r \"$d/a\"] >= 0}]]; file delete -force $d; set v")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 {a b c} 1"
+    -- probe: 2026-11-28 tclsh9.1 (raw order was b a c)
+}
+
+rule GlobTailsReturnsBareNames {
+    -- -tails strips the -directory prefix from each result.
+    when: Evaluates("set d /tmp/rt_p_glob2; file delete -force $d; file mkdir $d; foreach n {c a b} {close [open $d/$n w]}; set r [lsort [glob -directory $d -tails *]]; file delete -force $d; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "a b c"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule GlobBraceExpansion {
+    -- Brace alternatives expand inside a pattern before matching, so both
+    -- extensions are selected.
+    when: Evaluates("set d /tmp/rt_p_glob3; file delete -force $d; file mkdir $d; foreach n {a.txt b.txt c.dat} {close [open $d/$n w]}; set r [lsort [glob -directory $d -tails *.{txt,dat}]]; file delete -force $d; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "a.txt b.txt c.dat"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule GlobQuestionMarkMatchesOneChar {
+    when: Evaluates("set d /tmp/rt_p_glob4; file delete -force $d; file mkdir $d; foreach n {aa ab ba} {close [open $d/$n w]}; set r [lsort [glob -directory $d -tails a?]]; file delete -force $d; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "aa ab"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule GlobBracketClass {
+    -- A bracket class matches exactly one character from the set.
+    when: Evaluates("set d /tmp/rt_p_glob5; file delete -force $d; file mkdir $d; foreach n {aa ba ca} {close [open $d/$n w]}; set r [lsort [glob -directory $d -tails {[ab]a}]]; file delete -force $d; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "aa ba"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule GlobTypesDirectory {
+    -- -types d keeps directories only (the file f is filtered out).
+    when: Evaluates("set d /tmp/rt_p_glob6; file delete -force $d; file mkdir $d/sub; close [open $d/f w]; set r [glob -directory $d -tails -types d *]; file delete -force $d; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "sub"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule GlobTypesHiddenIncludesDotEntries {
+    -- -types hidden selects dot entries; notably it includes "." and ".."
+    -- as well as dotfiles.
+    when: Evaluates("set d /tmp/rt_p_glob7; file delete -force $d; file mkdir $d; close [open $d/.hid w]; close [open $d/vis w]; set r [lsort [glob -directory $d -tails -types hidden *]]; file delete -force $d; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = ". .. .hid"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule GlobExplicitDotPattern {
+    -- An explicit leading-dot pattern sees . and .. too; the same result
+    -- as -types hidden without the type filter.
+    when: Evaluates("set d /tmp/rt_p_glob8; file delete -force $d; file mkdir $d; close [open $d/.hid w]; close [open $d/vis w]; set r [lsort [glob -directory $d -tails .*]]; file delete -force $d; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = ". .. .hid"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule GlobUnionOfPatterns {
+    -- Multiple patterns contribute one union; duplicates are not repeated.
+    when: Evaluates("set d /tmp/rt_p_glob9; file delete -force $d; file mkdir $d; foreach n {a1 a2 c1} {close [open $d/$n w]}; set r [lsort [glob -directory $d -tails a* c*]]; file delete -force $d; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "a1 a2 c1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule GlobBadTypesMessage {
+    when: Evaluates("catch {glob -types zzz *} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad argument to \"-types\": zzz"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule GlobTailsRequiresDirectory {
+    -- -tails is only meaningful with -directory or -path.
+    when: Evaluates("catch {glob -tails /tmp/*} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "\"-tails\" must be used with either \"-directory\" or \"-path\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule GlobMissingDirectoryIsEmpty {
+    -- A missing -directory is a no-match, not an error.
+    when: Evaluates("list [catch {glob -directory /tmp/rt_p_no_such_dir_zz9 *} m] [string length $m]")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── exec ─────────────────────────────────────────────────────────
+-- Probes: 2026-11-28 tclsh9.1 on Linux. exec does not invoke a shell:
+-- arguments are passed verbatim; only Tcl redirect operators are special.
+
+rule ExecTrimsTrailingNewline {
+    -- exec strips exactly one trailing newline; -keepnewline keeps it,
+    -- and an extra newline survives the strip.
+    when: Evaluates("list [exec echo hi] [string length [exec -keepnewline echo hi]] [string length [exec printf {a\\n\\n}]]")
+    ensures: completion.code = ok
+    ensures: completion.value = "hi 3 2"
+    -- probe: 2026-11-28 tclsh9.1; doc/exec.n
+}
+
+rule ExecStderrMergedIntoStdout {
+    -- 2>@1 redirects the child's stderr onto the captured stdout.
+    when: Evaluates("exec sh -c {echo E >&2} 2>@1")
+    ensures: completion.code = ok
+    ensures: completion.value = "E"
+    -- probe: 2026-11-28 tclsh9.1; doc/exec.n
+}
+
+rule ExecIgnoresstderrDropsStderr {
+    -- -ignorestderr discards the child's stderr instead of merging it.
+    when: Evaluates("exec -ignorestderr sh -c {echo E >&2; echo O}")
+    ensures: completion.code = ok
+    ensures: completion.value = "O"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ExecPipelineCapturesLastStage {
+    -- A single | builds a pipeline; the result is the last stage's stdout.
+    when: Evaluates("exec echo abc | tr a-z A-Z")
+    ensures: completion.code = ok
+    ensures: completion.value = "ABC"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ExecInputRedirect {
+    -- < feeds a file to the child's stdin.
+    when: Evaluates("exec echo abc > /tmp/rt_p_e_in; set r [exec cat < /tmp/rt_p_e_in]; file delete /tmp/rt_p_e_in; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "abc"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ExecOutputRedirect {
+    -- > sends the child's stdout to a file (3 bytes: "hi\n").
+    when: Evaluates("file delete /tmp/rt_p_e_out; exec echo hi > /tmp/rt_p_e_out; set f [open /tmp/rt_p_e_out r]; set r [read $f]; close $f; set n [file size /tmp/rt_p_e_out]; file delete /tmp/rt_p_e_out; list $n [string trimright $r]")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 hi"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ExecExitStatusErrorcode {
+    -- A non-zero child status is an error with CHILDSTATUS, the exit code
+    -- as the third element, and the standard message.
+    when: Evaluates("catch {exec sh -c {exit 3}} m o; set ec [dict get $o -errorcode]; list [lindex $ec 0] [lindex $ec 2] $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "CHILDSTATUS 3 {child process exited abnormally}"
+    -- probe: 2026-11-28 tclsh9.1; doc/exec.n
+}
+
+rule ExecSignalErrorcode {
+    -- A signal death reports CHILDKILLED plus the signal name.
+    when: Evaluates("catch {exec sh -c {kill -TERM $$}} m o; set ec [dict get $o -errorcode]; list [lindex $ec 0] [lindex $ec 2]")
+    ensures: completion.code = ok
+    ensures: completion.value = "CHILDKILLED SIGTERM"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ExecNotFoundErrorcode {
+    -- An unlaunchable program is POSIX ENOENT, not CHILDSTATUS.
+    when: Evaluates("catch {exec /tmp/rt_p_no_such_bin_zz9} m o; list [dict get $o -errorcode] [string match {couldn't execute \"/tmp/rt_p_no_such_bin_zz9\": no such file or directory} $m]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{POSIX ENOENT {no such file or directory}} 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ExecArgumentNoWordSplitting {
+    -- A braced argument reaches the child as one argument, and a bare "*"
+    -- is not glob-expanded by exec.
+    when: Evaluates("list [exec echo {a b}] [exec echo *]")
+    ensures: completion.code = ok
+    ensures: completion.value = "{a b} *"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ExecStderrBecomesFailureMessage {
+    -- With no explicit redirect, a failing child's stderr becomes the
+    -- error message (and also appears on the parent's stderr).
+    when: Evaluates("catch {exec sh -c {echo boom >&2; exit 1}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "boom"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ExecNoArgsMessage {
+    when: Evaluates("catch {exec} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"exec ?-option ...? arg ?arg ...?\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ExecBadSwitchMenu {
+    -- The switch menu order is the implementation order, not alphabetical.
+    when: Evaluates("catch {exec -bogus ls} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "bad option \"-bogus\": must be -ignorestderr, -keepnewline, -encoding, or --"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ExecChildErrorStatus {
+    -- A child that ends in `error` still reports CHILDSTATUS; the error
+    -- text propagates through the exec error message.
+    when: Evaluates("set f /tmp/rt_p_xe.tcl; exec echo {error boom} > $f; catch {exec [info nameofexecutable] $f} m o; set ec [dict get $o -errorcode]; file delete $f; list [lindex $ec 0] [string match {*boom*} $m]")
+    ensures: completion.code = ok
+    ensures: completion.value = "CHILDSTATUS 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── cd / pwd ─────────────────────────────────────────────────────
+-- Probes: 2026-11-28 tclsh9.1. cd does not expand ~ in 9.1 and uses
+-- $env(HOME) for the no-argument form.
+
+rule ProcPwdRoundTripsThroughCd {
+    -- cd/pwd round-trip; pwd reports the physical absolute path.
+    when: Evaluates("set d [pwd]; cd /tmp; set p [pwd]; cd $d; list $p [expr {[pwd] eq $d}]")
+    ensures: completion.code = ok
+    ensures: completion.value = "/tmp 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcCdParentTraversal {
+    when: Evaluates("cd /tmp; cd ..; pwd")
+    ensures: completion.code = ok
+    ensures: completion.value = "/"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcCdMissingDirectory {
+    -- The message names the target and the errno text.
+    when: Evaluates("catch {cd /tmp/rt_p_no_such_dir_zz9} m; string match {couldn't change working directory to *: no such file or directory} $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcCdToFile {
+    when: Evaluates("close [open /tmp/rt_p_cd_file w]; catch {cd /tmp/rt_p_cd_file} m; file delete /tmp/rt_p_cd_file; string match {couldn't change working directory to *: not a directory} $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcCdNoHomeErrors {
+    -- With no argument and HOME unset, cd reports the missing variable.
+    when: Evaluates("unset -nocomplain env(HOME); catch {cd} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "couldn't find HOME environment variable to expand path"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcCdEmptyHome {
+    when: Evaluates("set env(HOME) {}; catch {cd} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "couldn't change working directory to \"\": no such file or directory"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcCdDoesNotExpandTilde {
+    -- 9.0 removed automatic ~ expansion: cd treats it as a literal name.
+    when: Evaluates("catch {cd ~} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "couldn't change working directory to \"~\": no such file or directory"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcCdUsesHome {
+    -- No-argument cd changes to $env(HOME).
+    when: Evaluates("set d /tmp/rt_p_cdh; file mkdir $d; set env(HOME) $d; cd; set r [pwd]; cd /; file delete -force $d; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "/tmp/rt_p_cdh"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcCdWrongArgs {
+    when: Evaluates("catch {cd /tmp /var} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"cd ?dirName?\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcPwdWrongArgs {
+    when: Evaluates("catch {pwd x} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"pwd\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── source ───────────────────────────────────────────────────────
+-- Probes: 2026-11-28 tclsh9.1. A sourced file runs in the caller's
+-- frame; `return` at its top level is a normal (ok) completion of source.
+
+rule ProcSourceReturnsLastValue {
+    when: Evaluates("exec echo {set x 42} > /tmp/rt_p_s1.tcl; set r [source /tmp/rt_p_s1.tcl]; file delete /tmp/rt_p_s1.tcl; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "42"
+    -- probe: 2026-11-28 tclsh9.1; doc/source.n
+}
+
+rule ProcSourcePropagatesError {
+    when: Evaluates("exec echo {error boom} > /tmp/rt_p_s2.tcl; set c [catch {source /tmp/rt_p_s2.tcl} m]; file delete /tmp/rt_p_s2.tcl; list $c $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 boom"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcSourceReturnIsOkCompletion {
+    -- A top-level `return` in a sourced file is absorbed by source: the
+    -- caller sees an ok completion with the payload value.
+    when: Evaluates("exec echo {return hi} > /tmp/rt_p_s3.tcl; set c [catch {source /tmp/rt_p_s3.tcl} m]; file delete /tmp/rt_p_s3.tcl; list $c $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 hi"
+    -- probe: 2026-11-28 tclsh9.1 (break/continue are not absorbed)
+}
+
+rule ProcSourceBreakContinueCodes {
+    -- break and continue are not absorbed; catch sees codes 3 and 4.
+    when: Evaluates("exec echo break > /tmp/rt_p_s4a.tcl; exec echo continue > /tmp/rt_p_s4b.tcl; set r [list [catch {source /tmp/rt_p_s4a.tcl}] [catch {source /tmp/rt_p_s4b.tcl}]]; file delete /tmp/rt_p_s4a.tcl /tmp/rt_p_s4b.tcl; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 4"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcSourceMissingFile {
+    when: Evaluates("catch {source /tmp/rt_p_no_such_src_zz.tcl} m; string match {couldn't read file *: no such file or directory} $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcSourceNested {
+    -- An inner source runs in the same global frame as the outer one.
+    when: Evaluates("exec echo {set y 7} > /tmp/rt_p_s6b.tcl; exec echo {source /tmp/rt_p_s6b.tcl} > /tmp/rt_p_s6a.tcl; set r [source /tmp/rt_p_s6a.tcl]; file delete /tmp/rt_p_s6a.tcl /tmp/rt_p_s6b.tcl; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "7"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcSourceEncodingOption {
+    -- source takes -encoding; the named encoding decodes the file before
+    -- evaluation.
+    when: Evaluates("exec echo {expr {2+2}} > /tmp/rt_p_s7.tcl; set r [source -encoding utf-8 /tmp/rt_p_s7.tcl]; file delete /tmp/rt_p_s7.tcl; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "4"
+    -- probe: 2026-11-28 tclsh9.1; doc/source.n
+}
+
+rule ProcSourceUnknownEncoding {
+    when: Evaluates("exec echo {expr 1} > /tmp/rt_p_s8.tcl; catch {source -encoding bogus /tmp/rt_p_s8.tcl} m; file delete /tmp/rt_p_s8.tcl; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unknown encoding \"bogus\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcSourceDirectoryError {
+    when: Evaluates("catch {source /tmp} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "couldn't read file \"/tmp\": is a directory"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── env array ────────────────────────────────────────────────────
+-- Probes: 2026-11-28 tclsh9.1. env is a global array initialised from the
+-- process environment; children inherit its current contents.
+
+rule EnvSetAndRead {
+    when: Evaluates("set env(RTCL_T) v; list [info exists env(RTCL_T)] $env(RTCL_T)")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 v"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule EnvUnsetRemoves {
+    when: Evaluates("set env(RTCL_T) v; unset env(RTCL_T); info exists env(RTCL_T)")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule EnvIsArray {
+    -- env is an array with the inherited names (PATH is present here).
+    when: Evaluates("list [array exists env] [expr {[llength [array names env]] > 0}] [info exists env(PATH)]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule EnvIsGlobal {
+    -- env is a global variable visible through `global env` in a proc.
+    when: Evaluates("proc p {} {global env; info exists env(PATH)}; p")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule EnvChildSeesSetValue {
+    when: Evaluates("set env(RTCL_CHILD) hello; exec sh -c {printf %s \"$RTCL_CHILD\"}")
+    ensures: completion.code = ok
+    ensures: completion.value = "hello"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule EnvChildDoesNotSeeUnset {
+    when: Evaluates("set env(RTCL_GONE) x; unset env(RTCL_GONE); exec sh -c {if [ -z \"$RTCL_GONE\" ]; then echo gone; fi}")
+    ensures: completion.code = ok
+    ensures: completion.value = "gone"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule EnvValuePassedVerbatim {
+    -- Spaces in an element value survive into the child's environment.
+    when: Evaluates("set env(RTCL_A) {x y}; exec sh -c {printf %s \"$RTCL_A\"}")
+    ensures: completion.code = ok
+    ensures: completion.value = "x y"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule EnvEmptyValueVisibleToChild {
+    -- An element set to the empty string is exported as an empty value.
+    when: Evaluates("set env(RTCL_EMPTY) {}; exec sh -c {test -z \"$RTCL_EMPTY\" && echo empty}")
+    ensures: completion.code = ok
+    ensures: completion.value = "empty"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── exit (child process only) ────────────────────────────────────
+-- Probes: 2026-11-28 tclsh9.1. Each rule writes a temp script and runs it
+-- with [info nameofexecutable]; the interpreter under specification never
+-- executes exit in-process.
+
+rule ProcExitChildStatus {
+    when: Evaluates("set f /tmp/rt_p_x42.tcl; exec echo {exit 42} > $f; catch {exec [info nameofexecutable] $f} m o; set ec [dict get $o -errorcode]; file delete $f; list [lindex $ec 0] [lindex $ec 2]")
+    ensures: completion.code = ok
+    ensures: completion.value = "CHILDSTATUS 42"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcExitDefaultZero {
+    -- Bare exit uses status 0, so exec reports success.
+    when: Evaluates("set f /tmp/rt_p_x0.tcl; exec echo {exit} > $f; set r [catch {exec [info nameofexecutable] $f} m]; file delete $f; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcExitExplicitZero {
+    when: Evaluates("set f /tmp/rt_p_x0b.tcl; exec echo {exit 0} > $f; set r [catch {exec [info nameofexecutable] $f} m]; file delete $f; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcExitBadCodeFailsChild {
+    -- A non-integer exit argument makes the child fail with its own error;
+    -- the parent sees a normal exec failure.
+    when: Evaluates("set f /tmp/rt_p_xb.tcl; exec echo {exit abc} > $f; catch {exec [info nameofexecutable] $f} m; file delete $f; string match {*expected integer*} $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── fblocked / flush ─────────────────────────────────────────────
+-- Probes: 2026-11-28 tclsh9.1. fblocked reports whether the channel's
+-- input buffer is empty after a non-blocking read; regular files are never
+-- blocked. Channel numbers in error text are normalised to CH.
+
+rule ProcFblockedRegularFile {
+    -- A regular file is always readable: fblocked stays 0 before and after
+    -- a full read.
+    when: Evaluates("exec printf abc > /tmp/rt_p_fb1; set f [open /tmp/rt_p_fb1 r]; set a [fblocked $f]; set r [read $f]; set b [fblocked $f]; close $f; file delete /tmp/rt_p_fb1; list $a $b $r")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 0 abc"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcFblockedRegularFileAfterPartialRead {
+    when: Evaluates("exec printf abc > /tmp/rt_p_fb2; set f [open /tmp/rt_p_fb2 r]; read $f 1; set b [fblocked $f]; close $f; file delete /tmp/rt_p_fb2; set b")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcFblockedPipeNoData {
+    -- A fresh pipe read end reports 0 before any read is attempted.
+    when: Evaluates("lassign [chan pipe] r w; set a [fblocked $r]; close $r; close $w; set a")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcFblockedPipeDataAvailable {
+    -- With data buffered, fblocked is 0 and the data can be read.
+    when: Evaluates("exec printf x > /tmp/rt_p_fbs; lassign [chan pipe] r w; set s [open /tmp/rt_p_fbs r]; fcopy $s $w; set a [fblocked $r]; close $s; close $w; set d [read $r]; close $r; file delete /tmp/rt_p_fbs; list $a $d")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 x"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcFblockedNonblockingReadMarksBlocked {
+    -- On a non-blocking pipe, read returns "" when no data is buffered and
+    -- the following fblocked is 1.
+    when: Evaluates("lassign [chan pipe] r w; fconfigure $r -blocking 0; set d [read $r]; set a [fblocked $r]; close $r; close $w; list $d $a")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcFblockedNonblockingDataThenBlocked {
+    -- After consuming the only buffered byte, the non-blocking pipe is
+    -- blocked again (1).
+    when: Evaluates("exec printf x > /tmp/rt_p_fbs2; lassign [chan pipe] r w; set s [open /tmp/rt_p_fbs2 r]; fcopy $s $w; fconfigure $r -blocking 0; set d [read $r]; set a [fblocked $r]; close $s; close $w; close $r; file delete /tmp/rt_p_fbs2; list $d $a")
+    ensures: completion.code = ok
+    ensures: completion.value = "x 1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcFblockedWriteOnlyError {
+    -- fblocked requires an input channel.
+    when: Evaluates("set f [open /tmp/rt_p_fbw w]; set c [catch {fblocked $f} m]; close $f; file delete /tmp/rt_p_fbw; list $c [regsub {file[0-9]+} $m CH]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 {channel \"CH\" wasn't opened for reading}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcFblockedWrongArgs {
+    when: Evaluates("catch {fblocked} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"fblocked channel\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcFblockedUnknownChannel {
+    when: Evaluates("catch {fblocked nosuchchan} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "can not find channel named \"nosuchchan\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcFlushRegularFilePersists {
+    -- flush on a regular file returns "" and the data is already visible
+    -- to file size.
+    when: Evaluates("exec printf abc > /tmp/rt_p_fl_src; set f [open /tmp/rt_p_fl_out w]; set s [open /tmp/rt_p_fl_src r]; fcopy $s $f; set a [flush $f]; close $s; close $f; set n [file size /tmp/rt_p_fl_out]; file delete /tmp/rt_p_fl_src /tmp/rt_p_fl_out; list $a $n")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 3"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcFlushPipeReturnsEmpty {
+    -- Flushing an empty pipe writer is silent; the reader then sees EOF.
+    when: Evaluates("lassign [chan pipe] r w; set a [flush $w]; close $w; set d [read $r]; close $r; list $a $d")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} {}"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcFlushPipelinePersists {
+    -- Flushing a pipeline writer pushes the bytes through to the child.
+    when: Evaluates("exec printf abc > /tmp/rt_p_fl_src2; set p [open {|cat > /tmp/rt_p_fl_pipe} w]; set s [open /tmp/rt_p_fl_src2 r]; fcopy $s $p; set a [flush $p]; close $s; close $p; set n [file size /tmp/rt_p_fl_pipe]; file delete /tmp/rt_p_fl_src2 /tmp/rt_p_fl_pipe; list $a $n")
+    ensures: completion.code = ok
+    ensures: completion.value = "{} 3"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcFlushStdoutEmpty {
+    when: Evaluates("flush stdout")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcFlushReadOnlyError {
+    -- flush requires an output channel.
+    when: Evaluates("exec printf abc > /tmp/rt_p_fl_ro; set f [open /tmp/rt_p_fl_ro r]; catch {flush $f} m; close $f; file delete /tmp/rt_p_fl_ro; regsub {file[0-9]+} $m CH")
+    ensures: completion.code = ok
+    ensures: completion.value = "channel \"CH\" wasn't opened for writing"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── open access modes not in io.allium ───────────────────────────
+-- Probes: 2026-11-28 tclsh9.1; doc/open.n. 9.1 open accepts exactly
+-- fileName ?access? ?permissions?; channel options belong to fconfigure.
+-- There is no "x" access mode: exclusive create is CREAT+EXCL.
+
+rule ProcOpenAppendPlusStartsAtEnd {
+    -- a+ positions a pre-existing file at its end (tell 3), so the first
+    -- read sees EOF.
+    when: Evaluates("exec printf abc > /tmp/rt_p_oap; set f [open /tmp/rt_p_oap a+]; set t [tell $f]; set r [read $f]; set t2 [tell $f]; close $f; file delete /tmp/rt_p_oap; list $t [string length $r] $t2")
+    ensures: completion.code = ok
+    ensures: completion.value = "3 0 3"
+    -- probe: 2026-11-28 tclsh9.1; doc/open.n (a+)
+}
+
+rule ProcOpenAppendPlusWritesAtEnd {
+    -- a+ writes append regardless of the read position.
+    when: Evaluates("exec printf abc > /tmp/rt_p_oap2; exec printf Z > /tmp/rt_p_oap2z; set f [open /tmp/rt_p_oap2 a+]; set s [open /tmp/rt_p_oap2z r]; fcopy $s $f; close $s; close $f; set f [open /tmp/rt_p_oap2 r]; set r [read $f]; close $f; file delete /tmp/rt_p_oap2 /tmp/rt_p_oap2z; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "abcZ"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcOpenWritePlusTruncates {
+    -- w+ truncates an existing file and starts empty.
+    when: Evaluates("exec printf abc > /tmp/rt_p_owp; set f [open /tmp/rt_p_owp w+]; set n [file size /tmp/rt_p_owp]; set r [read $f]; close $f; file delete /tmp/rt_p_owp; list $n $r")
+    ensures: completion.code = ok
+    ensures: completion.value = "0 {}"
+    -- probe: 2026-11-28 tclsh9.1; doc/open.n (w+)
+}
+
+rule ProcOpenExclusiveCreatesNew {
+    -- CREAT+EXCL creates a missing file exclusively.
+    when: Evaluates("file delete /tmp/rt_p_ox; set f [open /tmp/rt_p_ox {CREAT EXCL WRONLY}]; close $f; set e [file exists /tmp/rt_p_ox]; set n [file size /tmp/rt_p_ox]; file delete /tmp/rt_p_ox; list $e $n")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 0"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcOpenExclusiveRejectsExisting {
+    -- The exclusive message is "file exists" (not "file already exists").
+    when: Evaluates("exec printf a > /tmp/rt_p_oxe; set c [catch {open /tmp/rt_p_oxe {CREAT EXCL WRONLY}} m]; file delete /tmp/rt_p_oxe; list $c [string match {couldn't open *: file exists} $m]")
+    ensures: completion.code = ok
+    ensures: completion.value = "1 1"
+    -- probe: 2026-11-28 tclsh9.1; doc/open.n EXCL
+}
+
+rule ProcOpenRejectsXAccess {
+    -- "x" is not an access mode; a POSIX flag list with CREAT+EXCL is the
+    -- exclusive-create spelling.
+    when: Evaluates("catch {open /tmp/rt_p_ox x} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "illegal access mode \"x\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcOpenPermissionsOctal {
+    -- A permissions argument is an integer; 0o600 stays owner read/write.
+    when: Evaluates("file delete /tmp/rt_p_op; set f [open /tmp/rt_p_op w 0o600]; close $f; set p [format %o [expr {[file attributes /tmp/rt_p_op -permissions] & 0o777}]]; file delete /tmp/rt_p_op; set p")
+    ensures: completion.code = ok
+    ensures: completion.value = "600"
+    -- probe: 2026-11-28 tclsh9.1 (umask 022; 0600 decimal is wrong in Tcl 9)
+}
+
+rule ProcOpenPosixCreatTrunc {
+    -- POSIX flag lists may combine CREAT/WRONLY/TRUNC.
+    when: Evaluates("exec printf abc > /tmp/rt_p_ot; set f [open /tmp/rt_p_ot {CREAT WRONLY TRUNC}]; close $f; set n [file size /tmp/rt_p_ot]; file delete /tmp/rt_p_ot; set n")
+    ensures: completion.code = ok
+    ensures: completion.value = "0"
+    -- probe: 2026-11-28 tclsh9.1; doc/open.n
+}
+
+rule ProcOpenPosixBinaryFlag {
+    -- The BINARY flag configures -translation binary, so chan isbinary
+    -- reports 1.
+    when: Evaluates("file delete /tmp/rt_p_ob; set f [open /tmp/rt_p_ob {CREAT WRONLY BINARY}]; set r [chan isbinary $f]; close $f; file delete /tmp/rt_p_ob; set r")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcOpenAppendCreates {
+    -- a creates the file when it is missing.
+    when: Evaluates("file delete /tmp/rt_p_oac; set f [open /tmp/rt_p_oac a]; close $f; set e [file exists /tmp/rt_p_oac]; file delete /tmp/rt_p_oac; set e")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcOpenReadPlusMissing {
+    -- r+ does not create; the target must exist.
+    when: Evaluates("catch {open /tmp/rt_p_no_such_rp_zz r+} m; string match {couldn't open *: no such file or directory} $m")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcOpenWrongArgs {
+    when: Evaluates("catch {open} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"open fileName ?access? ?permissions?\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+-- ── file system / home / channels (9.1 faces) ────────────────────
+-- Probes: 2026-11-28 tclsh9.1; doc/file.n. These subcommands had no rules
+-- in file.allium (coverage-91 gap).
+
+rule ProcFileSystemIsNative {
+    -- file system returns the filesystem name; it does not check that the
+    -- path exists, and native files omit the platform-type second element
+    -- on this build.
+    when: Evaluates("list [file system /tmp] [file system /tmp/rt_p_no_such_fs_zz9]")
+    ensures: completion.code = ok
+    ensures: completion.value = "native native"
+    -- probe: 2026-11-28 tclsh9.1; doc/file.n "file system"
+}
+
+rule ProcFileSystemEmptyPath {
+    when: Evaluates("catch {file system {}} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "unrecognised path"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcFileSystemWrongArgs {
+    -- The subcommand requires exactly one name; the message names its
+    -- internal command.
+    when: Evaluates("catch {file system} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "wrong # args: should be \"::tcl::file::system name\""
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcFileHomeFollowsEnv {
+    -- No-argument file home is $env(HOME) (after tilde-to-slash
+    -- normalisation on Windows; plain here).
+    when: Evaluates("set env(HOME) /tmp/rt_p_home; file home")
+    ensures: completion.code = ok
+    ensures: completion.value = "/tmp/rt_p_home"
+    -- probe: 2026-11-28 tclsh9.1; doc/file.n "file home" (TIP 602)
+}
+
+rule ProcFileHomeUnsetErrors {
+    when: Evaluates("unset -nocomplain env(HOME); catch {file home} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "couldn't find HOME environment variable to expand path"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcFileHomeUnknownUser {
+    -- The optional username form asks the system user database.
+    when: Evaluates("catch {file home rtcl_no_such_user_zz9} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "user \"rtcl_no_such_user_zz9\" doesn't exist"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcFileChannelsFresh {
+    -- A fresh interpreter has exactly the three standard channels; sorted
+    -- here because registration order is not part of the contract.
+    when: Evaluates("lsort [file channels]")
+    ensures: completion.code = ok
+    ensures: completion.value = "stderr stdin stdout"
+    -- probe: 2026-11-28 tclsh9.1 (raw order stdin stdout stderr)
+}
+
+rule ProcFileChannelsPattern {
+    -- The optional pattern uses string-match rules.
+    when: Evaluates("lsort [file channels std*]")
+    ensures: completion.code = ok
+    ensures: completion.value = "stderr stdin stdout"
+    -- probe: 2026-11-28 tclsh9.1; doc/file.n
+}
+
+rule ProcFileChannelsIncludesOpenFile {
+    -- Each open channel adds one entry (3 standard + 1 file channel).
+    when: Evaluates("set f [open /tmp/rt_p_ch w]; set n [llength [file channels]]; close $f; file delete /tmp/rt_p_ch; set n")
+    ensures: completion.code = ok
+    ensures: completion.value = "4"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcFileChannelsAfterClose {
+    -- Closing the channel removes it from the list again.
+    when: Evaluates("set f [open /tmp/rt_p_ch2 w]; close $f; file delete /tmp/rt_p_ch2; lsort [file channels]")
+    ensures: completion.code = ok
+    ensures: completion.value = "stderr stdin stdout"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcFileChannelsMatchesChanNames {
+    -- file channels and chan names expose the same channel set; only the
+    -- generated fileN name is normalised.
+    when: Evaluates("set f [open /tmp/rt_p_ch3 w]; set a [lsort [lmap x [file channels] {regsub {file[0-9]+} $x CH}]]; set b [lsort [lmap x [chan names] {regsub {file[0-9]+} $x CH}]]; close $f; file delete /tmp/rt_p_ch3; expr {$a eq $b}")
+    ensures: completion.code = ok
+    ensures: completion.value = "1"
+    -- probe: 2026-11-28 tclsh9.1
+}
+
+rule ProcFileChannelsNoMatch {
+    when: Evaluates("file channels zz*")
+    ensures: completion.code = ok
+    ensures: completion.value = ""
+    -- probe: 2026-11-28 tclsh9.1
+}

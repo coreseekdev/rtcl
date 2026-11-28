@@ -3178,3 +3178,28 @@ sweep 12 既有、workspace **cargo exit 0**（rtcl-vm 871/0）、wasm32 ✓、
   pump_chan_copies/mod.rs copy_jobs/host.rs NativeFs——MODULARIZATION
   §5 注记过时），本轨 io 保留不受影响；fs_access cfg 门 file→any(
   file,io) 顺手修（io 无 file 组合此前从未编译过）。
+
+## T1 余项小批（task/t1-leftovers @ 4a8f8a6/c5787d4/83056c2，2026-11-29，子代理施工）
+
+- **expr 词内粘连比较符**（4a8f8a6）：`lt/gt/le/ge` 词运算符集扩为 8、
+  边界 9.1「第 3 字节非 ASCII 字母」、4 词比较符从 equality 移入
+  relational（PREC_COMPARE > PREC_EQUAL，tclCompExpr.c 钉形）——
+  `3lt2`→0、`3ni2`→1、`1.5lt2`→1、`3eq2x` 报 "2x"；p11/p13 重钉
+  （旧 8.6 bareword 钉形作废），probes 76→74。
+- **mathop 形状三处**（c5787d4）：!=/ne 严格两参（TclSingleOpCmd）；
+  usage 回显调用点字面（`in` 无 `::` 调用报无 `::` 文案）；<</>> usage
+  `integer shift`。mathop91.tcl 36 钉形对 oracle MATCH。
+- **lseq 惰性 series 现状核实 = 已落地**（近期批次 c1d989e/55cdc72）——
+  本项转「验证+补探针」：gen_lseq 50/50 含 lseq-4.11；三处错误路径修
+  正（bignum 端点/count/step → ARITH IOVERFLOW；NaN/Inf 域分诊：start
+  NaN→domain、end NaN→estimate 小写 "nan"、step NaN→domain——旧
+  post-check `len>=1` 守卫漏报空表；`lseq 0 1e20` UB 空表照抄）；
+  lseq91.tcl 扩 22 钉形。内存证据：`llength [lseq 0x7fffffff]` 峰值
+  6.3MB/0.02s（物化需 ~16GB）。
+- 门禁（合并树）：judge 95/95、crash-gate 128/128、probes **400/75**
+  （+mathop91 新探针）、sweep 12 既有、rtcl-vm 898/0、workspace exit 0、
+  w32 ✓。
+- 挂账：tclsh 字面量 rep 编译双路（count double 时 const-fold 成
+  double rep → IOVERFLOW——tclsh shimmer 产物，rtcl 统一钉
+  string-rep 路径并注明）；`lseq 0 9.2e18` tclsh 挂死不可采钉形（rtcl
+  返回空表）。

@@ -511,7 +511,12 @@ doc/*.n 章节）。
   `foreach`/`lmap`/`lfilter`（含 VM 内联路径）都按参数现算。
 - **双路径纪律**：惰性只用于大结果；`SERIES_EAGER_MAX=4096` 以下仍走
   原物化实现，保证普通结果与 list 完全同形。单测同时覆盖两路。
-- 其余消费者分析：`lsort` 无法避免 O(n) 物化（除非外部排序）；
+- `lsort` 的 stream fast path：`-integer/-real`（无 -stride/-index/
+  -command）识别算术 series，已按目标顺序排好则直接返回或返回反向
+  series；`-indices` 返回 0..n-1 的惰性索引序列；constant series +
+  `-unique` 返回单元素。`-ascii/-dictionary/-stride/-index/-command`
+  仍走通用非惰性排序。
+- 其余消费者分析：通用 `lsort` 无法避免 O(n) 物化（除非外部排序）；
   `lset`/`lappend` 需要 overlay rep（当前非惰性）。judge 95/95。
 - **运行纪律**：直接跑 rtcl 程序时统一用
   `systemd-run --user --scope -p MemoryMax=2G --quiet ./target/release/rtcl ...`，

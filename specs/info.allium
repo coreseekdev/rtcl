@@ -256,6 +256,8 @@ rule InfoPatchlevelAndTclversion {
     ensures: completion.code = ok
     ensures: completion.value = "9.1.0 9.1"
     -- probe 2026-11-28 tclsh9.1
+    -- rtcl: 报 8.6.17 / 8.6（兼容口径）；是否切换到 9.1 口径属
+    --   open question，本规格只钉 oracle。
 }
 
 rule InfoSharedlibextensionIsPlatformValue {

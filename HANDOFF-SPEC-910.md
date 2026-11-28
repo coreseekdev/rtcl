@@ -519,6 +519,20 @@ doc/*.n 章节）。
   `judge/probes/{oo_objcount91,oo_features91,pbr6_float_bits}.tcl` +
   `specs/scripts/audit-91.py`（§4 授权新增探针/审计脚本，只加不改）。
 
+### 2026-11-28（扩面完成）
+
+- 交付：9 份新规格（info/package/utility/coroutine/event/channel/
+  binary/clock/file），语料 **24 份 / 755 条**；744 条可执行 `when`
+  全部自包含，`audit-91.py` **checked=744 skipped=0 mismatches=0**。
+- 差分：新增 `specs/scripts/audit-rtcl.py`，oracle↔rtcl 逐条对比
+  （743 比较 / 504 同 / 239 异 / 1 skip）；差异按簇记入 §7.35，
+  属迁移面或实现缺口，本轮只登记不修码。
+- 门禁（均在同一 2G scope）：`cargo test -p rtcl-vm --lib` 898 passed；
+  `cargo test --workspace` 全绿（64 个 test-result 块全部 ok）；
+  `judge/run.sh` 95/95。运行时峰值：judge 264MB、vm lib 58MB。
+- 分支：`perf/wave2`，工作树干净；合并提交 `merge spec/*`、
+  `merge audit/*` 与 `docs(specs)` 复核提交。
+
 ## 9. 全量复核（2026-11-28）
 
 24 份规格：23 份行为规格全部 `Oracle: tclsh 9.1.0 (core-9-1-0)`；

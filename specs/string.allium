@@ -123,6 +123,7 @@ rule StringIsDictClass {
     ensures: completion.code = ok
     ensures: completion.value = "1 0 1"
     -- probe: probe5/probe9
+    -- rtcl: bad class "dict"（9.1 dict 类未实装，迁移面）
 }
 
 rule StringIsDigitCoversUnicode18 {

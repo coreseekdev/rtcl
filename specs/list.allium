@@ -68,9 +68,11 @@ rule LrangeIsInclusive {
 }
 
 rule LsetOutOfRangeErrors {
-    when: Evaluates("set l {a b c}; lset l 5 x")
-    ensures: completion.code = error
-    -- oracle message: list index out of range
+    when: Evaluates("set l {a b c}; catch {lset l 5 x} m; set m")
+    ensures: completion.code = ok
+    ensures: completion.value = "index \"5\" out of range"
+    -- probe 2026-11-28 tclsh9.1（旧注释误写为 list index out of range）
+    -- rtcl: 报 "list index out of range"（越界文案，迁移面）
 }
 
 rule LinsertPastEndAppends {

@@ -123,9 +123,10 @@ doc/*.n 章节）。
   unsupported_assemble）；`binary format` 浮点 Inf/NaN 位保真（pbr5）→
   **裁定项候选，见 §6**；regexp 编译错误文案 `couldn't→cannot`
   （p6/v_re/utf_char_classes）。
-- **spec 归属缺口**：`switch` 整命令无规格归属（control-flow 只钉完成
-  码，matching 钉 regexp/glob/format/scan/binary/clock）——`switch -integer`
-  等需要落 matching.allium 或新增面。
+- **spec 归属缺口（已补）**：`switch` 整命令原先无规格归属；本轮新增
+  `specs/switch.allium`（13 条：exact/glob/regexp/integer、-nocase、
+  default、`-` fallthrough、-matchvar/-indexvar、选项冲突与文案），
+  control-flow 中原 3 条 switch -integer 规则已移入。
 
 ### 规格 ↔ T 组映射（工作量分域）
 
@@ -140,6 +141,7 @@ doc/*.n 章节）。
 | matching (17) | T1/T7 + switch 归属 | 补 |
 | control-flow (13) | — | 完成码协议 9.1 未变，基本不动 |
 | dict (19) / list (18) | T4 | 现规则稳，补新子命令面 |
+| switch (13) | T4 | 新建（原无归属） |
 | oo (26) | T6 | 大量补 + 1 裁定项 |
 | regex-spencer (23) | T7 | 补 1 条文案 |
 | memory-lifecycle (8) / interp (0 规则) | T4 | interp 补 TIP 728 子解释器变量读写面 |
@@ -247,9 +249,9 @@ doc/*.n 章节）。
 7. `expr` 的 `017` 是十进制 17，而 `scan %i`/`%o` 的 `017` 仍是八进制
    15（C 语义）。两处都已按 oracle 分别钉死，勿当同一套字面量语法。
 8. 规则数口径：§2 写的「447 条规则」与实测不符——交接基线 `442f4ff`
-   上 `grep '^rule ' specs/*.allium` 为 242 条；本轮结束为 380 条
-   （新增 138 条）。§2 的 447 可能是含 probe/其他分支的旧数，后续以
-   grep 计数为准。
+   上 `grep '^rule ' specs/*.allium` 为 242 条；本轮结束为 390 条
+   （新增 148 条，含新增 `switch.allium` 13 条）。§2 的 447 可能是含
+   probe/其他分支的旧数，后续以 grep 计数为准。
 9. T7 指令面修正：9.1 的 `assemble` 菜单仍保留 `lshift`，移除的是
    `land`/`lor`；§3-C 写的「移除 land/lor/lshift」应改为「移除
    land/lor」。新增 `swap`/`isEmpty`/`strge|strgt|strle|strlt`/
@@ -334,7 +336,7 @@ doc/*.n 章节）。
     断言。
 24. `regsub` 的替换结果经 `list` 包装时反斜杠元素会被加括号：
     `list ... [regsub {x} x {\\&}]` 得 `ihhi {\x}`，不是 `ihhi \x`。
-25. 自审脚本（2026-11-27）：解析 380 条规则，292 条 `when` 可直接
+25. 自审脚本（2026-11-27）：解析 390 条规则，302 条 `when` 可直接
     执行，对 9.1.0 **0 mismatch**；77 条因 `-- after:` 前态/多行/
     未定义变量跳过。已把 20+ 条依赖前态的规则改成自包含
     （io gets/read、variables 顶部 proc/array、trace、oo、error-deep
@@ -433,7 +435,7 @@ doc/*.n 章节）。
     （§4 授权）。
 - 门禁终态：`allium check specs/` 0 error、0 warning、0 info；
   `allium analyse specs/` 0 finding。自审脚本
-  `python3 specs/scripts/audit-91.py`：checked=292 skipped=77
+  `python3 specs/scripts/audit-91.py`：checked=302 skipped=77
   mismatches=0（跳过的是 `-- after:` 前态/多行 trigger）。未改
   crates/judge 代码（仅按授权加 3 个探针 + 审计脚本），未跑 judge
   （规格-only 改动不触发代码门禁）。
@@ -443,12 +445,13 @@ doc/*.n 章节）。
 
 ## 9. 全量复核（2026-11-27）
 
-14 份规格：12 份行为规格全部 `Oracle: tclsh 9.1.0 (core-9-1-0)`；
-`memory-lifecycle.allium` 为实现资源契约（Oracle n/a），规则总数 380。
+15 份规格：12 份行为规格全部 `Oracle: tclsh 9.1.0 (core-9-1-0)`；
+`memory-lifecycle.allium` 为实现资源契约（Oracle n/a），规则总数 390。
 
 | 规格 | 规则 | 覆盖 | 状态 |
 |---|---:|---|---|
-| control-flow | 19 | T4 switch -integer / case / subst | 9.1 锚定 |
+| control-flow | 16 | T4 case/subst | 9.1 锚定 |
+| switch | 13 | T4 exact/glob/regexp/integer/matchvar | 9.1 锚定 |
 | dict | 22 | T4 getdef/getwithdefault | 9.1 锚定 |
 | error-deep | 13 | A6 + catch return 语义复核 | 9.1 锚定 |
 | expr | 36 | A1/A2 + T1 | 9.1 锚定 |

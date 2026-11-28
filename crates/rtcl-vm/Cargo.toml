@@ -47,7 +47,11 @@ rtcl-dbg = []
 # OS-level platform features (time, hostname, channels, filesystem)
 std = []
 # Tcl standard library — all extensions combined
-rtcl_std = ["file", "io", "exec", "clock", "regexp", "regexp-spencer", "env", "signal", "package", "net", "load-cmd", "dynmod", "json", "encoding"]
+rtcl_std = ["file", "io", "exec", "clock", "regexp", "regexp-spencer", "env", "signal", "package", "net", "load-cmd", "dynmod", "json", "encoding", "ext"]
+# rtcl 超 Tcl 面的 36 项扩展里 std-only 的部分（lambda/curry/ref/alias
+# 家族 core-in——见 wasm Core Profile D6；本 feature 只钉住裁定为
+# std-only 的行）。native（rtcl_std）恒开；wasm core 轨关闭。
+ext = []
 # Individual Tcl extensions (each implies Rust std)
 file = ["std"]                    # file, cd, pwd, glob (自实现), readdir, source
 io = ["std"]                      # channel I/O: open, close, read, gets, seek, tell, eof, flush, fconfigure, pid

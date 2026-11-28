@@ -1399,6 +1399,19 @@ impl Interp {
         const STDLIB_TCL: &str = include_str!("../stdlib.tcl");
         self.in_rt_prelude = true;
         let r = self.eval(STDLIB_TCL);
+        // std-only 扩展 proc（ensemble/popen/{file copy}/{file delete
+        // force}/stackdump/errorInfo）：feature "ext"（rtcl_std 恒含）
+        // 才载——Core Profile（wasm core 轨）不注册这批名字。
+        #[cfg(feature = "ext")]
+        {
+            const STDLIB_EXT_TCL: &str = include_str!("../stdlib_ext.tcl");
+            if r.is_ok() {
+                if let Err(e) = self.eval(STDLIB_EXT_TCL) {
+                    self.in_rt_prelude = false;
+                    panic!("stdlib_ext.tcl failed to load: {e}");
+                }
+            }
+        }
         self.in_rt_prelude = false;
         if let Err(e) = r {
             panic!("stdlib.tcl failed to load: {e}");

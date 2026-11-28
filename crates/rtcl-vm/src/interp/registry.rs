@@ -33,6 +33,8 @@ static CMD_TABLE: &[CmdEntry] = &[
     CmdEntry { name: "while",     func: loops::cmd_while,       cat: Language, cmd_id: None,                             usage: "test command",                        help: "Loop while condition is true" },
     CmdEntry { name: "for",       func: loops::cmd_for,         cat: Language, cmd_id: None,                             usage: "start test next command",              help: "C-style for loop" },
     CmdEntry { name: "break",     func: control::cmd_break,     cat: Language, cmd_id: None,                             usage: "?level?",                          help: "Break out of a loop" },
+    // case — 8.6 遗面（9.1 已除名）：Core Profile（ext 关）不携带。
+    #[cfg(feature = "ext")]
     CmdEntry { name: "case",      func: control::cmd_case,      cat: Language, cmd_id: None,                             usage: "string ?in? ?pattern body ...?",     help: "Obsolete glob case dispatch (tclsh 8.6 keeps it)" },
     CmdEntry { name: "coroutine", func: coro::cmd_coroutine,    cat: Standard, cmd_id: None,                             usage: "name cmd ?arg ...?",                 help: "Create a coroutine and run its first invocation" },
     #[cfg(feature = "io")]
@@ -113,6 +115,7 @@ static CMD_TABLE: &[CmdEntry] = &[
     CmdEntry { name: "array",     func: array::cmd_array,        cat: Standard, cmd_id: Some(CmdId::Array     as u16),   usage: "subcommand ?arg ...?",   help: "Array operations" },
     CmdEntry { name: "format",    func: io::cmd_format,          cat: Standard, cmd_id: Some(CmdId::Format    as u16),   usage: "formatString ?arg ...?",           help: "Format a string (printf-style)" },
     CmdEntry { name: "scan",      func: misc::cmd_scan,          cat: Standard, cmd_id: Some(CmdId::Scan      as u16),   usage: "string format ?varName ...?",      help: "Parse a string (scanf-style)" },
+    #[cfg(feature = "ext")]
     CmdEntry { name: "range",     func: loops::cmd_range,        cat: Standard, cmd_id: Some(CmdId::Range     as u16),   usage: "?start? end ?step?",               help: "Generate an integer range list" },
     CmdEntry { name: "tcl_endOfWord",             func: words::cmd_end_of_word,             cat: Standard, cmd_id: None, usage: "string startIndex", help: "Find the end of a word" },
     CmdEntry { name: "tcl_startOfNextWord",       func: words::cmd_start_of_next_word,      cat: Standard, cmd_id: None, usage: "string startIndex", help: "Find the start of the next word" },
@@ -129,34 +132,61 @@ static CMD_TABLE: &[CmdEntry] = &[
     CmdEntry { name: "variable",  func: namespace::cmd_variable,  cat: Language,  cmd_id: Some(CmdId::Variable as u16),  usage: "?name value ...? name ?value?",    help: "Declare namespace variable" },
     // ── Extension commands (always available) ──────────────────────────────
     CmdEntry { name: "puts",        func: io::cmd_puts,           cat: Extension, cmd_id: Some(CmdId::Puts        as u16), usage: "?-nonewline? ?channelId? string", help: "Output a string" },
+    #[cfg(feature = "ext")]
     CmdEntry { name: "disassemble", func: misc::cmd_disassemble,  cat: Extension, cmd_id: Some(CmdId::Disassemble as u16), usage: "procName",                       help: "Show bytecode for a procedure" },
     // ── Introspection commands ─────────────────────────────────────────────
+    // ── 36 项扩展的 Core Profile 裁定（D6，specs/ARCH-DESIGN-20261126.md）
+    // ── core-in（恒注册）：alias/ref/getref/setref/collect/finalize +
+    //    stdlib 侧 lambda/curry/function——函数族与其引用机器，纯内存
+    //    语义零 OS 面；std-only（cfg ext）：exists/local/upcall/defer/
+    //    stacktrace/pack/unpack/loop/range/lsubst/rand/debug/xtrace/
+    //    taint/untaint/case/disassemble/裸 +-*/ + stdlib 侧 ensemble/
+    //    popen/stackdump/errorInfo/{file copy}/{file delete force}
+    //    （stdlib_ext.tcl 载）+ json（既有 feature 门）。
+    #[cfg(feature = "ext")]
     CmdEntry { name: "exists",     func: introspect::cmd_exists,     cat: Language,  cmd_id: None, usage: "varName",                     help: "Check if a variable exists" },
     CmdEntry { name: "alias",      func: introspect::cmd_alias,      cat: Language,  cmd_id: None, usage: "name target ?arg ...?",       help: "Create a command alias" },
+    #[cfg(feature = "ext")]
     CmdEntry { name: "local",      func: introspect::cmd_local,      cat: Language,  cmd_id: None, usage: "command ?arg ...?",           help: "Mark command as scope-local" },
+    #[cfg(feature = "ext")]
     CmdEntry { name: "upcall",     func: introspect::cmd_upcall,     cat: Language,  cmd_id: None, usage: "command ?arg ...?",           help: "Call the original (overridden) command" },
     CmdEntry { name: "unknown",    func: introspect::cmd_unknown,    cat: Language,  cmd_id: None, usage: "cmdName ?arg ...?",           help: "Handler for unknown commands" },
+    #[cfg(feature = "ext")]
     CmdEntry { name: "defer",      func: introspect::cmd_defer,      cat: Language,  cmd_id: None, usage: "script",                     help: "Run script when scope exits" },
     CmdEntry { name: "ref",        func: introspect::cmd_ref,        cat: Language,  cmd_id: None, usage: "value ?tag?",                help: "Create a reference" },
     CmdEntry { name: "getref",     func: introspect::cmd_getref,     cat: Language,  cmd_id: None, usage: "reference",                  help: "Get value of a reference" },
     CmdEntry { name: "setref",     func: introspect::cmd_setref,     cat: Language,  cmd_id: None, usage: "reference value",            help: "Set value of a reference" },
     CmdEntry { name: "collect",    func: introspect::cmd_collect,    cat: Language,  cmd_id: None, usage: "",                           help: "Collect unreferenced references" },
     CmdEntry { name: "finalize",   func: introspect::cmd_finalize,   cat: Language,  cmd_id: None, usage: "reference ?script?",         help: "Set or get reference finalizer" },
+    #[cfg(feature = "ext")]
     CmdEntry { name: "stacktrace", func: introspect::cmd_stacktrace, cat: Language,  cmd_id: None, usage: "",                           help: "Return the current call stack" },
+    #[cfg(feature = "ext")]
     CmdEntry { name: "pack",       func: introspect::cmd_pack,       cat: Standard,  cmd_id: None, usage: "value -intle|-intbe|-floatle|-floatbe|-str width", help: "Pack a value into binary" },
+    #[cfg(feature = "ext")]
     CmdEntry { name: "unpack",     func: introspect::cmd_unpack,     cat: Standard,  cmd_id: None, usage: "binValue -intle|-intbe|-floatle|-floatbe|-str offset width", help: "Unpack binary data" },
     // ── Arithmetic operator commands (jimtcl core) ─────────────────────────
+    #[cfg(feature = "ext")]
     CmdEntry { name: "+",         func: misc::cmd_add,              cat: Standard,  cmd_id: None, usage: "number ?number ...?",         help: "Add numbers" },
+    #[cfg(feature = "ext")]
     CmdEntry { name: "-",         func: misc::cmd_sub,              cat: Standard,  cmd_id: None, usage: "number ?number ...?",         help: "Subtract numbers" },
+    #[cfg(feature = "ext")]
     CmdEntry { name: "*",         func: misc::cmd_mul,              cat: Standard,  cmd_id: None, usage: "number ?number ...?",         help: "Multiply numbers" },
+    #[cfg(feature = "ext")]
     CmdEntry { name: "/",         func: misc::cmd_div,              cat: Standard,  cmd_id: None, usage: "number ?number ...?",         help: "Divide numbers" },
     // ── Additional jimtcl core commands ────────────────────────────────────
+    #[cfg(feature = "ext")]
     CmdEntry { name: "loop",      func: loops::cmd_loop,            cat: Language,  cmd_id: None, usage: "var first limit ?incr? body", help: "Numeric loop (jimtcl extension)" },
+    #[cfg(feature = "ext")]
     CmdEntry { name: "lsubst",    func: list::cmd_lsubst,           cat: Standard,  cmd_id: None, usage: "list ?-nocase? ?-all? ?--? pattern replacement", help: "Replace elements in a list" },
+    #[cfg(feature = "ext")]
     CmdEntry { name: "rand",      func: misc::cmd_rand,             cat: Standard,  cmd_id: None, usage: "?min? ?max?",                help: "Generate a random integer" },
+    #[cfg(feature = "ext")]
     CmdEntry { name: "debug",     func: misc::cmd_debug,            cat: Extension, cmd_id: None, usage: "subcommand ?arg?",           help: "Debugging commands" },
+    #[cfg(feature = "ext")]
     CmdEntry { name: "xtrace",    func: misc::cmd_xtrace,           cat: Extension, cmd_id: None, usage: "?callback?",                 help: "Set or clear execution trace" },
+    #[cfg(feature = "ext")]
     CmdEntry { name: "taint",     func: introspect::cmd_taint,      cat: Extension, cmd_id: None, usage: "varName",                    help: "Mark a variable as tainted" },
+    #[cfg(feature = "ext")]
     CmdEntry { name: "untaint",   func: introspect::cmd_untaint,    cat: Extension, cmd_id: None, usage: "varName",                    help: "Remove taint from a variable" },
     // ── JSON extension ─────────────────────────────────────────────────────
     #[cfg(feature = "json")]

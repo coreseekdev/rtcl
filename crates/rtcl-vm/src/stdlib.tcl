@@ -66,12 +66,14 @@ proc curry {args} {
 # defer — Now implemented natively in Rust (cmd_defer in introspect.rs).
 # The native version pushes scripts onto the frame's deferred_scripts list,
 # which are executed in reverse order when the proc exits.
+# Core Profile（D6，ext 关）下 defer 是 std-only——命令行不注册。
 
 # ── loop ────────────────────────────────────────────────────────────────
 
 # loop — Enhanced for loop. Now implemented natively in Rust (loops.rs).
 # Signature: loop var ?first? limit ?increment? body
 # The native implementation supports the 3-arg form (loop var limit body).
+# Core Profile 下 loop 是 std-only——命令行不注册（for/while/foreach 覆盖）。
 
 # ── dict update / dict getdef ───────────────────────────────────────────
 
@@ -83,117 +85,12 @@ proc curry {args} {
 # dict getdef (Tcl 8.7) intentionally absent — the oracle is tclsh
 # 8.6.17, where it is an unknown subcommand (DIVERGENCES dict trio).
 
-# ── ensemble ─────────────────────────────────────────────────────────────
-
-# ensemble — Create an ensemble command that dispatches to subcommands.
-# jimtcl: ensemble.tcl (adapted for rtcl, without statics support)
-proc ensemble {command args} {
-    set autoprefix "$command "
-    set badopts "should be \"ensemble command ?-automap prefix?\""
-    if {[llength $args] % 2 != 0} {
-        return -code error "wrong # args: $badopts"
-    }
-    foreach {opt value} $args {
-        switch -- $opt {
-            -automap { set autoprefix $value }
-            default { return -code error "wrong # args: $badopts" }
-        }
-    }
-    # Build the proc body with substituted autoprefix
-    set body [format {
-        set target "%s$subcmd"
-        tailcall $target {*}$args
-    } $autoprefix]
-    proc $command {subcmd args} $body
-}
+# ensemble / popen / stackdump / errorInfo / {file copy} /
+# {file delete force} — std-only 扩展，移至 stdlib_ext.tcl（Core Profile
+# 不加载；见 crates/rtcl-vm/src/stdlib_ext.tcl）。
 
 # ── glob (requires readdir) ─────────────────────────────────────────────
 # rtcl already has a native glob command, so we don't need the Tcl version.
-
-# ── file copy ────────────────────────────────────────────────────────────
-
-# {file copy} — Copy a file using open/read/close.
-# jimtcl: tclcompat.tcl
-proc {file copy} {args} {
-    set force 0
-    set source ""
-    set target ""
-    foreach arg $args {
-        if {$arg eq "-force"} {
-            set force 1
-        } elseif {$source eq ""} {
-            set source $arg
-        } else {
-            set target $arg
-        }
-    }
-    if {$source eq "" || $target eq ""} {
-        return -code error "wrong # args: should be \"file copy ?-force? source target\""
-    }
-    if {!$force && [file exists $target]} {
-        return -code error "error copying \"$source\" to \"$target\": file already exists"
-    }
-    set in [open $source r]
-    set data [read $in]
-    close $in
-    set out [open $target w]
-    puts -nonewline $out $data
-    close $out
-}
-
-# ── file delete -force ──────────────────────────────────────────────────
-
-# {file delete force} — Recursive directory deletion.
-# jimtcl: tclcompat.tcl (requires readdir)
-proc {file delete force} {path} {
-    if {[file isdirectory $path]} {
-        foreach e [readdir $path] {
-            {file delete force} $path/$e
-        }
-    }
-    file delete $path
-}
-
-# ── stackdump / errorInfo ───────────────────────────────────────────────
-
-# stackdump — Human-readable stack trace formatter.
-# jimtcl: stdlib.tcl
-proc stackdump {stacktrace} {
-    set lines {}
-    lappend lines "Traceback (most recent call last):"
-    foreach {cmd l f p} [lreverse $stacktrace] {
-        set line {}
-        if {$f ne ""} {
-            append line "  File \"$f\", line $l"
-        }
-        if {$p ne ""} {
-            append line ", in $p"
-        }
-        if {$line ne ""} {
-            lappend lines $line
-            if {$cmd ne ""} {
-                lappend lines "    $cmd"
-            }
-        }
-    }
-    if {[llength $lines] > 1} {
-        return [join $lines \n]
-    }
-}
-
-# errorInfo — Format error info from stack trace.
-# jimtcl: stdlib.tcl
-proc errorInfo {msg {stacktrace ""}} {
-    if {$stacktrace eq ""} {
-        set stacktrace [stacktrace]
-    }
-    set result "$msg\n"
-    set dump [stackdump $stacktrace]
-    if {$dump ne ""} {
-        append result $dump
-    }
-    string trim $result
-}
 
 # ── namespace inscope ────────────────────────────────────────────────────
 
@@ -208,13 +105,6 @@ proc {namespace inscope} {ns args} {
 # Now implemented natively in Rust (commands/json.rs).
 # Registered as: json::decode, json::encode, json (ensemble).
 
-# ── popen (jimtcl tclcompat.tcl) ────────────────────────────────────────
-
-# popen — Open a pipe to/from a command.
-# Uses the native `open |command ?mode?` pipe channel support.
-proc popen {cmd {mode "r"}} {
-    open |$cmd $mode
-}
 
 # ── auto_qualify (tclsh 8.6 init.tcl, verbatim port) ────────────────────
 
